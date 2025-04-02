@@ -42,7 +42,7 @@ async def calculate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         # Пример расчётов по вашим формулам:
         short = invest * 0.02
         aave = (invest - short) / (1 + 0.75 * 0.147)
-        pool_eth = (invest * 0.64) / cp
+        pool_eth = (aave * 0.64) / cp
         pool_usdc = invest - (aave + short)
         range_min = cp * (1 - 0.03)
         range_max = cp * (1 + 0.20)
