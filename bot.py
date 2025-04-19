@@ -45,9 +45,9 @@ async def calculate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         pool_eth = (aave * 0.64) / cp
         pool_usdc = invest - (aave + short)
         range_min = cp * (1 - 0.03)
-        range_max = cp * (1 + 0.20)
+        range_max = cp * (1 + 0.03)
         close_lp_down = range_min
-        close_lp_up = cp * (1 + 0.15)
+        close_lp_up = range_max
         
         response = (
             f"Результаты расчётов:\n"
