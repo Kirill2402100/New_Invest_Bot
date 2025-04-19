@@ -40,25 +40,19 @@ async def calculate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         cp = float(params[1])
         
         # Пример расчётов по вашим формулам:
-        short = invest * 0.02
-        aave = (invest - short) / (1 + 0.75 * 0.147)
+        aave = (invest) / (1 + 4.355 * 0.147)
         pool_eth = (aave * 0.64) / cp
-        pool_usdc = invest - (aave + short)
+        pool_usdc = invest - (aave)
         range_min = cp * (1 - 0.03)
         range_max = cp * (1 + 0.03)
-        close_lp_down = range_min
-        close_lp_up = range_max
         
         response = (
             f"Результаты расчётов:\n"
-            f"SHORT = {short:.2f}\n"
             f"AAVE = {aave:.2f}\n"
             f"POOL ETH = {pool_eth:.2f}\n"
             f"POOL USDC = {pool_usdc:.2f}\n"
             f"RANGE MIN = {range_min:.2f}\n"
             f"RANGE MAX = {range_max:.2f}\n"
-            f"CLOSE LP DOWN = {close_lp_down:.2f}\n"
-            f"CLOSE LP UP = {close_lp_up:.2f}"
         )
         
         await update.message.reply_text(response)
