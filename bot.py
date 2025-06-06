@@ -1,76 +1,41 @@
-# Lp_alert_bot.py
+#!/usr/bin/env python3
 """
-Telegram-бот для концентрированного LP (EURC-USDC)
----------------------------------------------------
-
-* Каждые 30 минут тянет 30-мин свечи EURC-USD с Coinbase.
-* Считает 24-часовой ATR (48 свечей) и вероятность выхода из узкого диапазона ±0,10 % в ближайшие 6 часов.
-* В зависимости от вероятности (P_exit) выдаёт три рекомендации:
-    – «узкий»   ±0,10 %  ≈150 % APY  (риск <10 %)
-    – «средний» ±0,17 %  ≈90 %  APY  (10–25 %)
-    – «широкий» ±0,30 %  ≈50 %  APY  (≥25 %)
-  или полностью выйти/захеджироваться при σ >0,50 % или P_exit >60 %.
-* Шлёт сообщения в Telegram.
-
-Развёртывание на Railway
-=========================
-1. Добавьте этот файл в репозиторий вашего Railway-проекта.
-2. В *Variables* задайте минимум:
-
-   BOT_TOKEN       – токен из @BotFather
-   CHAT_ID         – id лички или группы (можно узнать через getUpdates)
-
-   (опционально)
-   PAIR            – "EURC-USD"
-   GRANULARITY     – 1800  # секунд
-   HORIZON_HRS     – 6
-   ATR_WINDOWS     – 48
-   APY_CONSTANT    – 0.15  # даёт 150 % при ±0,10 %
-3. Type = Python, Start Cmd = `python lp_alert_bot.py`
-
-Готово – Railway перезапустит контейнер и бот начнёт слать алёрты.
+Telegram-бот для LP (EURC-USDC) с Coinbase:
+– Считает σ и вероятность выхода из ±0.10 % диапазона.
+– Даёт рекомендации (±0.10 / 0.17 / 0.30 % или выход).
 """
 
 import os
 import time
 from math import erf, sqrt
 from statistics import mean
-from datetime import datetime, timezone
-
+from datetime import datetime, timedelta, timezone
 import requests
 
-###############################################################################
-#  Настройки из переменных окружения
-###############################################################################
+# ============ Параметры из окружения ============
 PAIR         = os.getenv("PAIR", "EURC-USD")
-GRANULARITY  = int(os.getenv("GRANULARITY", "1800"))   # 30-мин свечи
-ATR_WINDOWS  = int(os.getenv("ATR_WINDOWS", "48"))      # 24 ч
-HORIZON_HRS  = float(os.getenv("HORIZON_HRS", "6"))     # прогнозное окно
-APY_K        = float(os.getenv("APY_CONSTANT", "0.15"))  # константа APY≈K/width
+GRANULARITY  = int(os.getenv("GRANULARITY", "900"))     # 15 мин
+ATR_WINDOWS  = int(os.getenv("ATR_WINDOWS", "96"))      # ≈ 24 ч (96 × 15мин)
+HORIZON_HRS  = float(os.getenv("HORIZON_HRS", "6"))     # горизонт прогноза
+APY_K        = float(os.getenv("APY_CONSTANT", "0.15")) # константа доходности
 
-# Пороги вероятности
-P_HIGH = float(os.getenv("P_HIGH", "0.25"))   # ≥25 % → ±0,30 %
-P_MED  = float(os.getenv("P_MED",  "0.10"))   # 10–25 % → ±0,17 %
+P_HIGH = float(os.getenv("P_HIGH", "0.25"))   # ≥25 % → ±0.30 %
+P_MED  = float(os.getenv("P_MED",  "0.10"))   # 10–25 % → ±0.17 %
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID   = os.getenv("CHAT_ID")
 if not BOT_TOKEN or not CHAT_ID:
     raise SystemExit("[env] BOT_TOKEN и/или CHAT_ID не заданы – остановка.")
 
-###############################################################################
 COINBASE_API = "https://api.exchange.coinbase.com"
-D_FLAT = 0.10  # % ширина узкого диапазона
+D_FLAT = 0.10  # %
 
-###############################################################################
-#  Базовые функции
-###############################################################################
+# ============ Математика и расчёты ============
 
 def cdf_standard_normal(x: float) -> float:
-    """N(0,1) CDF via error function"""
     return 0.5 * (1 + erf(x / sqrt(2)))
 
 def exit_probability(d_pct: float, sigma_pct: float, horizon_h: float) -> float:
-    """P(|Δp|>d) за horizon_h, предполагая геом. броуновское движение"""
     if sigma_pct == 0:
         return 0.0
     z = d_pct / (sigma_pct * sqrt(horizon_h / 24))
@@ -79,23 +44,24 @@ def exit_probability(d_pct: float, sigma_pct: float, horizon_h: float) -> float:
 def expected_apy(width_pct: float) -> float:
     return APY_K / (width_pct / 100)
 
-###############################################################################
-#  Функции работы с данными
-###############################################################################
+# ============ Получение свечей ============
 
-def fetch_candles(pair: str, granularity: int, limit: int = 300):
-    """Возвращает список [time, low, high, open, close, volume] (ст.→нв.)"""
+def fetch_candles(pair: str, granularity: int, window: int):
+    end   = datetime.now(timezone.utc)
+    start = end - timedelta(seconds=granularity * (window + 2))
     url = f"{COINBASE_API}/products/{pair}/candles"
-    params = {"granularity": granularity, "limit": limit}
+    params = {
+        "start": start.isoformat(),
+        "end":   end.isoformat(),
+        "granularity": granularity
+    }
     r = requests.get(url, params=params, timeout=10)
     r.raise_for_status()
-    return sorted(r.json(), key=lambda x: x[0])
-
+    return sorted(r.json(), key=lambda x: x[0])  # по времени
 
 def true_range(cur, prev_close):
     high, low, close = cur[2], cur[1], cur[4]
     return max(high - low, abs(high - prev_close), abs(low - prev_close))
-
 
 def compute_atr(candles, window):
     if len(candles) < window + 1:
@@ -103,9 +69,7 @@ def compute_atr(candles, window):
     trs = [true_range(candles[-i], candles[-i - 1][4]) for i in range(1, window + 1)]
     return mean(trs)
 
-###############################################################################
-#  Telegram
-###############################################################################
+# ============ Telegram ============
 
 def tg_send(text: str):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
@@ -113,27 +77,24 @@ def tg_send(text: str):
     r = requests.post(url, json=payload, timeout=10)
     r.raise_for_status()
 
-###############################################################################
-#  Основной цикл
-###############################################################################
+# ============ Основной цикл ============
 
 def main():
     last_candle_ts = 0
+    print("[info] lp_alert_bot.py started")
     while True:
         try:
             candles = fetch_candles(PAIR, GRANULARITY, ATR_WINDOWS + 2)
             atr_raw = compute_atr(candles, ATR_WINDOWS)
             close = candles[-1][4]
-            sigma_pct = atr_raw / close * 100  # реализ. σ в процентах
+            sigma_pct = atr_raw / close * 100
             p_exit = exit_probability(D_FLAT, sigma_pct, HORIZON_HRS)
 
-            # Решение по диапазону
             if sigma_pct > 0.50 or p_exit >= 0.60:
-                # критическая турбулентность
                 width_pct = None
                 msg = (
                     f"🚨 *Высокий риск!* σ24h={sigma_pct:.2f}%  P_exit={p_exit*100:.1f}%\n"
-                    "Предлагаю полностью вывести ликвидность или 100 %-хедж." )
+                    "→ Вывести LP или хеджировать 100 %." )
             elif p_exit >= P_HIGH:
                 width_pct = 0.30
                 msg = (
@@ -154,15 +115,14 @@ def main():
             if candle_ts != last_candle_ts:
                 ts_str = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
                 tg_send(f"{msg}\n`{ts_str}`")
-                last_candle_ts = candle_ts
                 print("[sent]", msg)
+                last_candle_ts = candle_ts
 
         except Exception as exc:
             print("[error]", exc)
 
         time.sleep(GRANULARITY)
 
-###############################################################################
 if __name__ == "__main__":
     try:
         main()
