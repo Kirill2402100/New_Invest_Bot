@@ -67,7 +67,7 @@ async def set_lp(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.args:
         try:
             lp_center = float(context.args[0].replace(",", "."))
-            await update.message.reply_text(f"📍 Центр LP установлен: `{lp_center:.4f}`")
+            await update.message.reply_text(f"📍 Центр LP установлен: `{lp_center:.4f}`", parse_mode='Markdown')
         except ValueError:
             await update.message.reply_text("Введите число: /set <цена>")
 
@@ -83,7 +83,8 @@ async def step_lp(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lp_state = "open"
         observe_mode = False
         entry_exit_count = 0
-        await update.message.reply_text(f"📦 Диапазон LP: `{lp_lower:.4f} – {lp_upper:.4f}`\nСтатус: *LP активен*.", parse_mode='Markdown')
+        await update.message.reply_text(
+            f"📦 Диапазон LP: `{lp_lower:.4f} – {lp_upper:.4f}`\nСтатус: *LP активен*.", parse_mode='Markdown')
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if lp_state != "open":
@@ -158,7 +159,6 @@ async def monitor():
                     f"⚠️ Цена пилит границу диапазона.\n📐 Рекомендую пересобрать диапазон LP."
                 )
 
-        # Рассылаем сообщения не чаще 1 в 60 секунд
         if message and (now.timestamp() - last_report_time) > 60:
             await broadcast(message)
             last_report_time = now.timestamp()
