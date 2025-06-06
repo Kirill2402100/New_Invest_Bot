@@ -13,7 +13,7 @@ from datetime import datetime, timedelta, timezone
 import requests
 
 # ============ Параметры из окружения ============
-PAIR         = os.getenv("PAIR", "EURC-USD")
+PAIR         = os.getenv("PAIR", "EURC-USDC")
 GRANULARITY  = int(os.getenv("GRANULARITY", "900"))     # 15 мин
 ATR_WINDOWS  = int(os.getenv("ATR_WINDOWS", "48"))      # ≈ 24 ч (96 × 15мин)
 HORIZON_HRS  = float(os.getenv("HORIZON_HRS", "6"))     # горизонт прогноза
