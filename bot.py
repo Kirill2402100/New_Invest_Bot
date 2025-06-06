@@ -1,4 +1,4 @@
-# lp_supervisor_bot.py — переработанный Telegram-бот для LP с логикой наблюдения, тревог и отчётностью
+# lp_supervisor_bot_with_reports.py
 
 import os
 import time
@@ -7,6 +7,8 @@ from statistics import mean
 from math import erf, sqrt
 import requests
 import asyncio
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
 from telegram import Update, Bot
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
@@ -16,13 +18,19 @@ GRANULARITY = 60  # 1 минута
 ATR_WINDOW = 48
 OBSERVE_INTERVAL = 15 * 60  # 15 минут
 
-# Поддержка двух операторов
 CHAT_IDS = [
     int(os.getenv("CHAT_ID_MAIN", "0")),
     int(os.getenv("CHAT_ID_OPERATOR", "0"))
 ]
-
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+
+# === Google Sheets ===
+SHEET_ID = os.getenv("SHEET_ID")
+CREDENTIALS_FILE = "credentials.json"
+scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+creds = ServiceAccountCredentials.from_json_keyfile_name(CREDENTIALS_FILE, scope)
+sheet_client = gspread.authorize(creds)
+sheet = sheet_client.open_by_key(SHEET_ID).worksheet("LP_Logs")
 
 # === Состояние LP ===
 lp_center = None
@@ -34,6 +42,8 @@ observe_start = None
 last_exit_price = None
 entry_exit_count = 0
 last_report_time = 0
+lp_capital = 0.0
+lp_start_time = None
 
 # === Утилиты ===
 def cdf_standard_normal(x):
@@ -61,12 +71,13 @@ async def broadcast(text):
     for cid in CHAT_IDS:
         await bot.send_message(chat_id=cid, text=text, parse_mode='Markdown')
 
-# === Команды Telegram ===
+# === Telegram Команды ===
 async def set_lp(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global lp_center
+    global lp_center, lp_start_time
     if context.args:
         try:
             lp_center = float(context.args[0].replace(",", "."))
+            lp_start_time = datetime.now(timezone.utc)
             await update.message.reply_text(f"📍 Центр LP установлен: `{lp_center:.4f}`", parse_mode='Markdown')
         except ValueError:
             await update.message.reply_text("Введите число: /set <цена>")
@@ -86,19 +97,18 @@ async def step_lp(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"📦 Диапазон LP: `{lp_lower:.4f} – {lp_upper:.4f}`\nСтатус: *LP активен*.", parse_mode='Markdown')
 
-async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if lp_state != "open":
-        await update.message.reply_text("LP не активен.")
-        return
-    price, sigma = fetch_price_and_atr()
-    p_exit = exit_probability(0.1, sigma)
-    await update.message.reply_text(
-        f"\U0001F4C8 *LP Статус*\nЦена: `{price:.4f}`\nДиапазон: `{lp_lower:.4f} – {lp_upper:.4f}`\n\nσ = `{sigma:.2f}%`\nP_exit = `{p_exit*100:.1f}%`\nСостояние: `{lp_state}`",
-        parse_mode='Markdown')
+async def capital(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global lp_capital
+    if context.args:
+        try:
+            lp_capital = float(context.args[0].replace(",", "."))
+            await update.message.reply_text(f"💰 Капитал LP установлен: `{lp_capital:.2f} USDC`", parse_mode='Markdown')
+        except ValueError:
+            await update.message.reply_text("Введите сумму: /capital <сумма>")
 
 # === Основная логика ===
 async def monitor():
-    global observe_mode, observe_start, last_exit_price, entry_exit_count, last_report_time
+    global observe_mode, observe_start, last_exit_price, entry_exit_count, last_report_time, lp_start_time
     while True:
         if lp_state != "open":
             await asyncio.sleep(60)
@@ -126,6 +136,17 @@ async def monitor():
                 observe_mode = True
                 observe_start = now
                 entry_exit_count = 1
+                if lp_start_time:
+                    duration_min = (now - lp_start_time).total_seconds() / 60
+                    apr = 0
+                    if duration_min > 0 and lp_capital > 0:
+                        apr = ((price - lp_center) / lp_capital) * (525600 / duration_min) * 100
+                    sheet.append_row([
+                        now.strftime('%Y-%m-%d %H:%M:%S'),
+                        f"{lp_center:.4f}", f"{lp_lower:.4f} – {lp_upper:.4f}",
+                        f"{lp_capital:.2f}", f"{price:.4f}", f"{price - lp_center:.4f}",
+                        f"{duration_min:.1f}", f"{apr:.2f}"
+                    ])
             else:
                 entry_exit_count += 1
 
@@ -174,7 +195,7 @@ if __name__ == "__main__":
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("set", set_lp))
     app.add_handler(CommandHandler("step", step_lp))
-    app.add_handler(CommandHandler("status", status))
+    app.add_handler(CommandHandler("capital", capital))
 
     loop = asyncio.get_event_loop()
     loop.create_task(monitor())
