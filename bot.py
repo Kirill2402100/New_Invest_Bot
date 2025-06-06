@@ -2,6 +2,7 @@
 
 import os
 import time
+import json
 from datetime import datetime, timezone
 from statistics import mean
 from math import erf, sqrt
@@ -24,11 +25,12 @@ CHAT_IDS = [
 ]
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
-# === Google Sheets ===
+# === Google Sheets без файла, через переменную окружения ===
 SHEET_ID = os.getenv("SHEET_ID")
-CREDENTIALS_FILE = "credentials.json"
+CREDENTIALS_JSON = os.getenv("GOOGLE_CREDS")
 scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-creds = ServiceAccountCredentials.from_json_keyfile_name(CREDENTIALS_FILE, scope)
+creds_dict = json.loads(CREDENTIALS_JSON)
+creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
 sheet_client = gspread.authorize(creds)
 sheet = sheet_client.open_by_key(SHEET_ID).worksheet("LP_Logs")
 
