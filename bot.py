@@ -25,12 +25,16 @@ CHAT_IDS = [
 ]
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
-# === Google Sheets без файла, через переменную окружения ===
+# === Google Sheets через переменную окружения ===
+import json
+
 SHEET_ID = os.getenv("SHEET_ID")
-CREDENTIALS_JSON = os.getenv("GOOGLE_CREDS")
+
 scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-creds_dict = json.loads(CREDENTIALS_JSON)
-creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+google_creds_dict = json.loads(os.getenv("GOOGLE_CREDS"))
+creds = ServiceAccountCredentials.from_json_keyfile_dict(google_creds_dict, scope)
+
+import gspread
 sheet_client = gspread.authorize(creds)
 sheet = sheet_client.open_by_key(SHEET_ID).worksheet("LP_Logs")
 
