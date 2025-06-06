@@ -1,10 +1,4 @@
 #!/usr/bin/env python3
-"""
-Telegram-бот для LP (EURC-USDC) с Coinbase.
-– Считает σ и вероятность выхода из ±0.10 % диапазона.
-– Даёт рекомендации.
-"""
-
 import os
 import time
 from math import erf, sqrt
@@ -14,8 +8,8 @@ import requests
 
 # ============ Конфигурация ============
 PAIR         = os.getenv("PAIR", "EURC-USDC")
-GRANULARITY  = int(os.getenv("GRANULARITY", "900"))     # 15 минут
-ATR_WINDOWS  = int(os.getenv("ATR_WINDOWS", "48"))      # ≈12 часов
+GRANULARITY  = int(os.getenv("GRANULARITY", "900"))     # 15 мин
+ATR_WINDOWS  = int(os.getenv("ATR_WINDOWS", "48"))      # 12 ч
 HORIZON_HRS  = float(os.getenv("HORIZON_HRS", "6"))
 APY_K        = float(os.getenv("APY_CONSTANT", "0.15"))
 P_HIGH       = float(os.getenv("P_HIGH", "0.25"))
@@ -87,7 +81,12 @@ def tg_send(text: str):
 # ============ Основной цикл ============
 def main():
     last_candle_ts = 0
+    last_range_code = None
+    last_sent_ts = 0
+    STATUS_EVERY_N_CANDLES = 4  # каждые 4 свечи (~1 ч при 15 мин)
+
     print("[info] lp_alert_bot.py started")
+
     while True:
         try:
             candles = fetch_candles(PAIR, GRANULARITY, ATR_WINDOWS)
@@ -98,24 +97,29 @@ def main():
             sigma_pct = atr_raw / close * 100
             p_exit = exit_probability(D_FLAT, sigma_pct, HORIZON_HRS)
 
+            # Решение
             if sigma_pct > 0.50 or p_exit >= 0.60:
+                range_code = "exit"
                 msg = (
                     f"🚨 Высокий риск!\nσ24h = {sigma_pct:.2f}%\nP_exit = {p_exit*100:.1f}%\n"
                     "→ Вывести ликвидность или захеджироваться."
                 )
             elif p_exit >= P_HIGH:
+                range_code = "wide"
                 width_pct = 0.30
                 msg = (
                     f"⚠️ σ24h = {sigma_pct:.2f}%\nP_exit = {p_exit*100:.1f}%\n"
                     f"→ диапазон ±0.30 %  (≈{expected_apy(width_pct):.0f}% APY)"
                 )
             elif p_exit >= P_MED:
+                range_code = "medium"
                 width_pct = 0.17
                 msg = (
                     f"σ24h = {sigma_pct:.2f}%\nP_exit = {p_exit*100:.1f}%\n"
                     f"→ диапазон ±0.17 %  (≈{expected_apy(width_pct):.0f}% APY)"
                 )
             else:
+                range_code = "narrow"
                 width_pct = 0.10
                 msg = (
                     f"σ24h = {sigma_pct:.2f}%\nP_exit = {p_exit*100:.1f}% (спокойно)\n"
@@ -123,11 +127,19 @@ def main():
                 )
 
             candle_ts = candles[-1][0]
-            if candle_ts != last_candle_ts:
+            now_ts = time.time()
+
+            time_trigger = now_ts - last_sent_ts > GRANULARITY * STATUS_EVERY_N_CANDLES
+            state_changed = range_code != last_range_code
+            new_candle = candle_ts != last_candle_ts
+
+            if new_candle and (state_changed or time_trigger):
                 ts_str = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
                 tg_send(f"{msg}\n`{ts_str}`")
-                last_candle_ts = candle_ts
                 print("[sent]", msg)
+                last_sent_ts = now_ts
+                last_range_code = range_code
+                last_candle_ts = candle_ts
 
         except Exception as exc:
             print("[error]", exc)
