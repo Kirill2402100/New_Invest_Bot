@@ -1,20 +1,17 @@
-# lp_supervisor_bot.py
-
 import os
-import time
+import asyncio
 from datetime import datetime, timezone
 from statistics import mean
 from math import erf, sqrt
 import requests
 from telegram import Update, Bot
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
-import asyncio
 
 # --- Config ---
 PAIR = os.getenv("PAIR", "EURC-USDC")
-GRANULARITY = 60  # 1 minute candles
-ATR_WINDOW = 48   # 48 x 1min = last 48 mins, acceptable for now
-OBSERVE_INTERVAL = 15 * 60  # seconds to stay in observe mode
+GRANULARITY = 60
+ATR_WINDOW = 48
+OBSERVE_INTERVAL = 15 * 60
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = int(os.getenv("CHAT_ID", "0"))
@@ -26,9 +23,7 @@ lp_upper = None
 lp_state = "closed"
 observe_mode = False
 observe_start = None
-last_exit_price = None
 entry_exit_count = 0
-entry_log = []
 
 # --- Helpers ---
 def cdf_standard_normal(x):
@@ -58,7 +53,14 @@ def fetch_price_and_atr():
 
 def format_lp_status(price, sigma_pct):
     p_exit = exit_probability(0.1, sigma_pct)
-    status = f"\u2728 *LP Статус*\nЦена: `{price:.4f}`\nДиапазон: `{lp_lower:.4f} – {lp_upper:.4f}`\n\nσ = `{sigma_pct:.2f}%`\nP_exit = `{p_exit*100:.1f}%`\nСостояние: `{lp_state}`"
+    status = (
+        f"\u2728 *LP Статус*\n"
+        f"Цена: `{price:.4f}`\n"
+        f"Диапазон: `{lp_lower:.4f} – {lp_upper:.4f}`\n\n"
+        f"σ = `{sigma_pct:.2f}%`\n"
+        f"P_exit = `{p_exit*100:.1f}%`\n"
+        f"Состояние: `{lp_state}`"
+    )
     return status
 
 async def send_message(text):
@@ -67,7 +69,7 @@ async def send_message(text):
 
 # --- Telegram Commands ---
 async def set_lp(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global lp_center, lp_state
+    global lp_center
     if context.args:
         lp_center = float(context.args[0])
         await update.message.reply_text(f"Центр LP установлен: {lp_center:.4f}")
@@ -107,7 +109,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # --- Monitoring loop ---
 async def monitor():
-    global lp_state, observe_mode, observe_start, last_exit_price, entry_exit_count
+    global lp_state, observe_mode, observe_start, entry_exit_count
     while True:
         try:
             if lp_state != "open":
@@ -122,41 +124,33 @@ async def monitor():
                     if (datetime.now() - observe_start).total_seconds() > OBSERVE_INTERVAL:
                         apy = expected_apy(0.10)
                         await send_message(
-                            f"🚀 *Стабильность восстановлена*\nσ = `{sigma:.2f}%`\nP_exit = `{exit_probability(0.1, sigma)*100:.1f}%`\n→ Рекомендуется открыть LP: ±0.10%\nAPY: ~{apy:.0f}%"
+                            f"✅ Цена вернулась в диапазон\nМожно открыть LP ±0.10%\nAPY ≈ {apy:.0f}%"
                         )
                         observe_mode = False
-                        lp_state = "open"
                 await asyncio.sleep(60)
                 continue
 
-            deviation = abs(price - lp_center) / lp_center * 100
-            msg = f"🔴 *Цена вышла за пределы LP*\nТекущая цена: `{price:.4f}`\nОтклонение: `{deviation:.3f}%`\n"
-
-            if deviation < 0.02:
-                msg += "→ Отклонение незначительное\. Наблюдаем\."
-            elif deviation < 0.05:
-                msg += "→ Рекомендуется конвертировать *50%* EURC → USDC"
-            else:
-                msg += "→ *Критично*\. Рекомендуется продать *всё* EURC → USDC"
-
-            await send_message(msg)
-            observe_mode = True
-            observe_start = datetime.now()
-            lp_state = "observe"
+            if not observe_mode:
+                observe_mode = True
+                observe_start = datetime.now()
+                await send_message(f"⚠️ Цена вышла из диапазона: {price:.4f}\nНачинаем наблюдение 15 минут…")
 
         except Exception as e:
-            print("[error]", e)
+            print("[monitor error]", e)
+
         await asyncio.sleep(60)
 
-# --- Main ---
+# --- Entry point ---
 async def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
+
     app.add_handler(CommandHandler("set", set_lp))
     app.add_handler(CommandHandler("step", step_lp))
     app.add_handler(CommandHandler("reset", reset_lp))
     app.add_handler(CommandHandler("status", status))
+
     asyncio.create_task(monitor())
     await app.run_polling()
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     asyncio.run(main())
