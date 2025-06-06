@@ -15,7 +15,7 @@ import requests
 # ============ Параметры из окружения ============
 PAIR         = os.getenv("PAIR", "EURC-USD")
 GRANULARITY  = int(os.getenv("GRANULARITY", "900"))     # 15 мин
-ATR_WINDOWS  = int(os.getenv("ATR_WINDOWS", "96"))      # ≈ 24 ч (96 × 15мин)
+ATR_WINDOWS  = int(os.getenv("ATR_WINDOWS", "48"))      # ≈ 24 ч (96 × 15мин)
 HORIZON_HRS  = float(os.getenv("HORIZON_HRS", "6"))     # горизонт прогноза
 APY_K        = float(os.getenv("APY_CONSTANT", "0.15")) # константа доходности
 
@@ -48,7 +48,7 @@ def expected_apy(width_pct: float) -> float:
 
 def fetch_candles(pair: str, granularity: int, window: int):
     end   = datetime.now(timezone.utc)
-    start = end - timedelta(seconds=granularity * (window + 2))
+    start = end - timedelta(seconds=granularity * (window + 20))
     url = f"{COINBASE_API}/products/{pair}/candles"
     params = {
         "start": start.isoformat(),
