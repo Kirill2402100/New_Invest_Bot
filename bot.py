@@ -8,6 +8,7 @@ from math import erf, sqrt
 import requests
 from telegram import Update, Bot
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+import asyncio
 
 # --- Config ---
 PAIR = os.getenv("PAIR", "EURC-USDC")
@@ -121,4 +122,41 @@ async def monitor():
                     if (datetime.now() - observe_start).total_seconds() > OBSERVE_INTERVAL:
                         apy = expected_apy(0.10)
                         await send_message(
-                            f"
+                            f"🚀 *Стабильность восстановлена*\nσ = `{sigma:.2f}%`\nP_exit = `{exit_probability(0.1, sigma)*100:.1f}%`\n→ Рекомендуется открыть LP: ±0.10%\nAPY: ~{apy:.0f}%"
+                        )
+                        observe_mode = False
+                        lp_state = "open"
+                await asyncio.sleep(60)
+                continue
+
+            deviation = abs(price - lp_center) / lp_center * 100
+            msg = f"🔴 *Цена вышла за пределы LP*\nТекущая цена: `{price:.4f}`\nОтклонение: `{deviation:.3f}%`\n"
+
+            if deviation < 0.02:
+                msg += "→ Отклонение незначительное\. Наблюдаем\."
+            elif deviation < 0.05:
+                msg += "→ Рекомендуется конвертировать *50%* EURC → USDC"
+            else:
+                msg += "→ *Критично*\. Рекомендуется продать *всё* EURC → USDC"
+
+            await send_message(msg)
+            observe_mode = True
+            observe_start = datetime.now()
+            lp_state = "observe"
+
+        except Exception as e:
+            print("[error]", e)
+        await asyncio.sleep(60)
+
+# --- Main ---
+async def main():
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("set", set_lp))
+    app.add_handler(CommandHandler("step", step_lp))
+    app.add_handler(CommandHandler("reset", reset_lp))
+    app.add_handler(CommandHandler("status", status))
+    asyncio.create_task(monitor())
+    await app.run_polling()
+
+if __name__ == '__main__':
+    asyncio.run(main())
