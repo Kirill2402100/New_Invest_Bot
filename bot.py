@@ -1,153 +1,124 @@
-#!/usr/bin/env python3
+# lp_supervisor_bot.py
+
 import os
 import time
-from math import erf, sqrt
+from datetime import datetime, timezone
 from statistics import mean
-from datetime import datetime, timedelta, timezone
+from math import erf, sqrt
 import requests
+from telegram import Update, Bot
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-# ============ Конфигурация ============
-PAIR         = os.getenv("PAIR", "EURC-USDC")
-GRANULARITY  = int(os.getenv("GRANULARITY", "900"))     # 15 мин
-ATR_WINDOWS  = int(os.getenv("ATR_WINDOWS", "48"))      # 12 ч
-HORIZON_HRS  = float(os.getenv("HORIZON_HRS", "6"))
-APY_K        = float(os.getenv("APY_CONSTANT", "0.15"))
-P_HIGH       = float(os.getenv("P_HIGH", "0.25"))
-P_MED        = float(os.getenv("P_MED",  "0.10"))
-D_FLAT       = 0.10  # %
+# --- Config ---
+PAIR = os.getenv("PAIR", "EURC-USDC")
+GRANULARITY = 60  # 1 minute candles
+ATR_WINDOW = 48   # 48 x 1min = last 48 mins, acceptable for now
+OBSERVE_INTERVAL = 15 * 60  # seconds to stay in observe mode
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-CHAT_ID   = os.getenv("CHAT_ID")
-if not BOT_TOKEN or not CHAT_ID:
-    raise SystemExit("[env] BOT_TOKEN и/или CHAT_ID не заданы – остановка.")
+CHAT_ID = int(os.getenv("CHAT_ID", "0"))
 
-COINBASE_API = "https://api.exchange.coinbase.com"
+# --- LP State ---
+lp_center = None
+lp_lower = None
+lp_upper = None
+lp_state = "closed"
+observe_mode = False
+observe_start = None
+last_exit_price = None
+entry_exit_count = 0
+entry_log = []
 
-# ============ Математика ============
-def cdf_standard_normal(x: float) -> float:
+# --- Helpers ---
+def cdf_standard_normal(x):
     return 0.5 * (1 + erf(x / sqrt(2)))
 
-def exit_probability(d_pct: float, sigma_pct: float, horizon_h: float) -> float:
+def exit_probability(d_pct, sigma_pct, horizon_h=6):
     if sigma_pct == 0:
         return 0.0
     z = d_pct / (sigma_pct * sqrt(horizon_h / 24))
     return 2 * (1 - cdf_standard_normal(z))
 
-def expected_apy(width_pct: float) -> float:
-    return APY_K / (width_pct / 100)
+def expected_apy(width_pct):
+    return 0.15 / (width_pct / 100)
 
-# ============ Данные ============
-def fetch_candles(pair: str, granularity: int, window: int):
-    end = datetime.now(timezone.utc)
-    start = end - timedelta(seconds=granularity * (window + 20))
-    url = f"{COINBASE_API}/products/{pair}/candles"
-    params = {
-        "start": start.isoformat(),
-        "end": end.isoformat(),
-        "granularity": granularity
-    }
-    r = requests.get(url, params=params, timeout=10)
+def fetch_price_and_atr():
+    url = f"https://api.exchange.coinbase.com/products/{PAIR}/candles"
+    params = {"granularity": GRANULARITY, "limit": ATR_WINDOW + 1}
+    r = requests.get(url, params=params)
     r.raise_for_status()
-    return sorted(r.json(), key=lambda x: x[0])
+    candles = sorted(r.json(), key=lambda x: x[0])
+    close_prices = [c[4] for c in candles]
+    tr = [abs(close_prices[i] - close_prices[i - 1]) for i in range(1, len(close_prices))]
+    atr = mean(tr)
+    last_price = close_prices[-1]
+    sigma_pct = atr / last_price * 100
+    return last_price, sigma_pct
 
-def true_range(cur, prev_close):
-    high, low, close = cur[2], cur[1], cur[4]
-    return max(high - low, abs(high - prev_close), abs(low - prev_close))
+def format_lp_status(price, sigma_pct):
+    p_exit = exit_probability(0.1, sigma_pct)
+    status = f"\u2728 *LP Статус*\nЦена: `{price:.4f}`\nДиапазон: `{lp_lower:.4f} – {lp_upper:.4f}`\n\nσ = `{sigma_pct:.2f}%`\nP_exit = `{p_exit*100:.1f}%`\nСостояние: `{lp_state}`"
+    return status
 
-def compute_atr(candles, window):
-    if len(candles) < window + 1:
-        raise ValueError(f"Not enough candles: {len(candles)} (need {window+1})")
-    trs = [true_range(candles[-i], candles[-i - 1][4]) for i in range(1, window + 1)]
-    return mean(trs)
+async def send_message(text):
+    bot = Bot(token=BOT_TOKEN)
+    await bot.send_message(chat_id=CHAT_ID, text=text, parse_mode='MarkdownV2')
 
-# ============ Telegram ============
-def escape_md(text: str) -> str:
-    """Экранирует символы под MarkdownV2"""
-    for c in r"_*[]()~`>#+-=|{}.!":
-        text = text.replace(c, f"\\{c}")
-    return text
+# --- Telegram Commands ---
+async def set_lp(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global lp_center, lp_state
+    if context.args:
+        lp_center = float(context.args[0])
+        await update.message.reply_text(f"Центр LP установлен: {lp_center:.4f}")
+    else:
+        await update.message.reply_text("Использование: /set <цена>")
 
-def tg_send(text: str):
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": CHAT_ID,
-        "text": escape_md(text),
-        "parse_mode": "MarkdownV2"
-    }
-    r = requests.post(url, json=payload, timeout=10)
-    print("[tg]", r.status_code, r.text[:100])
-    r.raise_for_status()
+async def step_lp(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global lp_lower, lp_upper, lp_state, lp_center
+    if not lp_center:
+        await update.message.reply_text("Сначала задай центр LP: /set <цена>")
+        return
+    if len(context.args) == 2:
+        low_pct, high_pct = map(float, context.args)
+        lp_lower = lp_center * (1 - low_pct / 100)
+        lp_upper = lp_center * (1 + high_pct / 100)
+        lp_state = "open"
+        await update.message.reply_text(f"Диапазон LP: {lp_lower:.4f} – {lp_upper:.4f}\nLP активен.")
+    else:
+        await update.message.reply_text("Использование: /step <низ %> <верх %>")
 
-# ============ Основной цикл ============
-def main():
-    last_candle_ts = 0
-    last_range_code = None
-    last_sent_ts = 0
-    STATUS_EVERY_N_CANDLES = 4  # каждые 4 свечи (~1 ч при 15 мин)
+async def reset_lp(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global lp_center, lp_lower, lp_upper, lp_state, observe_mode, observe_start, entry_exit_count
+    lp_center = lp_lower = lp_upper = None
+    lp_state = "closed"
+    observe_mode = False
+    observe_start = None
+    entry_exit_count = 0
+    await update.message.reply_text("Настройки LP сброшены.")
 
-    print("[info] lp_alert_bot.py started")
+async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if lp_state == "closed":
+        await update.message.reply_text("LP не активен.")
+        return
+    price, sigma = fetch_price_and_atr()
+    msg = format_lp_status(price, sigma)
+    await update.message.reply_text(msg)
 
+# --- Monitoring loop ---
+async def monitor():
+    global lp_state, observe_mode, observe_start, last_exit_price, entry_exit_count
     while True:
         try:
-            candles = fetch_candles(PAIR, GRANULARITY, ATR_WINDOWS)
-            print("[debug] candles received:", len(candles))
+            if lp_state != "open":
+                await asyncio.sleep(60)
+                continue
 
-            atr_raw = compute_atr(candles, ATR_WINDOWS)
-            close = candles[-1][4]
-            sigma_pct = atr_raw / close * 100
-            p_exit = exit_probability(D_FLAT, sigma_pct, HORIZON_HRS)
+            price, sigma = fetch_price_and_atr()
+            now = datetime.now(timezone.utc)
 
-            # Решение
-            if sigma_pct > 0.50 or p_exit >= 0.60:
-                range_code = "exit"
-                msg = (
-                    f"🚨 Высокий риск!\nσ24h = {sigma_pct:.2f}%\nP_exit = {p_exit*100:.1f}%\n"
-                    "→ Вывести ликвидность или захеджироваться."
-                )
-            elif p_exit >= P_HIGH:
-                range_code = "wide"
-                width_pct = 0.30
-                msg = (
-                    f"⚠️ σ24h = {sigma_pct:.2f}%\nP_exit = {p_exit*100:.1f}%\n"
-                    f"→ диапазон ±0.30 %  (≈{expected_apy(width_pct):.0f}% APY)"
-                )
-            elif p_exit >= P_MED:
-                range_code = "medium"
-                width_pct = 0.17
-                msg = (
-                    f"σ24h = {sigma_pct:.2f}%\nP_exit = {p_exit*100:.1f}%\n"
-                    f"→ диапазон ±0.17 %  (≈{expected_apy(width_pct):.0f}% APY)"
-                )
-            else:
-                range_code = "narrow"
-                width_pct = 0.10
-                msg = (
-                    f"σ24h = {sigma_pct:.2f}%\nP_exit = {p_exit*100:.1f}% (спокойно)\n"
-                    f"→ держим ±0.10 %  (≈{expected_apy(width_pct):.0f}% APY)"
-                )
-
-            candle_ts = candles[-1][0]
-            now_ts = time.time()
-
-            time_trigger = now_ts - last_sent_ts > GRANULARITY * STATUS_EVERY_N_CANDLES
-            state_changed = range_code != last_range_code
-            new_candle = candle_ts != last_candle_ts
-
-            if new_candle and (state_changed or time_trigger):
-                ts_str = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
-                tg_send(f"{msg}\n`{ts_str}`")
-                print("[sent]", msg)
-                last_sent_ts = now_ts
-                last_range_code = range_code
-                last_candle_ts = candle_ts
-
-        except Exception as exc:
-            print("[error]", exc)
-
-        time.sleep(GRANULARITY)
-
-if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        print("Stopped by user.")
+            if lp_lower <= price <= lp_upper:
+                if observe_mode:
+                    if (datetime.now() - observe_start).total_seconds() > OBSERVE_INTERVAL:
+                        apy = expected_apy(0.10)
+                        await send_message(
+                            f"
