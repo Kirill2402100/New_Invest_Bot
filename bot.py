@@ -9,15 +9,16 @@ import requests
 from telegram import Update, Bot
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-# --- Config ---
+# --- Конфигурация ---
 PAIR = os.getenv("PAIR", "EURC-USDC")
 GRANULARITY = 60  # 1 минута
 ATR_WINDOW = 48   # 48 минут
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-CHAT_ID = int(os.getenv("CHAT_ID", "0"))
 OBSERVE_INTERVAL = 15 * 60  # 15 минут
 
-# --- LP State ---
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+CHAT_ID = int(os.getenv("CHAT_ID", "0"))
+
+# --- Состояние LP ---
 lp_center = None
 lp_lower = None
 lp_upper = None
@@ -27,7 +28,7 @@ observe_start = None
 last_exit_price = None
 entry_exit_count = 0
 
-# --- Helpers ---
+# --- Хелперы ---
 def cdf_standard_normal(x):
     return 0.5 * (1 + erf(x / sqrt(2)))
 
@@ -56,9 +57,9 @@ def fetch_price_and_atr():
 def format_lp_status(price, sigma_pct):
     p_exit = exit_probability(0.1, sigma_pct)
     return (
-        f"✨ *LP Статус*\n"
+        f"📊 *LP Статус*\n"
         f"Цена: `{price:.4f}`\n"
-        f"Диапазон: `{lp_lower:.4f} – {lp_upper:.4f}`\n\n"
+        f"Диапазон: `{lp_lower:.4f} – {lp_upper:.4f}`\n"
         f"σ = `{sigma_pct:.2f}%`\n"
         f"P_exit = `{p_exit*100:.1f}%`\n"
         f"Состояние: `{lp_state}`"
@@ -68,19 +69,19 @@ async def send_message(text):
     bot = Bot(token=BOT_TOKEN)
     await bot.send_message(chat_id=CHAT_ID, text=text, parse_mode="Markdown")
 
-# --- Telegram Commands ---
+# --- Команды Telegram ---
 async def set_lp(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global lp_center
     if context.args:
         lp_center = float(context.args[0])
-        await update.message.reply_text(f"✅ Центр LP установлен: {lp_center:.4f}")
+        await update.message.reply_text(f"📍 Центр LP установлен: `{lp_center:.4f}`", parse_mode="Markdown")
     else:
         await update.message.reply_text("Использование: /set <цена>")
 
 async def step_lp(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global lp_lower, lp_upper, lp_state, lp_center
     if not lp_center:
-        await update.message.reply_text("Сначала укажи центр LP: /set <цена>")
+        await update.message.reply_text("Сначала задай центр LP: /set <цена>")
         return
     if len(context.args) == 2:
         low_pct, high_pct = map(float, context.args)
@@ -88,11 +89,11 @@ async def step_lp(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lp_upper = lp_center * (1 + high_pct / 100)
         lp_state = "open"
         await update.message.reply_text(
-            f"📈 LP открыт:\nДиапазон: `{lp_lower:.4f} – {lp_upper:.4f}`\n"
-            f"Шаги: ⬇ {low_pct:.2f}% | ⬆ {high_pct:.2f}%"
+            f"📶 Диапазон LP: `{lp_lower:.4f} – {lp_upper:.4f}`\nСтатус: *LP активен*",
+            parse_mode="Markdown"
         )
     else:
-        await update.message.reply_text("Использование: /step <низ %> <верх %>")
+        await update.message.reply_text("Использование: /step <нижний %> <верхний %>")
 
 async def reset_lp(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global lp_center, lp_lower, lp_upper, lp_state, observe_mode, observe_start, entry_exit_count
@@ -101,17 +102,20 @@ async def reset_lp(update: Update, context: ContextTypes.DEFAULT_TYPE):
     observe_mode = False
     observe_start = None
     entry_exit_count = 0
-    await update.message.reply_text("🔁 LP сброшен. Все параметры очищены.")
+    await update.message.reply_text("♻️ Настройки LP сброшены.")
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if lp_state != "open":
-        await update.message.reply_text("ℹ️ LP не активен.")
+    if lp_state == "closed":
+        await update.message.reply_text("🔕 LP не активен.")
         return
-    price, sigma = fetch_price_and_atr()
-    msg = format_lp_status(price, sigma)
-    await update.message.reply_text(msg)
+    try:
+        price, sigma = fetch_price_and_atr()
+        msg = format_lp_status(price, sigma)
+        await update.message.reply_text(msg)
+    except Exception as e:
+        await update.message.reply_text(f"Ошибка: {e}")
 
-# --- Monitoring Logic ---
+# --- Мониторинг LP ---
 async def monitor():
     global lp_state, observe_mode, observe_start, last_exit_price, entry_exit_count
     while True:
@@ -123,46 +127,56 @@ async def monitor():
             price, sigma = fetch_price_and_atr()
             now = datetime.now(timezone.utc)
 
-            # В пределах диапазона
             if lp_lower <= price <= lp_upper:
                 if observe_mode and (datetime.now() - observe_start).total_seconds() > OBSERVE_INTERVAL:
-                    apy = expected_apy(0.10)
-                    await send_message(
-                        f"✅ *Ситуация стабилизировалась*\nРекомендуется открыть LP снова.\n"
-                        f"Диапазон ±0.10% ≈ `{apy:.0f}% APY`"
-                    )
                     observe_mode = False
+                    await send_message(
+                        f"🔁 Цена стабилизировалась. Можно открывать LP:\n"
+                        f"Рекомендую диапазон ±0.10% (≈{expected_apy(0.10):.0f}% APY)"
+                    )
                 await asyncio.sleep(60)
                 continue
 
-            # Вышли из диапазона
+            # Если вышли из диапазона
             if not observe_mode:
                 observe_mode = True
                 observe_start = datetime.now()
                 last_exit_price = price
-                direction = "⬆ вверх" if price > lp_upper else "⬇ вниз"
+                entry_exit_count += 1
+
+                action = ""
+                delta = abs(price - lp_center) / lp_center * 100
+                if delta < 0.02:
+                    action = "❌ Пока ничего не делаем."
+                elif delta < 0.05:
+                    action = "🔁 Конвертировать 50% в *USDC*."
+                else:
+                    action = "🚨 Конвертировать *всё* в USDC!"
+
                 await send_message(
-                    f"🚨 *Выход из LP!*\nЦена {direction} за пределы `{lp_lower:.4f} – {lp_upper:.4f}`\n"
-                    f"`{price:.4f}` – начинаем наблюдение..."
+                    f"⚠️ *Цена вышла из диапазона!*\n"
+                    f"`Цена: {price:.4f}`\n\n{action}"
                 )
 
             await asyncio.sleep(60)
 
         except Exception as e:
-            print("[error]", e)
+            await send_message(f"Ошибка мониторинга: {e}")
             await asyncio.sleep(60)
 
-# --- Entry Point ---
-async def main():
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+# --- Запуск приложения ---
+if __name__ == "__main__":
+    import nest_asyncio
+    from telegram.ext import Application
 
+    nest_asyncio.apply()
+
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("set", set_lp))
     app.add_handler(CommandHandler("step", step_lp))
-    app.add_handler(CommandHandler("status", status))
     app.add_handler(CommandHandler("reset", reset_lp))
+    app.add_handler(CommandHandler("status", status))
 
-    asyncio.create_task(monitor())
-    await app.run_polling()
-
-if __name__ == "__main__":
-    asyncio.run(main())
+    loop = asyncio.get_event_loop()
+    loop.create_task(monitor())
+    app.run_polling()
