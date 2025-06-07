@@ -31,13 +31,15 @@ import json
 SHEET_ID = os.getenv("SHEET_ID")
 
 scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-CREDENTIALS_FILE = "credentials.json"
-creds = ServiceAccountCredentials.from_json_keyfile_name(CREDENTIALS_FILE, scope)
+
+# Загрузка ключа из переменной окружения GOOGLE_CREDENTIALS
+google_creds_json = os.getenv("GOOGLE_CREDENTIALS")
+creds_dict = json.loads(google_creds_json)
+creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
 
 import gspread
 sheet_client = gspread.authorize(creds)
 sheet = sheet_client.open_by_key(SHEET_ID).worksheet("LP_Logs")
-
 # === Состояние LP ===
 lp_center = None
 lp_lower = None
