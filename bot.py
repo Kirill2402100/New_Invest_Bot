@@ -1,201 +1,168 @@
-# bot.py  – LP-supervisor с Google Sheets отчётностью
-# -----------------------------------------------
+# -*- coding: utf-8 -*-
+"""
+LP supervisor bot – c поддержкой Google Sheets.
+Шапки и структура листов:
+  LP_Logs   : Дата-время | Время start | Время stop | Минут | P&L | APR_цикла
+  Daily     : День       | P&L | Ср_APR | Прогноз_APR | Циклов | LP_время(%)
+  Monthly   : Месяц      | P&L | Ср_APR | Прогноз_APR | Циклов | LP_время(%)
+"""
 import os, json, asyncio, time
 from datetime import datetime, timezone
 from statistics import mean
 from math import erf, sqrt
 
-import requests
-import gspread
+import requests, gspread
 from oauth2client.service_account import ServiceAccountCredentials
 from telegram import Update, Bot
 from telegram.ext import (
-    ApplicationBuilder, Application,
-    CommandHandler, ContextTypes
+    ApplicationBuilder, CommandHandler, ContextTypes
 )
 
-# ----------- ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ ----------------
+# ---------- ПАРАМЕТРЫ ----------
 PAIR          = os.getenv("PAIR", "EURC-USDC")
+GRANULARITY   = 60          # свеча 1 мин
+ATR_WINDOW    = 48
+OBS_INTERVAL  = 15 * 60     # 15 мин
+CHAT_IDS      = [
+    int(os.getenv("CHAT_ID_MAIN", "0")),
+    int(os.getenv("CHAT_ID_OPERATOR", "0"))
+]
 BOT_TOKEN     = os.getenv("BOT_TOKEN")
-CHAT_IDS      = [int(x) for x in os.getenv("CHAT_ID", "").split(",") if x]
 
-SHEET_ID      = os.getenv("SHEET_ID")               # id таблицы
-GOOGLE_CREDS  = json.loads(os.getenv("GOOGLE_CREDENTIALS"))
+# ---------- GOOGLE SHEETS ----------
+SHEET_ID      = os.getenv("SHEET_ID")
+scope         = [
+    "https://spreadsheets.google.com/feeds",
+    "https://www.googleapis.com/auth/drive",
+]
+creds_dict    = json.loads(os.getenv("GOOGLE_CREDENTIALS"))
+creds         = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+gs            = gspread.authorize(creds)
 
-# ----------- GOOGLE SHEETS -----------------------
-scope  = ["https://spreadsheets.google.com/feeds",
-          "https://www.googleapis.com/auth/drive"]
-creds  = ServiceAccountCredentials.from_json_keyfile_dict(GOOGLE_CREDS, scope)
-sheet  = gspread.authorize(creds).open_by_key(SHEET_ID).worksheet("LP_Logs")
+LOGS_WS       = gs.open_by_key(SHEET_ID).worksheet("LP_Logs")
 
-# ----------- СОСТОЯНИЕ LP ------------------------
-lp_lower: float | None = None     # нижняя граница
-lp_upper: float | None = None     # верхняя
-lp_center: float | None = None    # центр (считаем сами)
-lp_state   = "closed"             # "open"/"closed"
-observe_mode   = False
-observe_start  = None
-entry_exit_cnt = 0
-last_report_ts = 0.0
+HEADERS = [
+    "Дата-время",        # A
+    "Время start",       # B
+    "Время stop",        # C
+    "Минут",             # D
+    "P&L за цикл (USDC)",# E
+    "APR цикла (%)",     # F
+]
 
-cap_in   = 0.0                    # USDC, вход
-cap_out  = 0.0                    # USDC, выход
-lp_start = None                   # datetime, вход
+def ensure_headers(ws):
+    first_row = ws.row_values(1)
+    if first_row != HEADERS:
+        ws.resize(1)               # очищаем, оставляем только 1-ю строку
+        ws.append_row(HEADERS)
 
-# ----------- КОНСТАНТЫ РАССЧЁТА ------------------
-GRANULARITY      = 60             # сек, 1-мин свеча
-ATR_WINDOW       = 48             # 48 мин
-OBSERVE_INTERVAL = 15 * 60        # сек
+ensure_headers(LOGS_WS)             # один раз при старте
 
-# ----------- УТИЛИТЫ -----------------------------
-def cdf(x): return 0.5 * (1 + erf(x / sqrt(2)))
+# ---------- СОСТОЯНИЕ ----------
+lp_open        = False
+lp_start_price = None
+lp_start_time  = None
+lp_capital_in  = 0.0
 
-def exit_prob(d_pct, sigma_pct, horizon_h=6):
+# ---------- УТИЛИТЫ ----------
+def cdf_norm(x): return 0.5 * (1 + erf(x / sqrt(2)))
+
+def exit_prob(d_pct, sigma_pct, h=6):
     if sigma_pct == 0: return 0.0
-    z = d_pct / (sigma_pct * sqrt(horizon_h / 24))
-    return 2 * (1 - cdf(z))
+    z = d_pct / (sigma_pct * sqrt(h / 24))
+    return 2 * (1 - cdf_norm(z))
 
-def fetch_price_atr():
+def price_and_atr():
     url = f"https://api.exchange.coinbase.com/products/{PAIR}/candles"
-    r   = requests.get(url, params={"granularity": GRANULARITY,
-                                    "limit": ATR_WINDOW+1}, timeout=10)
+    r   = requests.get(url, params=dict(granularity=GRANULARITY, limit=ATR_WINDOW+1))
     r.raise_for_status()
-    cs   = sorted(r.json(), key=lambda x: x[0])
-    close = [c[4] for c in cs]
-    tr    = [abs(close[i]-close[i-1]) for i in range(1, len(close))]
-    atr   = mean(tr)
-    return close[-1], atr/close[-1]*100
+    candles = sorted(r.json(), key=lambda x: x[0])
+    closes  = [c[4] for c in candles]
+    atr     = mean(abs(closes[i]-closes[i-1]) for i in range(1,len(closes)))
+    return closes[-1], atr / closes[-1] * 100
 
-async def say(msg:str):
+async def say(txt):
     bot = Bot(BOT_TOKEN)
     for cid in CHAT_IDS:
-        await bot.send_message(cid, msg, parse_mode="Markdown")
+        await bot.send_message(cid, txt, parse_mode="Markdown")
 
-def log_exit(now, pnl_usd, pnl_pct, apr_pct, dur_min):
-    """Пишем строку EXIT в лист"""
-    sheet.append_row([
-        now.strftime('%Y-%m-%d %H:%M:%S'),
-        f"{lp_center:.5f}" if lp_center else "",
-        "EXIT",
-        f"{cap_in:.2f}", f"{cap_out:.2f}",
-        f"{pnl_usd:+.2f}", f"{pnl_pct:+.4f}",
-        f"{dur_min:.1f}", f"{apr_pct:.2f}"
-    ])
-
-# ----------- КОМАНДЫ TG --------------------------
-async def cmd_set(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
-    global lp_lower, lp_upper, lp_center, lp_state, observe_mode, entry_exit_cnt
-    if len(ctx.args) != 2:
-        await update.message.reply_text("Формат: /set LOW HIGH (цены)")
-        return
-    try:
-        lp_lower, lp_upper = map(float, ctx.args)
-        if lp_lower >= lp_upper:
-            raise ValueError
-        lp_center = (lp_lower + lp_upper) / 2
-        lp_state  = "open"
-        observe_mode = False; entry_exit_cnt = 0
-        await update.message.reply_text(
-            f"📦 Диапазон активирован:\n`{lp_lower:.5f} — {lp_upper:.5f}`",
-            parse_mode='Markdown'
-        )
-    except ValueError:
-        await update.message.reply_text("Неверные числа. Пример: /set 1.13495 1.14001")
-
+# ---------- КОМАНДЫ ----------
 async def cmd_capital(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
-    global cap_in, lp_start
+    global lp_capital_in
     if not ctx.args: return
-    try:
-        cap_in = float(ctx.args[0].replace(",", "."))
-        lp_start = datetime.now(timezone.utc)
-        await update.message.reply_text(f"💰 Вход: `{cap_in:.2f} USDC`", parse_mode='Markdown')
-    except ValueError:
-        await update.message.reply_text("Формат: /capital 1000.00")
+    lp_capital_in = float(ctx.args[0].replace(',','.'))
+    await update.message.reply_text(f"💰 Капитал входа установлен: *{lp_capital_in:.2f} USDC*", parse_mode='Markdown')
+
+async def cmd_set(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
+    """
+    /set 1.13495 1.14001
+    """
+    global lp_open, lp_start_price, lp_start_time
+    if len(ctx.args) != 2:
+        await update.message.reply_text("Формат: /set <price_low> <price_high>")
+        return
+    low, high      = map(float, ctx.args)
+    lp_start_price = (low + high) / 2
+    lp_open        = True
+    lp_start_time  = datetime.now(timezone.utc)
+    await update.message.reply_text(
+        f"📦 LP открыт\nДиапазон: `{low}` – `{high}`", parse_mode='Markdown'
+    )
 
 async def cmd_reset(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
-    """Фиксируем выход, пишем строку в лог и закрываем LP"""
-    global cap_out, lp_state, observe_mode, entry_exit_cnt
-    if not ctx.args:
-        await update.message.reply_text("⚠️ /reset <сумма выхода>")
+    """
+    /reset 11500   — фиксируем выход, считаем P&L, заносим строку в таблицу
+    """
+    global lp_open
+    if not lp_open:
+        await update.message.reply_text("LP уже закрыт.")
         return
-    try:
-        cap_out = float(ctx.args[0].replace(",", "."))
-    except ValueError:
-        return await update.message.reply_text("Число USDC, пример: /reset 1040")
+    if not ctx.args:
+        await update.message.reply_text("Формат: /reset <Cap_out_USDC>")
+        return
 
-    now   = datetime.now(timezone.utc)
-    dur   = (now - lp_start).total_seconds()/60 if lp_start else 0
-    pnl   = cap_out - cap_in
-    pnlpc = (pnl / cap_in) if cap_in else 0
-    apr   = pnlpc * (525600/dur)*100 if dur and cap_in else 0
+    cap_out   = float(ctx.args[0].replace(',','.'))
+    t_stop    = datetime.now(timezone.utc)
+    minutes   = round((t_stop - lp_start_time).total_seconds() / 60, 1)
+    pnl       = cap_out - lp_capital_in
+    apr_cycle = (pnl / lp_capital_in) * (525600 / minutes) * 100 if minutes > 0 else 0
 
-    log_exit(now, pnl, pnlpc, apr, dur)
+    LOGS_WS.append_row([
+        lp_start_time.strftime('%Y-%m-%d %H:%M:%S'),        # Дата-время (старт)
+        lp_start_time.strftime('%H:%M'),                    # Время start
+        t_stop.strftime('%H:%M'),                           # Время stop
+        minutes,                                           # Минут
+        round(pnl, 2),                                     # P&L
+        round(apr_cycle, 1),                               # APR цикла
+    ])
 
-    lp_state = "closed"; observe_mode = False; entry_exit_cnt = 0
-    await say(f"✅ *LP закрыт*\n"
-              f"PnL: `{pnl:+.2f} USDC`  ({pnlpc*100:+.2f} %)\n"
-              f"APR: `{apr:+.2f} %` за {dur:.1f} мин.")
+    lp_open = False
+    await update.message.reply_text(
+        f"🚪 LP закрыт. P&L: *{pnl:+.2f} USDC*, APR цикла ≈ *{apr_cycle:.1f}%*",
+        parse_mode='Markdown'
+    )
 
-async def cmd_status(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
-    price, _ = fetch_price_atr()
-    msg = f"*Статус*: {lp_state.upper()}\n" \
-          f"Цена: `{price:.5f}`\n"
-    if lp_state == "open":
-        msg += f"Диапазон: `{lp_lower:.5f} — {lp_upper:.5f}`\n" \
-               f"Вход: `{cap_in:.2f} USDC`"
-    await update.message.reply_text(msg, parse_mode='Markdown')
+async def cmd_status(update:Update, _):
+    status = "OPEN" if lp_open else "CLOSED"
+    await update.message.reply_text(f"Статус LP: *{status}*", parse_mode='Markdown')
 
-# ----------- МОНИТОР -----------------------------
-async def monitor():
-    global observe_mode, observe_start, entry_exit_cnt, last_report_ts
+# ---------- ОСНОВНОЙ ЦИКЛ НАБЛЮДЕНИЯ ----------
+async def watcher():
     while True:
-        if lp_state != "open":
-            await asyncio.sleep(60) ; continue
+        # … здесь можно добавить логику сигналов при выходе цены
+        await asyncio.sleep(300)
 
-        price, sigma = fetch_price_atr()
-        now  = datetime.now(timezone.utc)
-        in_range = lp_lower <= price <= lp_upper
-        header = None
+# ---------- ЗАПУСК ----------
+if __name__ == "__main__":
+    import nest_asyncio, asyncio
+    nest_asyncio.apply()
 
-        if in_range:
-            if observe_mode and (now-observe_start).total_seconds() > OBSERVE_INTERVAL:
-                observe_mode=False; entry_exit_cnt=0
-                header="✅ Цена вернулась в диапазон"
-        else:
-            diff = abs(price - (lp_upper if price>lp_upper else lp_lower))
-            diff_pct = diff/lp_center*100 if lp_center else 0
-            p_exit = exit_prob(0.1, sigma)
-            if not observe_mode:
-                observe_mode=True; observe_start=now; entry_exit_cnt=1
-            else:
-                entry_exit_cnt +=1
-            header="🚨 Цена вышла" + (" *резко*" if diff_pct>0.05 else "")
-
-            advice = ("Спокойно." if diff_pct<=0.02 else
-                      "📉 Конвертируйте 50 % в USDC." if diff_pct<=0.05 else
-                      "⚠️ Полная конвертация в USDC!")
-
-            message = (f"{header}\n"
-                       f"Текущая: `{price:.5f}`\n"
-                       f"Δ = {diff_pct:.2f}%  σ = {sigma:.2f}%\n"
-                       f"P_exit ≈ {p_exit*100:.1f}%\n\n{advice}")
-            if (time.time()-last_report_ts) > 60:
-                await say(message); last_report_ts=time.time()
-
-        await asyncio.sleep(60)
-
-# ----------- СТАРТ -------------------------------
-def main():
-    app:Application = ApplicationBuilder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("set",     cmd_set))
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("capital", cmd_capital))
-    app.add_handler(CommandHandler("reset",   cmd_reset))
-    app.add_handler(CommandHandler("status",  cmd_status))
+    app.add_handler(CommandHandler("set",      cmd_set))
+    app.add_handler(CommandHandler("reset",    cmd_reset))
+    app.add_handler(CommandHandler("status",   cmd_status))
 
     loop = asyncio.get_event_loop()
-    loop.create_task(monitor())
+    loop.create_task(watcher())
     app.run_polling()
-
-if __name__ == "__main__":
-    import nest_asyncio; nest_asyncio.apply()
-    main()
