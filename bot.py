@@ -157,4 +157,12 @@ if __name__ == "__main__":
 
     loop = asyncio.get_event_loop()
     loop.create_task(watcher())
+
+    from telegram.ext import MessageHandler, filters
+
+    async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        chat_id = update.effective_chat.id
+        await update.message.reply_text(f"Ваш chat_id: {chat_id}")
+
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, echo))
     app.run_polling()
