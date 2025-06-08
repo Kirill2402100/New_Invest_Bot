@@ -24,8 +24,7 @@ GRANULARITY   = 60          # свеча 1 мин
 ATR_WINDOW    = 48
 OBS_INTERVAL  = 15 * 60     # 15 мин
 CHAT_IDS      = [
-    int(os.getenv("CHAT_ID_MAIN", "0")),
-    int(os.getenv("CHAT_ID_OPERATOR", "0"))
+    int(cid) for cid in os.getenv("CHAT_IDS", "0").split(",")
 ]
 BOT_TOKEN     = os.getenv("BOT_TOKEN")
 
@@ -94,12 +93,9 @@ async def cmd_capital(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"💰 Капитал входа установлен: *{lp_capital_in:.2f} USDC*", parse_mode='Markdown')
 
 async def cmd_set(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
-    """
-    /set 1.13495 1.14001
-    """
     global lp_open, lp_start_price, lp_start_time
     if len(ctx.args) != 2:
-        await update.message.reply_text("Формат: /set <price_low> <price_high>")
+        await update.message.reply_text("/сет <цена low> <цена high>")
         return
     low, high      = map(float, ctx.args)
     lp_start_price = (low + high) / 2
@@ -110,15 +106,12 @@ async def cmd_set(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     )
 
 async def cmd_reset(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
-    """
-    /reset 11500   — фиксируем выход, считаем P&L, заносим строку в таблицу
-    """
     global lp_open
     if not lp_open:
         await update.message.reply_text("LP уже закрыт.")
         return
     if not ctx.args:
-        await update.message.reply_text("Формат: /reset <Cap_out_USDC>")
+        await update.message.reply_text("/ресет <Cap_out_USDC>")
         return
 
     cap_out   = float(ctx.args[0].replace(',','.'))
@@ -128,17 +121,17 @@ async def cmd_reset(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     apr_cycle = (pnl / lp_capital_in) * (525600 / minutes) * 100 if minutes > 0 else 0
 
     LOGS_WS.append_row([
-        lp_start_time.strftime('%Y-%m-%d %H:%M:%S'),        # Дата-время (старт)
-        lp_start_time.strftime('%H:%M'),                    # Время start
-        t_stop.strftime('%H:%M'),                           # Время stop
-        minutes,                                           # Минут
-        round(pnl, 2),                                     # P&L
-        round(apr_cycle, 1),                               # APR цикла
+        lp_start_time.strftime('%Y-%m-%d %H:%M:%S'),        # Дата-время
+        lp_start_time.strftime('%H:%M'),                    # start
+        t_stop.strftime('%H:%M'),                           # stop
+        minutes,                                            # в минутах
+        round(pnl, 2),                                      # P&L
+        round(apr_cycle, 1),                                # APR
     ])
 
     lp_open = False
     await update.message.reply_text(
-        f"🚪 LP закрыт. P&L: *{pnl:+.2f} USDC*, APR цикла ≈ *{apr_cycle:.1f}%*",
+        f"🚪 LP закрыт. P&L: *{pnl:+.2f} USDC*, APR: *{apr_cycle:.1f}%*",
         parse_mode='Markdown'
     )
 
@@ -146,15 +139,14 @@ async def cmd_status(update:Update, _):
     status = "OPEN" if lp_open else "CLOSED"
     await update.message.reply_text(f"Статус LP: *{status}*", parse_mode='Markdown')
 
-# ---------- ОСНОВНОЙ ЦИКЛ НАБЛЮДЕНИЯ ----------
+# ---------- ЦИКЛ НАБЛЮДЕНИЯ ----------
 async def watcher():
     while True:
-        # … здесь можно добавить логику сигналов при выходе цены
         await asyncio.sleep(300)
 
 # ---------- ЗАПУСК ----------
 if __name__ == "__main__":
-    import nest_asyncio, asyncio
+    import nest_asyncio
     nest_asyncio.apply()
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
