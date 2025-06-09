@@ -70,14 +70,7 @@ def price_and_atr():
 async def say(text):
     bot = Bot(BOT_TOKEN)
     for cid in CHAT_IDS:
-        await bot.send_message(cid, text, parse_mode="MarkdownV2")
-
-def escape_md(text):
-    """Экранирует спецсимволы MarkdownV2"""
-    escape_chars = r"_*[]()~`>#+-=|{}.!"
-    for c in escape_chars:
-        text = text.replace(c, f"\\{c}")
-    return text
+        await bot.send_message(cid, text, parse_mode="Markdown")
 
 # ---------- КОМАНДЫ ----------
 async def cmd_capital(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -161,14 +154,14 @@ async def watcher():
             if now_in_lp != last_in_lp:
                 last_in_lp = now_in_lp
                 if not now_in_lp:
-                    msg = f"*\$begin:math:display$LP EXIT\\$end:math:display$* Цена: *{price:.5f}* \$begin:math:text$от центра: {deviation:+.3f}%\\$end:math:text$\n"
+                    msg = f"*LP EXIT* \u0426ена: *{price:.5f}* (\u043eт \u0446ентра: {deviation:+.3f}%)\n"
                     if abs(deviation) < 0.02:
-                        msg += "→ Цена близка, LP не трогаем\\. Следим\\. 👁"
+                        msg += "→ Цена близка, LP не трогаем. Следим. 👁"
                     elif abs(deviation) < 0.05:
-                        msg += "→ ⚠️ Рекомендуется продать 50% EURC → USDC\\.\\nЖдём стабилизации\\."
+                        msg += "→ ⚠️ Рекомендуется продать 50% EURC → USDC.\nЖдём стабилизации."
                     else:
-                        msg += "→ ❌ Рекомендуется *полный выход*\\. Продать EURC → USDC\\."
-                    await say(escape_md(msg))
+                        msg += "→ ❌ Рекомендуется *полный выход*. Продать EURC → USDC."
+                    await say(msg)
 
             flips = sum(1 for i in range(1, len(entry_exit_log)) if entry_exit_log[i] != entry_exit_log[i-1])
             if flips >= 6:
@@ -176,39 +169,30 @@ async def watcher():
                 entry_exit_log = []
 
         except Exception as e:
-            await say(escape_md(f"🚨 Ошибка в watcher: {e}"))
+            await say(f"🚨 Ошибка в watcher: {e}")
 
 # ---------- ЗАПУСК ----------
 if __name__ == "__main__":
     import nest_asyncio
-    import asyncio
     from telegram import Bot
 
     nest_asyncio.apply()
 
     async def main():
-        # Удаляем webhook, если вдруг он был установлен ранее (важно для polling)
         await Bot(BOT_TOKEN).delete_webhook(drop_pending_updates=True)
-
-        # Создаём приложение Telegram-бота
         app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-        # Регистрируем команды
         app.add_handler(CommandHandler("capital", cmd_capital))
         app.add_handler(CommandHandler("set", cmd_set))
         app.add_handler(CommandHandler("reset", cmd_reset))
         app.add_handler(CommandHandler("status", cmd_status))
+        app.add_handler(
+            MessageHandler(filters.TEXT & ~filters.COMMAND,
+                lambda update, context: update.message.reply_text(f"Ваш chat_id: {update.effective_chat.id}")
+            )
+        )
 
-        # Ответ на текст (показ chat_id)
-        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,
-            lambda update, context: update.message.reply_text(f"Ваш chat_id: {update.effective_chat.id}")
-        ))
-
-        # Фоновая задача — watcher
         asyncio.get_running_loop().create_task(watcher())
-
         await app.run_polling()
 
-    # Запускаем асинхронно через loop
-    loop = asyncio.get_event_loop()
-    loop.run_until_complete(main())
+    asyncio.run(main())
