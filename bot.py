@@ -2,18 +2,32 @@
 """
 LP supervisor bot – c поддержкой Google Sheets.
 """
-import os, json, asyncio
+
+import os, sys, json, asyncio
 from datetime import datetime, timezone
 from statistics import mean
 from math import erf, sqrt
 
+# ---------- ЗАЩИТА ОТ ПОВТОРНОГО ЗАПУСКА ----------
+LOCK_FILE = "/tmp/bot.lock"
+
+def ensure_single_instance():
+    try:
+        fd = os.open(LOCK_FILE, os.O_CREAT | os.O_EXCL | os.O_RDWR)
+        os.write(fd, str(os.getpid()).encode())
+    except FileExistsError:
+        print("❌ Бот уже запущен в другом процессе!")
+        sys.exit(1)
+
+ensure_single_instance()
+
+# ---------- ИМПОРТЫ ДЛЯ БОТА ----------
 import requests, gspread
 from oauth2client.service_account import ServiceAccountCredentials
 from telegram import Update, Bot
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
 )
-
 # ---------- ПАРАМЕТРЫ ----------
 PAIR          = os.getenv("PAIR", "EURC-USDC")
 GRANULARITY   = 60
