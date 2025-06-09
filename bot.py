@@ -194,21 +194,25 @@ async def watcher():
 # ---------- ЗАПУСК ----------
 if __name__ == "__main__":
     import nest_asyncio
+    import asyncio
     nest_asyncio.apply()
 
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("capital", cmd_capital))
-    app.add_handler(CommandHandler("set",      cmd_set))
-    app.add_handler(CommandHandler("reset",    cmd_reset))
-    app.add_handler(CommandHandler("status",   cmd_status))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, lambda update, context: update.message.reply_text(f"Ваш chat_id: {update.effective_chat.id}")))
+    from telegram import Bot
 
-    loop = asyncio.get_event_loop()
-    loop.create_task(watcher())
-  
-    import asyncio
-    await asyncio.get_event_loop().run_until_complete(
-    Bot(BOT_TOKEN).delete_webhook(drop_pending_updates=True)
-    )
-    
-    app.run_polling()
+    async def main():
+        await Bot(BOT_TOKEN).delete_webhook(drop_pending_updates=True)
+
+        app = ApplicationBuilder().token(BOT_TOKEN).build()
+        app.add_handler(CommandHandler("capital", cmd_capital))
+        app.add_handler(CommandHandler("set",      cmd_set))
+        app.add_handler(CommandHandler("reset",    cmd_reset))
+        app.add_handler(CommandHandler("status",   cmd_status))
+        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, lambda update, context: update.message.reply_text(f"Ваш chat_id: {update.effective_chat.id}")))
+
+        # Запускаем watcher как отдельную задачу
+        loop = asyncio.get_running_loop()
+        loop.create_task(watcher())
+
+        await app.run_polling()
+
+    asyncio.run(main())
