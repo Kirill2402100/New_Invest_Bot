@@ -2,32 +2,33 @@
 """
 LP supervisor bot – c поддержкой Google Sheets.
 """
-
-import os, sys, json, asyncio
+import os, json, asyncio, sys, atexit
 from datetime import datetime, timezone
 from statistics import mean
 from math import erf, sqrt
 
-# ---------- ЗАЩИТА ОТ ПОВТОРНОГО ЗАПУСКА ----------
-LOCK_FILE = "/tmp/bot.lock"
-
-def ensure_single_instance():
-    try:
-        fd = os.open(LOCK_FILE, os.O_CREAT | os.O_EXCL | os.O_RDWR)
-        os.write(fd, str(os.getpid()).encode())
-    except FileExistsError:
-        print("❌ Бот уже запущен в другом процессе!")
-        sys.exit(1)
-
-ensure_single_instance()
-
-# ---------- ИМПОРТЫ ДЛЯ БОТА ----------
 import requests, gspread
 from oauth2client.service_account import ServiceAccountCredentials
 from telegram import Update, Bot
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
 )
+
+# ---------- ANTI-DUPLICATE PROTECTION ----------
+LOCKFILE = "lockfile.pid"
+
+if os.path.exists(LOCKFILE):
+    print("⚠️ Бот уже запущен. Завершаем второй экземпляр.")
+    sys.exit(1)
+
+with open(LOCKFILE, "w") as f:
+    f.write(str(os.getpid()))
+
+def cleanup():
+    if os.path.exists(LOCKFILE):
+        os.remove(LOCKFILE)
+atexit.register(cleanup)
+
 # ---------- ПАРАМЕТРЫ ----------
 PAIR          = os.getenv("PAIR", "EURC-USDC")
 GRANULARITY   = 60
@@ -85,6 +86,12 @@ async def say(text):
     bot = Bot(BOT_TOKEN)
     for cid in CHAT_IDS:
         await bot.send_message(cid, text, parse_mode="Markdown")
+
+def escape_md(text):
+    escape_chars = r"_*[]()~`>#+-=|{}.!"
+    for c in escape_chars:
+        text = text.replace(c, f"\\{c}")
+    return text
 
 # ---------- КОМАНДЫ ----------
 async def cmd_capital(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -168,14 +175,14 @@ async def watcher():
             if now_in_lp != last_in_lp:
                 last_in_lp = now_in_lp
                 if not now_in_lp:
-                    msg = f"*LP EXIT* \u0426ена: *{price:.5f}* (\u043eт \u0446ентра: {deviation:+.3f}%)\n"
+                    msg = f"*LP EXIT* Цена: *{price:.5f}* (от центра: {deviation:+.3f}%)\n"
                     if abs(deviation) < 0.02:
                         msg += "→ Цена близка, LP не трогаем. Следим. 👁"
                     elif abs(deviation) < 0.05:
                         msg += "→ ⚠️ Рекомендуется продать 50% EURC → USDC.\nЖдём стабилизации."
                     else:
                         msg += "→ ❌ Рекомендуется *полный выход*. Продать EURC → USDC."
-                    await say(msg)
+                    await say(escape_md(msg))
 
             flips = sum(1 for i in range(1, len(entry_exit_log)) if entry_exit_log[i] != entry_exit_log[i-1])
             if flips >= 6:
@@ -183,30 +190,28 @@ async def watcher():
                 entry_exit_log = []
 
         except Exception as e:
-            await say(f"🚨 Ошибка в watcher: {e}")
+            await say(escape_md(f"🚨 Ошибка в watcher: {e}"))
 
 # ---------- ЗАПУСК ----------
 if __name__ == "__main__":
     import nest_asyncio
-    from telegram import Bot
-
     nest_asyncio.apply()
 
     async def main():
         await Bot(BOT_TOKEN).delete_webhook(drop_pending_updates=True)
-        app = ApplicationBuilder().token(BOT_TOKEN).build()
 
+        app = ApplicationBuilder().token(BOT_TOKEN).build()
         app.add_handler(CommandHandler("capital", cmd_capital))
         app.add_handler(CommandHandler("set", cmd_set))
         app.add_handler(CommandHandler("reset", cmd_reset))
         app.add_handler(CommandHandler("status", cmd_status))
-        app.add_handler(
-            MessageHandler(filters.TEXT & ~filters.COMMAND,
-                lambda update, context: update.message.reply_text(f"Ваш chat_id: {update.effective_chat.id}")
-            )
-        )
+
+        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,
+            lambda update, context: update.message.reply_text(f"Ваш chat_id: {update.effective_chat.id}")
+        ))
 
         asyncio.get_running_loop().create_task(watcher())
         await app.run_polling()
 
-    asyncio.run(main())
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(main())
