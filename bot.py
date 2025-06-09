@@ -15,7 +15,7 @@ import requests, gspread
 from oauth2client.service_account import ServiceAccountCredentials
 from telegram import Update, Bot
 from telegram.ext import (
-    ApplicationBuilder, CommandHandler, ContextTypes
+    ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
 )
 
 # ---------- ПАРАМЕТРЫ ----------
@@ -62,6 +62,10 @@ lp_open        = False
 lp_start_price = None
 lp_start_time  = None
 lp_capital_in  = 0.0
+lp_range_low   = None
+lp_range_high  = None
+last_in_lp     = True
+entry_exit_log = []
 
 # ---------- УТИЛИТЫ ----------
 def cdf_norm(x): return 0.5 * (1 + erf(x / sqrt(2)))
@@ -90,19 +94,22 @@ async def cmd_capital(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     global lp_capital_in
     if not ctx.args: return
     lp_capital_in = float(ctx.args[0].replace(',','.'))
-    await update.message.reply_text(f"💰 Капитал входа установлен: *{lp_capital_in:.2f} USDC*", parse_mode='Markdown')
+    await update.message.reply_text(f"\U0001F4B0 Капитал входа установлен: *{lp_capital_in:.2f} USDC*", parse_mode='Markdown')
 
 async def cmd_set(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
-    global lp_open, lp_start_price, lp_start_time
+    global lp_open, lp_start_price, lp_start_time, lp_range_low, lp_range_high, last_in_lp, entry_exit_log
     if len(ctx.args) != 2:
         await update.message.reply_text("/сет <цена low> <цена high>")
         return
     low, high      = map(float, ctx.args)
     lp_start_price = (low + high) / 2
+    lp_range_low, lp_range_high = low, high
     lp_open        = True
     lp_start_time  = datetime.now(timezone.utc)
+    last_in_lp     = True
+    entry_exit_log = []
     await update.message.reply_text(
-        f"📦 LP открыт\nДиапазон: `{low}` – `{high}`", parse_mode='Markdown'
+        f"\U0001F4E6 LP открыт\nДиапазон: `{low}` – `{high}`", parse_mode='Markdown'
     )
 
 async def cmd_reset(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
@@ -131,7 +138,7 @@ async def cmd_reset(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
 
     lp_open = False
     await update.message.reply_text(
-        f"🚪 LP закрыт. P&L: *{pnl:+.2f} USDC*, APR: *{apr_cycle:.1f}%*",
+        f"\U0001F6AA LP закрыт. P&L: *{pnl:+.2f} USDC*, APR: *{apr_cycle:.1f}%*",
         parse_mode='Markdown'
     )
 
@@ -141,8 +148,48 @@ async def cmd_status(update:Update, _):
 
 # ---------- ЦИКЛ НАБЛЮДЕНИЯ ----------
 async def watcher():
+    global lp_open, lp_range_low, lp_range_high, last_in_lp, entry_exit_log
+
     while True:
-        await asyncio.sleep(300)
+        await asyncio.sleep(60)  # проверка каждую минуту
+
+        if not lp_open or lp_range_low is None or lp_range_high is None:
+            continue
+
+        try:
+            price, _ = price_and_atr()
+            center   = lp_start_price
+            deviation = (price - center) / center * 100  # в %
+
+            now_in_lp = lp_range_low <= price <= lp_range_high
+            entry_exit_log.append(now_in_lp)
+            if len(entry_exit_log) > 240:
+                entry_exit_log.pop(0)
+
+            if now_in_lp != last_in_lp:
+                last_in_lp = now_in_lp
+
+                if now_in_lp:
+                    continue
+                else:
+                    msg = f"*[LP EXIT]* Цена: *{price:.5f}* (от центра: {deviation:+.3f}%)\n"
+
+                    if abs(deviation) < 0.02:
+                        msg += "→ Цена близка, LP не трогаем. Следим. \U0001F441"
+                    elif abs(deviation) < 0.05:
+                        msg += "→ ⚠️ Рекомендуется продать 50% EURC → USDC.\nЖдём стабилизации."
+                    else:
+                        msg += "→ ❌ Рекомендуется *полный выход*. Продать EURC → USDC."
+
+                    await say(msg)
+
+            flips = sum(1 for i in range(1, len(entry_exit_log)) if entry_exit_log[i] != entry_exit_log[i-1])
+            if flips >= 6:
+                await say("🔁 *Обнаружена пила: 6+ заходов/выходов за 4ч*\n→ 💡 Рекомендуется пересобрать LP диапазон ближе к текущей цене.")
+                entry_exit_log = []
+
+        except Exception as e:
+            await say(f"🚨 Ошибка в watcher: {e}")
 
 # ---------- ЗАПУСК ----------
 if __name__ == "__main__":
@@ -154,15 +201,8 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("set",      cmd_set))
     app.add_handler(CommandHandler("reset",    cmd_reset))
     app.add_handler(CommandHandler("status",   cmd_status))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, lambda update, context: update.message.reply_text(f"Ваш chat_id: {update.effective_chat.id}")))
 
     loop = asyncio.get_event_loop()
     loop.create_task(watcher())
-
-    from telegram.ext import MessageHandler, filters
-
-    async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        chat_id = update.effective_chat.id
-        await update.message.reply_text(f"Ваш chat_id: {chat_id}")
-
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, echo))
     app.run_polling()
