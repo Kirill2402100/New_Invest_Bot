@@ -112,7 +112,7 @@ async def cmd_set(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
         f"\U0001F4E6 LP открыт\nДиапазон: `{low}` – `{high}`", parse_mode='Markdown'
     )
 
-async def cmd_reset(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
+async def cmd_reset(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     global lp_open
     if not lp_open:
         await update.message.reply_text("LP уже закрыт.")
@@ -121,31 +121,37 @@ async def cmd_reset(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("/ресет <Cap_out_USDC>")
         return
 
-    cap_out   = float(ctx.args[0].replace(',','.'))
-    t_stop    = datetime.now(timezone.utc)
-    minutes   = round((t_stop - lp_start_time).total_seconds() / 60, 1)
-    pnl       = cap_out - lp_capital_in
-    apr_cycle = (pnl / lp_capital_in) * (525600 / minutes) * 100 if minutes > 0 else 0
+    try:
+        cap_out = float(ctx.args[0].replace(',', '.'))
+        t_stop = datetime.now(timezone.utc)
+        minutes = round((t_stop - lp_start_time).total_seconds() / 60, 1)
+        pnl = cap_out - lp_capital_in
+        apr_cycle = (pnl / lp_capital_in) * (525600 / minutes) * 100 if minutes > 0 else 0
 
-    LOGS_WS.append_row([
-        lp_start_time.strftime('%Y-%m-%d %H:%M:%S'),        # Дата-время
-        lp_start_time.strftime('%H:%M'),                    # start
-        t_stop.strftime('%H:%M'),                           # stop
-        minutes,                                            # в минутах
-        round(pnl, 2),                                      # P&L
-        round(apr_cycle, 1),                                # APR
-    ])
+        row = [
+            lp_start_time.strftime('%Y-%m-%d %H:%M:%S'),  # Дата-время
+            lp_start_time.strftime('%H:%M'),              # start
+            t_stop.strftime('%H:%M'),                     # stop
+            minutes,                                      # минут
+            round(pnl, 2),                                # P&L
+            round(apr_cycle, 1),                          # APR
+        ]
 
-    lp_open = False
-    await update.message.reply_text(
-        f"\U0001F6AA LP закрыт. P&L: *{pnl:+.2f} USDC*, APR: *{apr_cycle:.1f}%*",
-        parse_mode='Markdown'
-    )
+        await asyncio.to_thread(
+            LOGS_WS.append_row,
+            row,
+            value_input_option='USER_ENTERED'
+        )
 
-async def cmd_status(update:Update, _):
-    status = "OPEN" if lp_open else "CLOSED"
-    await update.message.reply_text(f"Статус LP: *{status}*", parse_mode='Markdown')
+        lp_open = False
+        await update.message.reply_text(
+            f"\U0001F6AA LP закрыт. P&L: *{pnl:+.2f} USDC*, APR: *{apr_cycle:.1f}%*",
+            parse_mode='Markdown'
+        )
 
+    except Exception as e:
+        await update.message.reply_text(f"🚨 Ошибка при закрытии LP: {e}")
+      
 # ---------- ЦИКЛ НАБЛЮДЕНИЯ ----------
 async def watcher():
     global lp_open, lp_range_low, lp_range_high, last_in_lp, entry_exit_log
