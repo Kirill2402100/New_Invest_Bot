@@ -11,10 +11,10 @@ import requests, gspread
 from oauth2client.service_account import ServiceAccountCredentials
 from telegram import Update, Bot
 from telegram.ext import (
-    ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
+    Application, CommandHandler, ContextTypes, MessageHandler, filters
 )
 
-# ---------- ANTI-DUPLICATE PROTECTION ----------
+# ---------- ANTI-DUPLICATE PROTECTION (Оставляем на всякий случай, но не полагаемся на него полностью) ----------
 LOCKFILE = "lockfile.pid"
 
 if os.path.exists(LOCKFILE):
@@ -29,10 +29,12 @@ def cleanup():
         os.remove(LOCKFILE)
 atexit.register(cleanup)
 
+
 # ---------- ПАРАМЕТРЫ ----------
 PAIR          = os.getenv("PAIR", "EURC-USDC")
 GRANULARITY   = 60
 ATR_WINDOW    = 48
+# Убедитесь, что CHAT_IDS и BOT_TOKEN установлены в переменных окружения на Railway
 CHAT_IDS      = [int(cid) for cid in os.getenv("CHAT_IDS", "0").split(",")]
 BOT_TOKEN     = os.getenv("BOT_TOKEN")
 
@@ -42,6 +44,7 @@ scope         = [
     "https://spreadsheets.google.com/feeds",
     "https://www.googleapis.com/auth/drive",
 ]
+# Убедитесь, что GOOGLE_CREDENTIALS установлены корректно
 creds_dict    = json.loads(os.getenv("GOOGLE_CREDENTIALS"))
 creds         = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
 gs            = gspread.authorize(creds)
@@ -55,8 +58,8 @@ HEADERS = [
 
 def ensure_headers(ws):
     if ws.row_values(1) != HEADERS:
-        ws.resize(1)
-        ws.append_row(HEADERS)
+        ws.resize(rows=1) # Сначала очистим лишние строки, если есть
+        ws.update('A1', [HEADERS]) # Обновляем заголовки
 
 ensure_headers(LOGS_WS)
 
@@ -82,13 +85,16 @@ def price_and_atr():
     atr     = mean(abs(closes[i] - closes[i-1]) for i in range(1, len(closes)))
     return closes[-1], atr / closes[-1] * 100
 
-async def say(text):
-    bot = Bot(BOT_TOKEN)
+async def say(bot: Bot, text: str):
     for cid in CHAT_IDS:
         await bot.send_message(cid, text, parse_mode="Markdown")
 
 def escape_md(text):
     escape_chars = r"_*[]()~`>#+-=|{}.!"
+    # В новой версии python-telegram-bot лучше использовать встроенный escape
+    # from telegram.helpers import escape_markdown
+    # return escape_markdown(text, version=2)
+    # Но пока оставим ваш вариант для совместимости
     for c in escape_chars:
         text = text.replace(c, f"\\{c}")
     return text
@@ -97,26 +103,34 @@ def escape_md(text):
 async def cmd_capital(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     global lp_capital_in
     if not ctx.args: return
-    lp_capital_in = float(ctx.args[0].replace(',', '.'))
-    await update.message.reply_text(
-        f"💰 Капитал входа установлен: *{lp_capital_in:.2f} USDC*", parse_mode='Markdown'
-    )
+    try:
+        lp_capital_in = float(ctx.args[0].replace(',', '.'))
+        await update.message.reply_text(
+            f"💰 Капитал входа установлен: *{lp_capital_in:.2f} USDC*", parse_mode='Markdown'
+        )
+    except (ValueError, IndexError):
+        await update.message.reply_text("Пожалуйста, введите корректное число. Пример: /capital 1000.50")
+
 
 async def cmd_set(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     global lp_open, lp_start_price, lp_start_time, lp_range_low, lp_range_high, last_in_lp, entry_exit_log
     if len(ctx.args) != 2:
-        await update.message.reply_text("/set <low> <high>")
+        await update.message.reply_text("Неверный формат. Используйте: /set <цена_низ> <цена_верх>")
         return
-    low, high = map(float, ctx.args)
-    lp_start_price = (low + high) / 2
-    lp_range_low, lp_range_high = low, high
-    lp_open = True
-    lp_start_time = datetime.now(timezone.utc)
-    last_in_lp = True
-    entry_exit_log = []
-    await update.message.reply_text(
-        f"📦 LP открыт\nДиапазон: `{low}` – `{high}`", parse_mode='Markdown'
-    )
+    try:
+        low, high = sorted(map(float, ctx.args))
+        lp_start_price = (low + high) / 2
+        lp_range_low, lp_range_high = low, high
+        lp_open = True
+        lp_start_time = datetime.now(timezone.utc)
+        last_in_lp = True
+        entry_exit_log = []
+        await update.message.reply_text(
+            f"📦 LP открыт\nДиапазон: `{low}` – `{high}`", parse_mode='Markdown'
+        )
+    except ValueError:
+        await update.message.reply_text("Цены должны быть числами. Пример: /set 0.9995 1.0005")
+
 
 async def cmd_reset(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     global lp_open
@@ -124,14 +138,14 @@ async def cmd_reset(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("LP уже закрыт.")
         return
     if not ctx.args:
-        await update.message.reply_text("/reset <Cap_out_USDC>")
+        await update.message.reply_text("Неверный формат. Используйте: /reset <капитал_на_выходе_USDC>")
         return
     try:
         cap_out = float(ctx.args[0].replace(',', '.'))
         t_stop = datetime.now(timezone.utc)
         minutes = round((t_stop - lp_start_time).total_seconds() / 60, 1)
         pnl = cap_out - lp_capital_in
-        apr = (pnl / lp_capital_in) * (525600 / minutes) * 100 if minutes > 0 else 0
+        apr = (pnl / lp_capital_in) * (525600 / minutes) * 100 if minutes > 0 and lp_capital_in > 0 else 0
 
         row = [
             lp_start_time.strftime('%Y-%m-%d %H:%M:%S'),
@@ -141,20 +155,30 @@ async def cmd_reset(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             round(pnl, 2),
             round(apr, 1)
         ]
+        # Запуск синхронной функции gspread в отдельном потоке
         await asyncio.to_thread(LOGS_WS.append_row, row, value_input_option='USER_ENTERED')
         lp_open = False
         await update.message.reply_text(
             f"🚪 LP закрыт. P&L: *{pnl:+.2f} USDC*, APR: *{apr:.1f}%*", parse_mode='Markdown'
         )
+    except ValueError:
+        await update.message.reply_text("Капитал на выходе должен быть числом. Пример: /reset 1005.70")
     except Exception as e:
-        await update.message.reply_text(f"Ошибка при закрытии: {e}")
+        print(f"Ошибка при закрытии LP: {e}")
+        await update.message.reply_text(f"Произошла ошибка при закрытии LP: {e}")
 
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    status = "OPEN" if lp_open else "CLOSED"
-    await update.message.reply_text(f"Статус LP: *{status}*", parse_mode='Markdown')
+    status = "✅ OPEN" if lp_open else "❌ CLOSED"
+    msg = f"Статус LP: *{status}*"
+    if lp_open:
+        msg += f"\nДиапазон: `{lp_range_low}` - `{lp_range_high}`"
+        msg += f"\nКапитал входа: `{lp_capital_in:.2f} USDC`"
+        msg += f"\nВремя старта: `{lp_start_time.strftime('%Y-%m-%d %H:%M')}` UTC"
+    await update.message.reply_text(msg, parse_mode='Markdown')
 
 # ---------- WATCHER ----------
-async def watcher():
+async def watcher(app: Application):
+    """Фоновая задача, которая проверяет цену каждую минуту."""
     global lp_open, lp_range_low, lp_range_high, last_in_lp, entry_exit_log
 
     while True:
@@ -166,52 +190,67 @@ async def watcher():
         try:
             price, _ = price_and_atr()
             center = lp_start_price
-            deviation = (price - center) / center * 100
+            deviation = (price - center) / center * 100 if center != 0 else 0
             now_in_lp = lp_range_low <= price <= lp_range_high
-            entry_exit_log.append(now_in_lp)
-            if len(entry_exit_log) > 240:
-                entry_exit_log.pop(0)
 
+            # Логика входа/выхода
             if now_in_lp != last_in_lp:
                 last_in_lp = now_in_lp
-                if not now_in_lp:
-                    msg = f"*LP EXIT* Цена: *{price:.5f}* (от центра: {deviation:+.3f}%)\n"
-                    if abs(deviation) < 0.02:
-                        msg += "→ Цена близка, LP не трогаем. Следим. 👁"
-                    elif abs(deviation) < 0.05:
-                        msg += "→ ⚠️ Рекомендуется продать 50% EURC → USDC.\nЖдём стабилизации."
-                    else:
-                        msg += "→ ❌ Рекомендуется *полный выход*. Продать EURC → USDC."
-                    await say(escape_md(msg))
+                if not now_in_lp: # Цена вышла из диапазона
+                    msg = f"PRICE *LP EXIT* | Цена: `{price:.5f}` (от центра: {deviation:+.3f}%)"
+                    await say(app.bot, msg) # Используем escape_md прямо тут
+                else: # Цена вернулась в диапазон
+                    msg = f"PRICE *LP RE-ENTRY* | Цена: `{price:.5f}` (от центра: {deviation:+.3f}%)"
+                    await say(app.bot, msg)
+
+            # Логика "пилы"
+            entry_exit_log.append(now_in_lp)
+            if len(entry_exit_log) > 240: # Ограничиваем лог последними 4 часами (240 минут)
+                entry_exit_log.pop(0)
 
             flips = sum(1 for i in range(1, len(entry_exit_log)) if entry_exit_log[i] != entry_exit_log[i-1])
             if flips >= 6:
-                await say("🔁 *Обнаружена пила: 6+ выходов/входов за 4ч*\n→ 💡 Рекомендуется пересобрать LP диапазон ближе к текущей цене.")
-                entry_exit_log = []
+                await say(app.bot, "🔁 *Обнаружена пила: 6+ пересечений границы диапазона за последние 4 часа.*\n→ Рекомендуется пересоздать LP с более широким диапазоном.")
+                entry_exit_log = [] # Сбрасываем счетчик после оповещения
 
+        except requests.exceptions.RequestException as e:
+            print(f"Ошибка сети в watcher: {e}")
+            # Не спамим в телеграм об ошибках сети, они могут быть временными
         except Exception as e:
-            await say(escape_md(f"🚨 Ошибка в watcher: {e}"))
+            print(f"Критическая ошибка в watcher: {e}")
+            await say(app.bot, f"🚨 Ошибка в фоновой задаче: {e}")
 
-# ---------- ЗАПУСК ----------
+
+# ---------- ЗАПУСК БОТА (ИСПРАВЛЕННАЯ ВЕРСИЯ) ----------
+def main() -> None:
+    """Основная функция для запуска бота."""
+    if not BOT_TOKEN:
+        print("Ошибка: BOT_TOKEN не найден. Укажите его в переменных окружения.")
+        sys.exit(1)
+
+    # 1. Создаем приложение
+    application = Application.builder().token(BOT_TOKEN).build()
+
+    # 2. Добавляем обработчики команд
+    application.add_handler(CommandHandler("start", cmd_status)) # Добавим status на /start
+    application.add_handler(CommandHandler("capital", cmd_capital))
+    application.add_handler(CommandHandler("set", cmd_set))
+    application.add_handler(CommandHandler("reset", cmd_reset))
+    application.add_handler(CommandHandler("status", cmd_status))
+    
+    # Ответ на любое текстовое сообщение, не являющееся командой
+    async def show_chat_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        await update.message.reply_text(f"Ваш chat_id: `{update.effective_chat.id}`", parse_mode='Markdown')
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, show_chat_id))
+
+    # 3. Настраиваем и запускаем фоновую задачу watcher
+    application.job_queue.run_once(watcher, 5, name="price_watcher")
+    
+    # 4. Запускаем бота
+    # drop_pending_updates=True очистит обновления, которые бот пропустил, пока был оффлайн
+    application.run_polling(drop_pending_updates=True)
+
+
 if __name__ == "__main__":
-    import nest_asyncio
-    nest_asyncio.apply()
-
-    async def main():
-        await Bot(BOT_TOKEN).delete_webhook(drop_pending_updates=True)
-
-        app = ApplicationBuilder().token(BOT_TOKEN).build()
-        app.add_handler(CommandHandler("capital", cmd_capital))
-        app.add_handler(CommandHandler("set", cmd_set))
-        app.add_handler(CommandHandler("reset", cmd_reset))
-        app.add_handler(CommandHandler("status", cmd_status))
-
-        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,
-            lambda update, context: update.message.reply_text(f"Ваш chat_id: {update.effective_chat.id}")
-        ))
-
-        asyncio.get_running_loop().create_task(watcher())
-        await app.run_polling()
-
-    loop = asyncio.get_event_loop()
-    loop.run_until_complete(main())
+    # `nest_asyncio` не требуется в этой структуре
+    main()
