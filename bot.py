@@ -151,7 +151,11 @@ async def cmd_reset(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     except Exception as e:
         await update.message.reply_text(f"🚨 Ошибка при закрытии LP: {e}")
-      
+
+    async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    status = "OPEN" if lp_open else "CLOSED"
+    await update.message.reply_text(f"Статус LP: *{status}*", parse_mode='Markdown') 
+  
 # ---------- ЦИКЛ НАБЛЮДЕНИЯ ----------
 async def watcher():
     global lp_open, lp_range_low, lp_range_high, last_in_lp, entry_exit_log
