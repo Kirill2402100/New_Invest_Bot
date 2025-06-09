@@ -205,7 +205,7 @@ if __name__ == "__main__":
 
     loop = asyncio.get_event_loop()
     loop.create_task(watcher())
-    
-    telegram.Bot(BOT_TOKEN).delete_webhook(drop_pending_updates=True)
+  
+    Bot(BOT_TOKEN).delete_webhook(drop_pending_updates=True)    
     
     app.run_polling()
