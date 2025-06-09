@@ -181,21 +181,36 @@ async def watcher():
 # ---------- ЗАПУСК ----------
 if __name__ == "__main__":
     import nest_asyncio
+    import asyncio
     nest_asyncio.apply()
 
+    from telegram import Bot
+
     async def main():
+        # Удаляем webhook, если вдруг он был установлен ранее (важно для polling)
         await Bot(BOT_TOKEN).delete_webhook(drop_pending_updates=True)
+
+        # Создаём приложение Telegram-бота
         app = ApplicationBuilder().token(BOT_TOKEN).build()
+
+        # Регистрируем команды
         app.add_handler(CommandHandler("capital", cmd_capital))
         app.add_handler(CommandHandler("set", cmd_set))
         app.add_handler(CommandHandler("reset", cmd_reset))
         app.add_handler(CommandHandler("status", cmd_status))
-        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,
-                                       lambda update, ctx: update.message.reply_text(f"Ваш chat_id: {update.effective_chat.id}")))
 
-        loop = asyncio.get_running_loop()
-        loop.create_task(watcher())
+        # Отвечаем на обычные сообщения (для получения chat_id)
+        app.add_handler(
+            MessageHandler(
+                filters.TEXT & ~filters.COMMAND,
+                lambda update, context: update.message.reply_text(f"Ваш chat_id: {update.effective_chat.id}")
+            )
+        )
 
+        # Запускаем цикл наблюдения (watcher) как фоновую задачу
+        asyncio.get_running_loop().create_task(watcher())
+
+        # Стартуем бота в режиме polling
         await app.run_polling()
 
     asyncio.run(main())
