@@ -6,7 +6,7 @@ LP supervisor bot – c поддержкой Google Sheets.
   Daily     : День       | P&L | Ср_APR | Прогноз_APR | Циклов | LP_время(%)
   Monthly   : Месяц      | P&L | Ср_APR | Прогноз_APR | Циклов | LP_время(%)
 """
-import os, json, asyncio, time
+import os, json, asyncio
 from datetime import datetime, timezone
 from statistics import mean
 from math import erf, sqrt
@@ -17,71 +17,67 @@ from telegram import Update, Bot
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
 )
-from telegram.helpers import escape_markdown
 
 # ---------- ПАРАМЕТРЫ ----------
 PAIR        = os.getenv("PAIR", "EURC-USDC")
 GRANULARITY = 60
 ATR_WINDOW  = 48
-OBS_INTERVAL = 15 * 60
-CHAT_IDS = [int(cid) for cid in os.getenv("CHAT_IDS", "0").split(",")]
-BOT_TOKEN = os.getenv("BOT_TOKEN")
+CHAT_IDS    = [int(cid) for cid in os.getenv("CHAT_IDS", "0").split(",")]
+BOT_TOKEN   = os.getenv("BOT_TOKEN")
 
 # ---------- GOOGLE SHEETS ----------
-SHEET_ID = os.getenv("SHEET_ID")
-scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-creds_dict = json.loads(os.getenv("GOOGLE_CREDENTIALS"))
-creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
-gs = gspread.authorize(creds)
-LOGS_WS = gs.open_by_key(SHEET_ID).worksheet("LP_Logs")
+SHEET_ID    = os.getenv("SHEET_ID")
+scope       = [
+    "https://spreadsheets.google.com/feeds",
+    "https://www.googleapis.com/auth/drive",
+]
+creds_dict  = json.loads(os.getenv("GOOGLE_CREDENTIALS"))
+creds       = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+gs          = gspread.authorize(creds)
+LOGS_WS     = gs.open_by_key(SHEET_ID).worksheet("LP_Logs")
 
-HEADERS = ["\u0414\u0430\u0442\u0430-\u0432\u0440\u0435\u043c\u044f", "\u0412\u0440\u0435\u043c\u044f start", "\u0412\u0440\u0435\u043c\u044f stop", "\u041c\u0438\u043d\u0443\u0442", "P&L \u0437\u0430 \u0446\u0438\u043a\u043b (USDC)", "APR \u0446\u0438\u043a\u043bа (%)"]
+HEADERS = [
+    "Дата-время", "Время start", "Время stop",
+    "Минут", "P&L за цикл (USDC)", "APR цикла (%)"
+]
 
 def ensure_headers(ws):
-    first_row = ws.row_values(1)
-    if first_row != HEADERS:
+    if ws.row_values(1) != HEADERS:
         ws.resize(1)
         ws.append_row(HEADERS)
 
 ensure_headers(LOGS_WS)
 
 # ---------- СОСТОЯНИЕ ----------
-lp_open = False
+lp_open        = False
 lp_start_price = None
-lp_start_time = None
-lp_capital_in = 0.0
-lp_range_low = None
-lp_range_high = None
-last_in_lp = True
+lp_start_time  = None
+lp_capital_in  = 0.0
+lp_range_low   = None
+lp_range_high  = None
+last_in_lp     = True
 entry_exit_log = []
 
 # ---------- УТИЛИТЫ ----------
-def cdf_norm(x): return 0.5 * (1 + erf(x / sqrt(2)))
-def exit_prob(d_pct, sigma_pct, h=6):
-    if sigma_pct == 0: return 0.0
-    z = d_pct / (sigma_pct * sqrt(h / 24))
-    return 2 * (1 - cdf_norm(z))
-
 def price_and_atr():
     url = f"https://api.exchange.coinbase.com/products/{PAIR}/candles"
-    r = requests.get(url, params=dict(granularity=GRANULARITY, limit=ATR_WINDOW + 1))
+    r   = requests.get(url, params={"granularity": GRANULARITY, "limit": ATR_WINDOW + 1})
     r.raise_for_status()
-    candles = sorted(r.json(), key=lambda x: x[0])
-    closes = [c[4] for c in candles]
-    atr = mean(abs(closes[i] - closes[i - 1]) for i in range(1, len(closes)))
+    closes = [c[4] for c in sorted(r.json(), key=lambda x: x[0])]
+    atr = mean(abs(closes[i]-closes[i-1]) for i in range(1, len(closes)))
     return closes[-1], atr / closes[-1] * 100
 
-async def say(txt, markdown=False):
+async def say(txt):
     bot = Bot(BOT_TOKEN)
     for cid in CHAT_IDS:
-        await bot.send_message(cid, txt, parse_mode="MarkdownV2" if markdown else None)
+        await bot.send_message(cid, txt, parse_mode="Markdown")
 
 # ---------- КОМАНДЫ ----------
 async def cmd_capital(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     global lp_capital_in
     if not ctx.args: return
     lp_capital_in = float(ctx.args[0].replace(',', '.'))
-    await update.message.reply_text(f"\U0001F4B0 Капитал входа установлен: *{lp_capital_in:.2f} USDC*", parse_mode='Markdown')
+    await update.message.reply_text(f"💰 Капитал входа: *{lp_capital_in:.2f} USDC*", parse_mode='Markdown')
 
 async def cmd_set(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     global lp_open, lp_start_price, lp_start_time, lp_range_low, lp_range_high, last_in_lp, entry_exit_log
@@ -95,7 +91,7 @@ async def cmd_set(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     lp_start_time = datetime.now(timezone.utc)
     last_in_lp = True
     entry_exit_log = []
-    await update.message.reply_text(f"\U0001F4E6 LP открыт\nДиапазон: `{low}` – `{high}`", parse_mode='Markdown')
+    await update.message.reply_text(f"📦 LP открыт\nДиапазон: `{low}` – `{high}`", parse_mode='Markdown')
 
 async def cmd_reset(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     global lp_open
@@ -105,98 +101,79 @@ async def cmd_reset(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not ctx.args:
         await update.message.reply_text("/reset <Cap_out>")
         return
-
     try:
         cap_out = float(ctx.args[0].replace(',', '.'))
         t_stop = datetime.now(timezone.utc)
         minutes = round((t_stop - lp_start_time).total_seconds() / 60, 1)
         pnl = cap_out - lp_capital_in
-        apr_cycle = (pnl / lp_capital_in) * (525600 / minutes) * 100 if minutes > 0 else 0
+        apr = (pnl / lp_capital_in) * (525600 / minutes) * 100 if minutes > 0 else 0
 
-        row = [
+        await asyncio.to_thread(LOGS_WS.append_row, [
             lp_start_time.strftime('%Y-%m-%d %H:%M:%S'),
             lp_start_time.strftime('%H:%M'),
             t_stop.strftime('%H:%M'),
             minutes,
             round(pnl, 2),
-            round(apr_cycle, 1),
-        ]
-
-        await asyncio.to_thread(LOGS_WS.append_row, row, value_input_option='USER_ENTERED')
+            round(apr, 1),
+        ], value_input_option='USER_ENTERED')
 
         lp_open = False
-        await update.message.reply_text(f"\U0001F6AA LP закрыт. P&L: *{pnl:+.2f} USDC*, APR: *{apr_cycle:.1f}%*", parse_mode='Markdown')
-
+        await update.message.reply_text(
+            f"🚪 LP закрыт. P&L: *{pnl:+.2f} USDC*, APR: *{apr:.1f}%*",
+            parse_mode='Markdown'
+        )
     except Exception as e:
-        await update.message.reply_text(f"🚨 Ошибка при закрытии LP: {e}")
+        await update.message.reply_text(f"🚨 Ошибка: {e}")
 
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     status = "OPEN" if lp_open else "CLOSED"
     await update.message.reply_text(f"Статус LP: *{status}*", parse_mode='Markdown')
 
-# ---------- ЦИКЛ НАБЛЮДЕНИЯ ----------
+# ---------- НАБЛЮДЕНИЕ ----------
 async def watcher():
     global lp_open, lp_range_low, lp_range_high, last_in_lp, entry_exit_log
-
     while True:
         await asyncio.sleep(60)
-
         if not lp_open or lp_range_low is None or lp_range_high is None:
             continue
-
         try:
             price, _ = price_and_atr()
-            center = lp_start_price
-            deviation = (price - center) / center * 100
-
+            deviation = (price - lp_start_price) / lp_start_price * 100
             now_in_lp = lp_range_low <= price <= lp_range_high
             entry_exit_log.append(now_in_lp)
             if len(entry_exit_log) > 240:
                 entry_exit_log.pop(0)
-
             if now_in_lp != last_in_lp:
                 last_in_lp = now_in_lp
-
                 if not now_in_lp:
-                    price_str = escape_markdown(f"{price:.5f}", version=2)
-                    deviation_str = escape_markdown(f"{deviation:+.3f}", version=2)
-                    msg = f"*\\[LP EXIT\\]* Цена: *{price_str}* \\(ot центра: {deviation_str}%\\)\n"
-
+                    msg = f"*[LP EXIT]* \u0426ена: *{price:.5f}* (\u043eт \u0446ентра: {deviation:+.3f}%)*\n"
                     if abs(deviation) < 0.02:
-                        msg += "→ Цена близка, LP не трогаем\. Следим\. 👁"
+                        msg += "\u2192 \u0426ена \u0431\u043b\u0438з\u043aа, LP \u043d\u0435 \u0442\u0440\u043e\u0433\u0430\u0435м. \u0421\u043b\u0435\u0434\u0438м."
                     elif abs(deviation) < 0.05:
-                        msg += "→ ⚠️ Рекомендуется продать 50\% EURC → USDC\.\n꧝дём стабилизации\.
-"
+                        msg += "\u2192 \u26a0\ufe0f \u0420\u0435\u043a\u043e\u043c\u0435\u043d\u0434\u0443\u0435\u0442\u0441\u044f \u043f\u0440\u043e\u0434\u0430\u0442\u044c 50% EURC \u2192 USDC. \n\u0416\u0434\u0451м \u0441\u0442\u0430б\u0438\u043b\u0438\u0437\u0430\u0446\u0438ю."
                     else:
-                        msg += "→ ❌ Рекомендуется *полный выход*\. Продать EURC → USDC\."
-
-                    await say(msg, markdown=True)
-
-            flips = sum(1 for i in range(1, len(entry_exit_log)) if entry_exit_log[i] != entry_exit_log[i - 1])
+                        msg += "\u2192 ❌ \u0420\u0435\u043a\u043e\u043c\u0435\u043d\u0434\u0443\u0435\u0442\u0441\u044f *\u043f\u043e\u043b\u043d\u044bй \u0432\u044b\u0445\u043e\u0434*. EURC \u2192 USDC."
+                    await say(msg)
+            flips = sum(1 for i in range(1, len(entry_exit_log)) if entry_exit_log[i] != entry_exit_log[i-1])
             if flips >= 6:
-                await say("\U0001F501 *Обнаружена пила: 6+ заходов/выходов за 4ч*\n→ 💡 Рекомендуется пересобрать LP диапазон ближе к текущей цене.", markdown=True)
+                await say("\ud83d\udd01 *6+ \u0437\u0430\u0445\u043e\u0434\u043e\u0432/\u0432\u044b\u0445\u043e\u0434\u043e\u0432 \u0437\u0430 4\u0447*\n\u2192 💡 \u0420\u0435\u043a\u043e\u043c\u0435\u043d\u0434\u0443\u0435\u0442\u0441\u044f \u043f\u0435\u0440\u0435\u0441\u043e\u0431\u0440\u0430\u0442\u044c LP \u0431\u043b\u0438же \u043a \u0446ене.")
                 entry_exit_log = []
-
         except Exception as e:
-            await say(f"🚨 Ошибка в watcher: {e}")
+            await say(f"🚨 Ошибка watcher: {e}")
 
 # ---------- ЗАПУСК ----------
 if __name__ == "__main__":
     import nest_asyncio
     nest_asyncio.apply()
-
     async def main():
         await Bot(BOT_TOKEN).delete_webhook(drop_pending_updates=True)
-
         app = ApplicationBuilder().token(BOT_TOKEN).build()
         app.add_handler(CommandHandler("capital", cmd_capital))
-        app.add_handler(CommandHandler("set", cmd_set))
-        app.add_handler(CommandHandler("reset", cmd_reset))
-        app.add_handler(CommandHandler("status", cmd_status))
-        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, lambda update, context: update.message.reply_text(f"Ваш chat_id: {update.effective_chat.id}")))
-
-        loop = asyncio.get_running_loop()
-        loop.create_task(watcher())
+        app.add_handler(CommandHandler("set",     cmd_set))
+        app.add_handler(CommandHandler("reset",   cmd_reset))
+        app.add_handler(CommandHandler("status",  cmd_status))
+        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,
+            lambda update, ctx: update.message.reply_text(f"chat_id: {update.effective_chat.id}")))
+        asyncio.get_running_loop().create_task(watcher())
         await app.run_polling()
-
     asyncio.run(main())
