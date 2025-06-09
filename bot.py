@@ -41,21 +41,21 @@ gs            = gspread.authorize(creds)
 LOGS_WS       = gs.open_by_key(SHEET_ID).worksheet("LP_Logs")
 
 HEADERS = [
-    "Дата-время",        # A
-    "Время start",       # B
-    "Время stop",        # C
-    "Минут",             # D
-    "P&L за цикл (USDC)",# E
-    "APR цикла (%)",     # F
+    "Дата-время",
+    "Время start",
+    "Время stop",
+    "Минут",
+    "P&L за цикл (USDC)",
+    "APR цикла (%)",
 ]
 
 def ensure_headers(ws):
     first_row = ws.row_values(1)
     if first_row != HEADERS:
-        ws.resize(1)               # очищаем, оставляем только 1-ю строку
+        ws.resize(1)
         ws.append_row(HEADERS)
 
-ensure_headers(LOGS_WS)             # один раз при старте
+ensure_headers(LOGS_WS)
 
 # ---------- СОСТОЯНИЕ ----------
 lp_open        = False
@@ -94,7 +94,7 @@ async def cmd_capital(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     global lp_capital_in
     if not ctx.args: return
     lp_capital_in = float(ctx.args[0].replace(',','.'))
-    await update.message.reply_text(f"\U0001F4B0 Капитал входа установлен: *{lp_capital_in:.2f} USDC*", parse_mode='Markdown')
+    await update.message.reply_text(f"💰 Капитал входа установлен: *{lp_capital_in:.2f} USDC*", parse_mode='Markdown')
 
 async def cmd_set(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     global lp_open, lp_start_price, lp_start_time, lp_range_low, lp_range_high, last_in_lp, entry_exit_log
@@ -108,9 +108,7 @@ async def cmd_set(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
     lp_start_time  = datetime.now(timezone.utc)
     last_in_lp     = True
     entry_exit_log = []
-    await update.message.reply_text(
-        f"\U0001F4E6 LP открыт\nДиапазон: `{low}` – `{high}`", parse_mode='Markdown'
-    )
+    await update.message.reply_text(f"📦 LP открыт\nДиапазон: `{low}` – `{high}`", parse_mode='Markdown')
 
 async def cmd_reset(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     global lp_open
@@ -129,12 +127,12 @@ async def cmd_reset(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         apr_cycle = (pnl / lp_capital_in) * (525600 / minutes) * 100 if minutes > 0 else 0
 
         row = [
-            lp_start_time.strftime('%Y-%m-%d %H:%M:%S'),  # Дата-время
-            lp_start_time.strftime('%H:%M'),              # start
-            t_stop.strftime('%H:%M'),                     # stop
-            minutes,                                      # минут
-            round(pnl, 2),                                # P&L
-            round(apr_cycle, 1),                          # APR
+            lp_start_time.strftime('%Y-%m-%d %H:%M:%S'),
+            lp_start_time.strftime('%H:%M'),
+            t_stop.strftime('%H:%M'),
+            minutes,
+            round(pnl, 2),
+            round(apr_cycle, 1),
         ]
 
         await asyncio.to_thread(
@@ -144,24 +142,21 @@ async def cmd_reset(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
 
         lp_open = False
-        await update.message.reply_text(
-            f"\U0001F6AA LP закрыт. P&L: *{pnl:+.2f} USDC*, APR: *{apr_cycle:.1f}%*",
-            parse_mode='Markdown'
-        )
+        await update.message.reply_text(f"🛚 LP закрыт. P&L: *{pnl:+.2f} USDC*, APR: *{apr_cycle:.1f}%*", parse_mode='Markdown')
 
     except Exception as e:
         await update.message.reply_text(f"🚨 Ошибка при закрытии LP: {e}")
 
-    async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     status = "OPEN" if lp_open else "CLOSED"
-    await update.message.reply_text(f"Статус LP: *{status}*", parse_mode='Markdown') 
-  
+    await update.message.reply_text(f"Статус LP: *{status}*", parse_mode='Markdown')
+
 # ---------- ЦИКЛ НАБЛЮДЕНИЯ ----------
 async def watcher():
     global lp_open, lp_range_low, lp_range_high, last_in_lp, entry_exit_log
 
     while True:
-        await asyncio.sleep(60)  # проверка каждую минуту
+        await asyncio.sleep(60)
 
         if not lp_open or lp_range_low is None or lp_range_high is None:
             continue
@@ -169,7 +164,7 @@ async def watcher():
         try:
             price, _ = price_and_atr()
             center   = lp_start_price
-            deviation = (price - center) / center * 100  # в %
+            deviation = (price - center) / center * 100
 
             now_in_lp = lp_range_low <= price <= lp_range_high
             entry_exit_log.append(now_in_lp)
@@ -182,10 +177,10 @@ async def watcher():
                 if now_in_lp:
                     continue
                 else:
-                    msg = f"*[LP EXIT]* Цена: *{price:.5f}* (от центра: {deviation:+.3f}%)\n"
+                    msg = f"*[LP EXIT]* Цена: *{price:.5f}* (от центра: {deviation:+.3f}%)*\n"
 
                     if abs(deviation) < 0.02:
-                        msg += "→ Цена близка, LP не трогаем. Следим. \U0001F441"
+                        msg += "→ Цена близка, LP не трогаем. Следим. 👁"
                     elif abs(deviation) < 0.05:
                         msg += "→ ⚠️ Рекомендуется продать 50% EURC → USDC.\nЖдём стабилизации."
                     else:
@@ -219,7 +214,6 @@ if __name__ == "__main__":
         app.add_handler(CommandHandler("status",   cmd_status))
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, lambda update, context: update.message.reply_text(f"Ваш chat_id: {update.effective_chat.id}")))
 
-        # Запускаем watcher как отдельную задачу
         loop = asyncio.get_running_loop()
         loop.create_task(watcher())
 
