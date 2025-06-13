@@ -1,256 +1,198 @@
-# -*- coding: utf-8 -*-
-"""
-LP supervisor bot – c поддержкой Google Sheets.
-"""
-import os, json, asyncio, sys, atexit
+# Новый код бота, объединяющий SSL-сигналы и отправку данных в Google Sheets
+import os
+import asyncio
+import json
 from datetime import datetime, timezone
-from statistics import mean
-from math import erf, sqrt
-
-import requests, gspread
+import numpy as np
+import pandas as pd
+import ccxt
+import gspread
 from oauth2client.service_account import ServiceAccountCredentials
-from telegram import Update, Bot
-from telegram.ext import (
-    Application, CommandHandler, ContextTypes, MessageHandler, filters
-)
+from telegram import Update
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-# ---------- ANTI-DUPLICATE PROTECTION (Оставляем на всякий случай, но не полагаемся на него полностью) ----------
-LOCKFILE = "lockfile.pid"
+# === ENV ===
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+CHAT_IDS = [int(cid) for cid in os.getenv("CHAT_IDS", "0").split(",")]
+PAIR = os.getenv("PAIR", "EUR/USDT")
+SHEET_ID = os.getenv("SHEET_ID")
 
-if os.path.exists(LOCKFILE):
-    print("⚠️ Бот уже запущен. Завершаем второй экземпляр.")
-    sys.exit(1)
-
-with open(LOCKFILE, "w") as f:
-    f.write(str(os.getpid()))
-
-def cleanup():
-    if os.path.exists(LOCKFILE):
-        os.remove(LOCKFILE)
-atexit.register(cleanup)
-
-
-# ---------- ПАРАМЕТРЫ ----------
-PAIR          = os.getenv("PAIR", "EURC-USDC")
-GRANULARITY   = 60
-ATR_WINDOW    = 48
-# Убедитесь, что CHAT_IDS и BOT_TOKEN установлены в переменных окружения на Railway
-CHAT_IDS      = [int(cid) for cid in os.getenv("CHAT_IDS", "0").split(",")]
-BOT_TOKEN     = os.getenv("BOT_TOKEN")
-
-# ---------- GOOGLE SHEETS ----------
-SHEET_ID      = os.getenv("SHEET_ID")
-scope         = [
+# === GOOGLE SHEETS ===
+scope = [
     "https://spreadsheets.google.com/feeds",
     "https://www.googleapis.com/auth/drive",
 ]
-# Убедитесь, что GOOGLE_CREDENTIALS установлены корректно
-creds_dict    = json.loads(os.getenv("GOOGLE_CREDENTIALS"))
-creds         = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
-gs            = gspread.authorize(creds)
+creds_dict = json.loads(os.getenv("GOOGLE_CREDENTIALS"))
+creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+gs = gspread.authorize(creds)
+LOGS_WS = gs.open_by_key(SHEET_ID).worksheet("LP_Logs")
 
-LOGS_WS       = gs.open_by_key(SHEET_ID).worksheet("LP_Logs")
+HEADERS = ["Дата-время", "Время start", "Время stop", "Минут", "P&L за цикл (USDC)", "APR цикла (%)"]
+if LOGS_WS.row_values(1) != HEADERS:
+    LOGS_WS.resize(rows=1)
+    LOGS_WS.update('A1', [HEADERS])
 
-HEADERS = [
-    "Дата-время", "Время start", "Время stop", "Минут",
-    "P&L за цикл (USDC)", "APR цикла (%)"
-]
+# === STATE ===
+current_signal = None
+last_cross = None
+position = None
+log = []
+monitoring = False
 
-def ensure_headers(ws):
-    if ws.row_values(1) != HEADERS:
-        ws.resize(rows=1) # Сначала очистим лишние строки, если есть
-        ws.update('A1', [HEADERS]) # Обновляем заголовки
+# === EXCHANGE ===
+exchange = ccxt.mexc()
 
-ensure_headers(LOGS_WS)
+# === SSL Signal Calculation ===
+def calculate_ssl(df):
+    sma = df['close'].rolling(13).mean()
+    hlv = (df['close'] > sma).astype(int)
 
-# ---------- СОСТОЯНИЕ ----------
-lp_open        = False
-lp_start_price = None
-lp_start_time  = None
-lp_capital_in  = 0.0
-lp_range_low   = None
-lp_range_high  = None
-last_in_lp     = True
-entry_exit_log = []
+    ssl_up = []
+    ssl_down = []
 
-# ---------- УТИЛИТЫ ----------
-def cdf_norm(x): return 0.5 * (1 + erf(x / sqrt(2)))
+    for i in range(len(df)):
+        if i < 12:
+            ssl_up.append(None)
+            ssl_down.append(None)
+        else:
+            if hlv.iloc[i] == 1:
+                ssl_up.append(df['high'].iloc[i-12:i+1].max())
+                ssl_down.append(df['low'].iloc[i-12:i+1].min())
+            else:
+                ssl_up.append(df['low'].iloc[i-12:i+1].min())
+                ssl_down.append(df['high'].iloc[i-12:i+1].max())
 
-def price_and_atr():
-    url = f"https://api.exchange.coinbase.com/products/{PAIR}/candles"
-    r   = requests.get(url, params=dict(granularity=GRANULARITY, limit=ATR_WINDOW+1))
-    r.raise_for_status()
-    candles = sorted(r.json(), key=lambda x: x[0])
-    closes  = [c[4] for c in candles]
-    atr     = mean(abs(closes[i] - closes[i-1]) for i in range(1, len(closes)))
-    return closes[-1], atr / closes[-1] * 100
+    df['ssl_up'] = ssl_up
+    df['ssl_down'] = ssl_down
+    df['ssl_channel'] = None
 
-async def say(bot: Bot, text: str):
-    for cid in CHAT_IDS:
-        await bot.send_message(cid, text, parse_mode="Markdown")
+    for i in range(1, len(df)):
+        if pd.notna(df['ssl_up'].iloc[i]) and pd.notna(df['ssl_down'].iloc[i]):
+            prev = df.iloc[i - 1]
+            curr = df.iloc[i]
+            if prev['ssl_up'] < prev['ssl_down'] and curr['ssl_up'] > curr['ssl_down']:
+                df.at[df.index[i], 'ssl_channel'] = 'LONG'
+            elif prev['ssl_up'] > prev['ssl_down'] and curr['ssl_up'] < curr['ssl_down']:
+                df.at[df.index[i], 'ssl_channel'] = 'SHORT'
+    return df
 
-def escape_md(text):
-    escape_chars = r"_*[]()~`>#+-=|{}.!"
-    # В новой версии python-telegram-bot лучше использовать встроенный escape
-    # from telegram.helpers import escape_markdown
-    # return escape_markdown(text, version=2)
-    # Но пока оставим ваш вариант для совместимости
-    for c in escape_chars:
-        text = text.replace(c, f"\\{c}")
-    return text
 
-# ---------- КОМАНДЫ ----------
-async def cmd_capital(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    global lp_capital_in
-    if not ctx.args: return
+async def fetch_ssl_signal():
+    ohlcv = exchange.fetch_ohlcv(PAIR, timeframe='5m', limit=100)
+    df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+    df.set_index('timestamp', inplace=True)
+    df = calculate_ssl(df)
+    valid_signals = df['ssl_channel'].dropna()
+    if len(valid_signals) < 2:
+        return None, df['close'].iloc[-1]
+
+    prev = valid_signals.iloc[-2]
+    curr = valid_signals.iloc[-1]
+    price = df['close'].iloc[-1]
+
+    if prev != curr:
+        return curr, price
+    return None, price
+
+
+async def monitor_signal(app):
+    global current_signal, last_cross
+    while monitoring:
+        try:
+            signal, price = await fetch_ssl_signal()
+            if signal and signal != current_signal:
+                current_signal = signal
+                last_cross = datetime.utcnow()
+                for chat_id in CHAT_IDS:
+                    await app.bot.send_message(
+                        chat_id=chat_id,
+                        text=f"\U0001f4e1 Сигнал: {signal}\n\U0001f4b0 Цена: {price:.4f}\n\u23f0 Время: {last_cross.strftime('%H:%M UTC')}"
+                    )
+        except Exception as e:
+            print("[error]", e)
+        await asyncio.sleep(30)
+
+
+# === TELEGRAM COMMANDS ===
+async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    global monitoring
+    monitoring = True
+    await update.message.reply_text("✅ Мониторинг запущен.")
+    asyncio.create_task(monitor_signal(ctx.application))
+
+
+async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    global monitoring
+    monitoring = False
+    await update.message.reply_text("❌ Мониторинг остановлен.")
+
+
+async def cmd_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    global position
     try:
-        lp_capital_in = float(ctx.args[0].replace(',', '.'))
-        await update.message.reply_text(
-            f"💰 Капитал входа установлен: *{lp_capital_in:.2f} USDC*", parse_mode='Markdown'
-        )
-    except (ValueError, IndexError):
-        await update.message.reply_text("Пожалуйста, введите корректное число. Пример: /capital 1000.50")
+        price = float(ctx.args[0])
+        deposit = float(ctx.args[1])
+        position = {
+            "entry_price": price,
+            "entry_deposit": deposit,
+            "entry_time": datetime.utcnow(),
+            "direction": current_signal
+        }
+        await update.message.reply_text(f"✅ Вход зафиксирован: {current_signal} @ {price:.4f} | Баланс: {deposit}$")
+    except:
+        await update.message.reply_text("⚠️ Использование: /entry <цена> <депозит>")
 
 
-async def cmd_set(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    global lp_open, lp_start_price, lp_start_time, lp_range_low, lp_range_high, last_in_lp, entry_exit_log
-    if len(ctx.args) != 2:
-        await update.message.reply_text("Неверный формат. Используйте: /set <цена_низ> <цена_верх>")
-        return
+async def cmd_exit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    global position
     try:
-        low, high = sorted(map(float, ctx.args))
-        lp_start_price = (low + high) / 2
-        lp_range_low, lp_range_high = low, high
-        lp_open = True
-        lp_start_time = datetime.now(timezone.utc)
-        last_in_lp = True
-        entry_exit_log = []
-        await update.message.reply_text(
-            f"📦 LP открыт\nДиапазон: `{low}` – `{high}`", parse_mode='Markdown'
-        )
-    except ValueError:
-        await update.message.reply_text("Цены должны быть числами. Пример: /set 0.9995 1.0005")
+        exit_price = float(ctx.args[0])
+        exit_deposit = float(ctx.args[1])
+        if position is None:
+            await update.message.reply_text("⚠️ Позиция не открыта.")
+            return
 
-
-async def cmd_reset(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    global lp_open
-    if not lp_open:
-        await update.message.reply_text("LP уже закрыт.")
-        return
-    if not ctx.args:
-        await update.message.reply_text("Неверный формат. Используйте: /reset <капитал_на_выходе_USDC>")
-        return
-    try:
-        cap_out = float(ctx.args[0].replace(',', '.'))
-        t_stop = datetime.now(timezone.utc)
-        minutes = round((t_stop - lp_start_time).total_seconds() / 60, 1)
-        pnl = cap_out - lp_capital_in
-        apr = (pnl / lp_capital_in) * (525600 / minutes) * 100 if minutes > 0 and lp_capital_in > 0 else 0
+        pnl = exit_deposit - position['entry_deposit']
+        apr = (pnl / position['entry_deposit']) * 100
+        duration = datetime.utcnow() - position['entry_time']
+        minutes = int(duration.total_seconds() // 60)
 
         row = [
-            lp_start_time.strftime('%Y-%m-%d %H:%M:%S'),
-            lp_start_time.strftime('%H:%M'),
-            t_stop.strftime('%H:%M'),
+            position['entry_time'].strftime('%Y-%m-%d %H:%M:%S'),
+            position['entry_time'].strftime('%H:%M'),
+            datetime.utcnow().strftime('%H:%M'),
             minutes,
             round(pnl, 2),
             round(apr, 1)
         ]
-        # Запуск синхронной функции gspread в отдельном потоке
         await asyncio.to_thread(LOGS_WS.append_row, row, value_input_option='USER_ENTERED')
-        lp_open = False
+
         await update.message.reply_text(
-            f"🚪 LP закрыт. P&L: *{pnl:+.2f} USDC*, APR: *{apr:.1f}%*", parse_mode='Markdown'
+            f"✅ Сделка закрыта\n📈 P&L: {pnl:.2f} USDT\n📊 APR: {apr:.2f}%\n⏰ Время в позиции: {minutes} мин"
         )
-    except ValueError:
-        await update.message.reply_text("Капитал на выходе должен быть числом. Пример: /reset 1005.70")
-    except Exception as e:
-        print(f"Ошибка при закрытии LP: {e}")
-        await update.message.reply_text(f"Произошла ошибка при закрытии LP: {e}")
+        position = None
+    except:
+        await update.message.reply_text("⚠️ Использование: /exit <цена> <депозит>")
+
 
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    status = "✅ OPEN" if lp_open else "❌ CLOSED"
-    msg = f"Статус LP: *{status}*"
-    if lp_open:
-        msg += f"\nДиапазон: `{lp_range_low}` - `{lp_range_high}`"
-        msg += f"\nКапитал входа: `{lp_capital_in:.2f} USDC`"
-        msg += f"\nВремя старта: `{lp_start_time.strftime('%Y-%m-%d %H:%M')}` UTC"
-    await update.message.reply_text(msg, parse_mode='Markdown')
-
-# ---------- WATCHER ----------
-async def watcher(app: Application):
-    """Фоновая задача, которая проверяет цену каждую минуту."""
-    global lp_open, lp_range_low, lp_range_high, last_in_lp, entry_exit_log
-
-    while True:
-        await asyncio.sleep(60)
-
-        if not lp_open or lp_range_low is None or lp_range_high is None:
-            continue
-
-        try:
-            price, _ = price_and_atr()
-            center = lp_start_price
-            deviation = (price - center) / center * 100 if center != 0 else 0
-            now_in_lp = lp_range_low <= price <= lp_range_high
-
-            # Логика входа/выхода
-            if now_in_lp != last_in_lp:
-                last_in_lp = now_in_lp
-                if not now_in_lp: # Цена вышла из диапазона
-                    msg = f"PRICE *LP EXIT* | Цена: `{price:.5f}` (от центра: {deviation:+.3f}%)"
-                    await say(app.bot, msg) # Используем escape_md прямо тут
-                else: # Цена вернулась в диапазон
-                    msg = f"PRICE *LP RE-ENTRY* | Цена: `{price:.5f}` (от центра: {deviation:+.3f}%)"
-                    await say(app.bot, msg)
-
-            # Логика "пилы"
-            entry_exit_log.append(now_in_lp)
-            if len(entry_exit_log) > 240: # Ограничиваем лог последними 4 часами (240 минут)
-                entry_exit_log.pop(0)
-
-            flips = sum(1 for i in range(1, len(entry_exit_log)) if entry_exit_log[i] != entry_exit_log[i-1])
-            if flips >= 6:
-                await say(app.bot, "🔁 *Обнаружена пила: 6+ пересечений границы диапазона за последние 4 часа.*\n→ Рекомендуется пересоздать LP с более широким диапазоном.")
-                entry_exit_log = [] # Сбрасываем счетчик после оповещения
-
-        except requests.exceptions.RequestException as e:
-            print(f"Ошибка сети в watcher: {e}")
-            # Не спамим в телеграм об ошибках сети, они могут быть временными
-        except Exception as e:
-            print(f"Критическая ошибка в watcher: {e}")
-            await say(app.bot, f"🚨 Ошибка в фоновой задаче: {e}")
+    if position:
+        await update.message.reply_text(
+            f"🔍 Позиция: {position['direction']} от {position['entry_price']}\nБаланс: {position['entry_deposit']}$"
+        )
+    else:
+        await update.message.reply_text("❌ Позиция не открыта.")
 
 
-# ---------- ЗАПУСК БОТА (ИСПРАВЛЕННАЯ ВЕРСИЯ) ----------
-def main() -> None:
-    """Основная функция для запуска бота."""
-    if not BOT_TOKEN:
-        print("Ошибка: BOT_TOKEN не найден. Укажите его в переменных окружения.")
-        sys.exit(1)
-
-    # 1. Создаем приложение
-    application = Application.builder().token(BOT_TOKEN).build()
-
-    # 2. Добавляем обработчики команд
-    application.add_handler(CommandHandler("start", cmd_status)) # Добавим status на /start
-    application.add_handler(CommandHandler("capital", cmd_capital))
-    application.add_handler(CommandHandler("set", cmd_set))
-    application.add_handler(CommandHandler("reset", cmd_reset))
-    application.add_handler(CommandHandler("status", cmd_status))
-    
-    # Ответ на любое текстовое сообщение, не являющееся командой
-    async def show_chat_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await update.message.reply_text(f"Ваш chat_id: `{update.effective_chat.id}`", parse_mode='Markdown')
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, show_chat_id))
-
-    # 3. Настраиваем и запускаем фоновую задачу watcher
-    application.job_queue.run_once(watcher, 5, name="price_watcher")
-    
-    # 4. Запускаем бота
-    # drop_pending_updates=True очистит обновления, которые бот пропустил, пока был оффлайн
-    application.run_polling(drop_pending_updates=True)
-
-
+# === INIT ===
 if __name__ == "__main__":
-    # `nest_asyncio` не требуется в этой структуре
-    main()
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
+
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("stop", cmd_stop))
+    app.add_handler(CommandHandler("entry", cmd_entry))
+    app.add_handler(CommandHandler("exit", cmd_exit))
+    app.add_handler(CommandHandler("status", cmd_status))
+
+    app.run_polling()
