@@ -14,7 +14,7 @@ from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 # === ENV ===
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_IDS = [int(cid) for cid in os.getenv("CHAT_IDS", "0").split(",")]
-PAIR = os.getenv("PAIR", "EUR/USDT")
+PAIR = os.getenv("PAIR", "BTC/USD")
 SHEET_ID = os.getenv("SHEET_ID")
 
 # === GOOGLE SHEETS ===
@@ -78,7 +78,7 @@ def calculate_ssl(df):
 
 
 async def fetch_ssl_signal():
-    ohlcv = exchange.fetch_ohlcv(PAIR, timeframe='5m', limit=100)
+    ohlcv = exchange.fetch_ohlcv(PAIR, timeframe='15m', limit=100)
     df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
     df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
     df.set_index('timestamp', inplace=True)
