@@ -76,7 +76,7 @@ def calculate_ssl(df):
                 df.at[df.index[i], 'ssl_channel'] = 'SHORT'
     return df
 
-
+# === Fetch SSL Signal ===
 async def fetch_ssl_signal():
     ohlcv = exchange.fetch_ohlcv(PAIR, timeframe='15m', limit=100)
     df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
@@ -95,7 +95,7 @@ async def fetch_ssl_signal():
         return curr, price
     return None, price
 
-
+# === Monitor ===
 async def monitor_signal(app):
     global current_signal, last_cross
     while monitoring:
@@ -103,30 +103,27 @@ async def monitor_signal(app):
             signal, price = await fetch_ssl_signal()
             if signal and signal != current_signal:
                 current_signal = signal
-                last_cross = datetime.utcnow()
+                last_cross = datetime.now(timezone.utc)
                 for chat_id in CHAT_IDS:
                     await app.bot.send_message(
                         chat_id=chat_id,
-                        text=f"\U0001f4e1 Сигнал: {signal}\n\U0001f4b0 Цена: {price:.4f}\n\u23f0 Время: {last_cross.strftime('%H:%M UTC')}"
+                        text=f"📡 Сигнал: {signal}\n💰 Цена: {price:.4f}\n⏰ Время: {last_cross.strftime('%H:%M UTC')}"
                     )
         except Exception as e:
             print("[error]", e)
         await asyncio.sleep(30)
 
-
-# === TELEGRAM COMMANDS ===
+# === Telegram Commands ===
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     global monitoring
     monitoring = True
     await update.message.reply_text("✅ Мониторинг запущен.")
     asyncio.create_task(monitor_signal(ctx.application))
 
-
 async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     global monitoring
     monitoring = False
     await update.message.reply_text("❌ Мониторинг остановлен.")
-
 
 async def cmd_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     global position
@@ -136,13 +133,12 @@ async def cmd_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         position = {
             "entry_price": price,
             "entry_deposit": deposit,
-            "entry_time": datetime.utcnow(),
+            "entry_time": datetime.now(timezone.utc),
             "direction": current_signal
         }
         await update.message.reply_text(f"✅ Вход зафиксирован: {current_signal} @ {price:.4f} | Баланс: {deposit}$")
     except:
         await update.message.reply_text("⚠️ Использование: /entry <цена> <депозит>")
-
 
 async def cmd_exit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     global position
@@ -155,13 +151,13 @@ async def cmd_exit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         pnl = exit_deposit - position['entry_deposit']
         apr = (pnl / position['entry_deposit']) * 100
-        duration = datetime.utcnow() - position['entry_time']
+        duration = datetime.now(timezone.utc) - position['entry_time']
         minutes = int(duration.total_seconds() // 60)
 
         row = [
             position['entry_time'].strftime('%Y-%m-%d %H:%M:%S'),
             position['entry_time'].strftime('%H:%M'),
-            datetime.utcnow().strftime('%H:%M'),
+            datetime.now(timezone.utc).strftime('%H:%M'),
             minutes,
             round(pnl, 2),
             round(apr, 1)
@@ -175,7 +171,6 @@ async def cmd_exit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except:
         await update.message.reply_text("⚠️ Использование: /exit <цена> <депозит>")
 
-
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if position:
         await update.message.reply_text(
@@ -184,8 +179,7 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("❌ Позиция не открыта.")
 
-
-# === INIT ===
+# === Init ===
 if __name__ == "__main__":
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
