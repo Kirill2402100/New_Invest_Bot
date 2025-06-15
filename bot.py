@@ -1,4 +1,3 @@
-# Новый код бота, объединяющий SSL-сигналы и отправку данных в Google Sheets
 import os
 import asyncio
 import json
@@ -42,7 +41,7 @@ monitoring = False
 # === EXCHANGE ===
 exchange = ccxt.mexc()
 
-# === SSL Signal Calculation ===
+# === SSL Calculation ===
 def calculate_ssl(df):
     sma = df['close'].rolling(13).mean()
     hlv = (df['close'] > sma).astype(int)
@@ -76,7 +75,6 @@ def calculate_ssl(df):
                 df.at[df.index[i], 'ssl_channel'] = 'SHORT'
     return df
 
-# === Fetch SSL Signal ===
 async def fetch_ssl_signal():
     ohlcv = exchange.fetch_ohlcv(PAIR, timeframe='15m', limit=100)
     df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
@@ -95,7 +93,6 @@ async def fetch_ssl_signal():
         return curr, price
     return None, price
 
-# === Monitor ===
 async def monitor_signal(app):
     global current_signal, last_cross
     while monitoring:
@@ -104,7 +101,7 @@ async def monitor_signal(app):
             if signal and signal != current_signal:
                 current_signal = signal
                 last_cross = datetime.now(timezone.utc)
-                for chat_id in CHAT_IDS:
+                for chat_id in app.chat_ids:
                     await app.bot.send_message(
                         chat_id=chat_id,
                         text=f"📡 Сигнал: {signal}\n💰 Цена: {price:.4f}\n⏰ Время: {last_cross.strftime('%H:%M UTC')}"
@@ -113,9 +110,11 @@ async def monitor_signal(app):
             print("[error]", e)
         await asyncio.sleep(30)
 
-# === Telegram Commands ===
+# === Commands ===
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     global monitoring
+    chat_id = update.effective_chat.id
+    ctx.application.chat_ids.add(chat_id)
     monitoring = True
     await update.message.reply_text("✅ Мониторинг запущен.")
     asyncio.create_task(monitor_signal(ctx.application))
@@ -164,6 +163,8 @@ async def cmd_exit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ]
         await asyncio.to_thread(LOGS_WS.append_row, row, value_input_option='USER_ENTERED')
 
+        log.append({"pnl": pnl, "apr": apr, "duration_min": minutes, "direction": position['direction']})
+
         await update.message.reply_text(
             f"✅ Сделка закрыта\n📈 P&L: {pnl:.2f} USDT\n📊 APR: {apr:.2f}%\n⏰ Время в позиции: {minutes} мин"
         )
@@ -179,14 +180,32 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("❌ Позиция не открыта.")
 
-# === Init ===
+async def cmd_log(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not log:
+        await update.message.reply_text("⚠️ Сделок пока нет.")
+        return
+    text = "📊 История сделок:\n"
+    for i, trade in enumerate(log[-5:], 1):
+        text += f"{i}. {trade['direction']} | P&L: {trade['pnl']:.2f}$ | APR: {trade['apr']:.2f}% | {trade['duration_min']} мин\n"
+    await update.message.reply_text(text)
+
+async def cmd_reset(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    global position, log
+    position = None
+    log.clear()
+    await update.message.reply_text("♻️ История и позиция сброшены.")
+
+# === Launch ===
 if __name__ == "__main__":
     app = ApplicationBuilder().token(BOT_TOKEN).build()
+    app.chat_ids = set(CHAT_IDS)
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("stop", cmd_stop))
     app.add_handler(CommandHandler("entry", cmd_entry))
     app.add_handler(CommandHandler("exit", cmd_exit))
     app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("log", cmd_log))
+    app.add_handler(CommandHandler("reset", cmd_reset))
 
     app.run_polling()
