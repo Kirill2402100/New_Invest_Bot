@@ -14,7 +14,7 @@ from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 # === ENV ===
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_IDS = [int(cid) for cid in os.getenv("CHAT_IDS", "0").split(",")]
-PAIR = os.getenv("PAIR", "BTC/USD")
+PAIR = os.getenv("PAIR", "BTC/USDT")
 SHEET_ID = os.getenv("SHEET_ID")
 
 # === GOOGLE SHEETS ===
