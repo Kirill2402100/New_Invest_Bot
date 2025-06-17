@@ -26,14 +26,17 @@ creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
 gs = gspread.authorize(creds)
 LOGS_WS = gs.open_by_key(SHEET_ID).worksheet("LP_Logs")
 
-HEADERS = ["Дата-время", "Время start", "Время stop", "Минут", "P&L за цикл (USDC)", "APR цикла (%)"]
+HEADERS = [
+    "Дата-время", "Инструмент", "Депозит", "Вход",
+    "Stop Loss", "Take Profit", "RR",
+    "P&L сделки (USDT)", "APR сделки (%)"
+]
 if LOGS_WS.row_values(1) != HEADERS:
     LOGS_WS.resize(rows=1)
     LOGS_WS.update('A1', [HEADERS])
 
 # === STATE ===
 current_signal = None
-last_cross = None
 position = None
 log = []
 monitoring = False
@@ -94,23 +97,22 @@ async def fetch_ssl_signal():
     return None, price
 
 async def monitor_signal(app):
-    global current_signal, last_cross
+    global current_signal
     while monitoring:
         try:
             signal, price = await fetch_ssl_signal()
             if signal and signal != current_signal:
                 current_signal = signal
-                last_cross = datetime.now(timezone.utc)
                 for chat_id in app.chat_ids:
                     await app.bot.send_message(
                         chat_id=chat_id,
-                        text=f"📡 Сигнал: {signal}\n💰 Цена: {price:.4f}\n⏰ Время: {last_cross.strftime('%H:%M UTC')}"
+                        text=f"📡 Сигнал: {signal}\n💰 Цена: {price:.4f}\n⏰ Время: {datetime.now(timezone.utc).strftime('%H:%M UTC')}"
                     )
         except Exception as e:
             print("[error]", e)
         await asyncio.sleep(30)
 
-# === Commands ===
+# === Telegram Commands ===
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     global monitoring
     chat_id = update.effective_chat.id
@@ -127,55 +129,63 @@ async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     global position
     try:
-        price = float(ctx.args[0])
-        deposit = float(ctx.args[1])
+        deposit, entry, sl, tp = map(float, ctx.args)
+        rr = round((entry - sl) / (tp - entry), 2) if tp != entry else 0
         position = {
-            "entry_price": price,
-            "entry_deposit": deposit,
+            "direction": current_signal,
             "entry_time": datetime.now(timezone.utc),
-            "direction": current_signal
+            "deposit": deposit,
+            "entry": entry,
+            "sl": sl,
+            "tp": tp,
+            "rr": rr
         }
-        await update.message.reply_text(f"✅ Вход зафиксирован: {current_signal} @ {price:.4f} | Баланс: {deposit}$")
+        await update.message.reply_text(
+            f"✅ Вход: {current_signal} @ {entry}\nДепозит: {deposit}$ | SL: {sl} | TP: {tp} | RR: {rr}"
+        )
     except:
-        await update.message.reply_text("⚠️ Использование: /entry <цена> <депозит>")
+        await update.message.reply_text("⚠️ Использование: /entry <депозит> <вход> <stop_loss> <take_profit>")
 
 async def cmd_exit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     global position
     try:
         exit_price = float(ctx.args[0])
         exit_deposit = float(ctx.args[1])
-        if position is None:
+        if not position:
             await update.message.reply_text("⚠️ Позиция не открыта.")
             return
 
-        pnl = exit_deposit - position['entry_deposit']
-        apr = (pnl / position['entry_deposit']) * 100
+        pnl = round(exit_deposit - position['deposit'], 2)
         duration = datetime.now(timezone.utc) - position['entry_time']
         minutes = int(duration.total_seconds() // 60)
+        apr = round((pnl / position['deposit']) * (525600 / minutes) * 100 if minutes > 0 else 0, 1)
 
         row = [
             position['entry_time'].strftime('%Y-%m-%d %H:%M:%S'),
-            position['entry_time'].strftime('%H:%M'),
-            datetime.now(timezone.utc).strftime('%H:%M'),
-            minutes,
-            round(pnl, 2),
-            round(apr, 1)
+            position['direction'],
+            position['deposit'],
+            position['entry'],
+            position['sl'],
+            position['tp'],
+            position['rr'],
+            pnl,
+            apr
         ]
         await asyncio.to_thread(LOGS_WS.append_row, row, value_input_option='USER_ENTERED')
 
         log.append({"pnl": pnl, "apr": apr, "duration_min": minutes, "direction": position['direction']})
 
         await update.message.reply_text(
-            f"✅ Сделка закрыта\n📈 P&L: {pnl:.2f} USDT\n📊 APR: {apr:.2f}%\n⏰ Время в позиции: {minutes} мин"
+            f"✅ Сделка закрыта\n📈 P&L: {pnl:.2f} USDT\n📊 APR: {apr:.2f}%\n⏰ Время: {minutes} мин"
         )
         position = None
     except:
-        await update.message.reply_text("⚠️ Использование: /exit <цена> <депозит>")
+        await update.message.reply_text("⚠️ Использование: /exit <выход> <депозит_на_выходе>")
 
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if position:
         await update.message.reply_text(
-            f"🔍 Позиция: {position['direction']} от {position['entry_price']}\nБаланс: {position['entry_deposit']}$"
+            f"🔍 Позиция: {position['direction']} @ {position['entry']}\nSL: {position['sl']} | TP: {position['tp']} | RR: {position['rr']}"
         )
     else:
         await update.message.reply_text("❌ Позиция не открыта.")
@@ -186,7 +196,7 @@ async def cmd_log(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     text = "📊 История сделок:\n"
     for i, trade in enumerate(log[-5:], 1):
-        text += f"{i}. {trade['direction']} | P&L: {trade['pnl']:.2f}$ | APR: {trade['apr']:.2f}% | {trade['duration_min']} мин\n"
+        text += f"{i}. {trade['direction']} | P&L: {trade['pnl']:.2f}$ | APR: {trade['apr']:.1f}% | {trade['duration_min']} мин\n"
     await update.message.reply_text(text)
 
 async def cmd_reset(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -195,7 +205,6 @@ async def cmd_reset(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     log.clear()
     await update.message.reply_text("♻️ История и позиция сброшены.")
 
-# === Launch ===
 if __name__ == "__main__":
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.chat_ids = set(CHAT_IDS)
