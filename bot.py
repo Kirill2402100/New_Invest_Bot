@@ -1,206 +1,262 @@
+#!/usr/bin/env python3
+# ============================================================================
+# v2.1 - Supertrend Signals
+# • Сигнал на вход теперь генерируется сменой направления Supertrend.
+# ============================================================================
+
 import os
 import asyncio
 import json
+import logging
 from datetime import datetime, timezone
 import numpy as np
 import pandas as pd
-import ccxt
+import ccxt.async_support as ccxt
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-# === ENV ===
+# === ENV / Logging ===
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-CHAT_IDS = [int(cid) for cid in os.getenv("CHAT_IDS", "0").split(",")]
-PAIR = os.getenv("PAIR", "BTC/USDT")
+CHAT_IDS = {int(cid) for cid in os.getenv("CHAT_IDS", "0").split(",") if cid}
+PAIR_RAW = os.getenv("PAIR", "BTC/USDT")
 SHEET_ID = os.getenv("SHEET_ID")
+LEVERAGE = int(os.getenv("LEVERAGE", 10))
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("bot")
 
 # === GOOGLE SHEETS ===
-scope = [
-    "https://spreadsheets.google.com/feeds",
-    "https://www.googleapis.com/auth/drive",
-]
-creds_dict = json.loads(os.getenv("GOOGLE_CREDENTIALS"))
-creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
-gs = gspread.authorize(creds)
-LOGS_WS = gs.open_by_key(SHEET_ID).worksheet("LP_Logs")
+try:
+    scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+    creds_dict = json.loads(os.getenv("GOOGLE_CREDENTIALS"))
+    creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+    gs = gspread.authorize(creds)
+    LOGS_WS = gs.open_by_key(SHEET_ID).worksheet("LP_Logs")
+    HEADERS = ["Дата-время", "Инструмент", "Направление", "Депозит", "Вход", "Stop Loss", "Take Profit", "RR", "P&L сделки (USDT)", "APR сделки (%)"]
+    if LOGS_WS.row_values(1) != HEADERS:
+        LOGS_WS.resize(rows=1); LOGS_WS.update('A1', [HEADERS])
+except Exception as e:
+    log.error("Google Sheets init failed: %s", e)
+    LOGS_WS = None
 
-HEADERS = [
-    "Дата-время", "Инструмент", "Депозит", "Вход", "Stop Loss", "Take Profit",
-    "RR", "P&L сделки (USDT)", "APR сделки (%)"
-]
-if LOGS_WS.row_values(1) != HEADERS:
-    LOGS_WS.resize(rows=1)
-    LOGS_WS.update('A1', [HEADERS])
+# === STATE MANAGEMENT ===
+STATE_FILE = "bot_state.json"
+state = {"monitoring": False, "position": None}
 
-# === STATE ===
-current_signal = None
-last_cross = None
-position = None
-log = []
-monitoring = False
+def save_state():
+    with open(STATE_FILE, 'w') as f:
+        json.dump(state, f)
+
+def load_state():
+    global state
+    if os.path.exists(STATE_FILE):
+        with open(STATE_FILE, 'r') as f:
+            state = json.load(f)
+            log.info("State loaded from file. Current position: %s", state.get("position"))
 
 # === EXCHANGE ===
-exchange = ccxt.mexc()
+exchange = ccxt.mexc({"apiKey": os.getenv("MEXC_API_KEY"), "secret": os.getenv("MEXC_SECRET")})
+PAIR = PAIR_RAW.upper()
 
-def calculate_ssl(df):
-    sma = df['close'].rolling(13).mean()
-    hlv = (df['close'] > sma).astype(int)
-    ssl_up, ssl_down = [], []
-    for i in range(len(df)):
-        if i < 12:
-            ssl_up.append(None)
-            ssl_down.append(None)
-        else:
-            if hlv.iloc[i] == 1:
-                ssl_up.append(df['high'].iloc[i-12:i+1].max())
-                ssl_down.append(df['low'].iloc[i-12:i+1].min())
-            else:
-                ssl_up.append(df['low'].iloc[i-12:i+1].min())
-                ssl_down.append(df['high'].iloc[i-12:i+1].max())
-    df['ssl_up'], df['ssl_down'], df['ssl_channel'] = ssl_up, ssl_down, None
+# === STRATEGY PARAMS ===
+RSI_LEN, ATR_LEN = 14, 14
+EMA_FAST_LEN, EMA_SLOW_LEN = 20, 50
+ST_ATR_LEN, ST_FACTOR = 10, 3  # Параметры для Supertrend
+RSI_LONG_T, RSI_SHORT_T = 52, 48
+TP_ATR_MUL, SL_ATR_MUL = 3.0, 1.5
+
+# === INDICATORS ===
+def _ta_rsi(series:pd.Series, length=14):
+    delta = series.diff()
+    gain = delta.clip(lower=0).rolling(window=length, min_periods=length).mean()
+    loss = (-delta.clip(upper=0)).rolling(window=length, min_periods=length).mean()
+    if loss.empty or loss.iloc[-1] == 0: return pd.Series(100, index=series.index)
+    rs = gain / loss
+    return 100 - (100 / (1 + rs))
+
+def calc_atr(df: pd.DataFrame, length=14):
+    high_low = df['high'] - df['low']
+    high_close = np.abs(df['high'] - df['close'].shift())
+    low_close = np.abs(df['low'] - df['close'].shift())
+    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+    return tr.rolling(window=length, min_periods=length).mean()
+
+def calculate_indicators(df: pd.DataFrame):
+    df['ema_fast'] = df['close'].ewm(span=EMA_FAST_LEN, adjust=False).mean()
+    df['ema_slow'] = df['close'].ewm(span=EMA_SLOW_LEN, adjust=False).mean()
+    df['rsi'] = _ta_rsi(df['close'], RSI_LEN)
+    df['atr'] = calc_atr(df, ATR_LEN)
+    
+    # Расчет Supertrend
+    st_atr = calc_atr(df, ST_ATR_LEN)
+    hl2 = (df['high'] + df['low']) / 2
+    upper_band = hl2 + (ST_FACTOR * st_atr)
+    lower_band = hl2 - (ST_FACTOR * st_atr)
+    
+    st_direction = pd.Series(1, index=df.index)
     for i in range(1, len(df)):
-        if pd.notna(df['ssl_up'].iloc[i]) and pd.notna(df['ssl_down'].iloc[i]):
-            prev, curr = df.iloc[i - 1], df.iloc[i]
-            if prev['ssl_up'] < prev['ssl_down'] and curr['ssl_up'] > curr['ssl_down']:
-                df.at[df.index[i], 'ssl_channel'] = 'LONG'
-            elif prev['ssl_up'] > prev['ssl_down'] and curr['ssl_up'] < curr['ssl_down']:
-                df.at[df.index[i], 'ssl_channel'] = 'SHORT'
-    return df
+        if df['close'].iloc[i-1] <= upper_band.iloc[i-1]:
+             st_direction.iloc[i] = 1 if upper_band.iloc[i] < upper_band.iloc[i-1] else -1
+        else:
+             st_direction.iloc[i] = -1 if lower_band.iloc[i] > lower_band.iloc[i-1] else 1
+    
+    df['st_dir'] = st_direction
+    return df.dropna()
 
-async def fetch_ssl_signal():
-    ohlcv = exchange.fetch_ohlcv(PAIR, timeframe='15m', limit=100)
-    df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-    df.set_index('timestamp', inplace=True)
-    df = calculate_ssl(df)
-    valid_signals = df['ssl_channel'].dropna()
-    if len(valid_signals) < 2:
-        return None, df['close'].iloc[-1]
-    prev, curr = valid_signals.iloc[-2], valid_signals.iloc[-1]
-    price = df['close'].iloc[-1]
-    return (curr, price) if prev != curr else (None, price)
-
-async def monitor_signal(app):
-    global current_signal, last_cross
-    while monitoring:
-        try:
-            signal, price = await fetch_ssl_signal()
-            if signal and signal != current_signal:
-                current_signal = signal
-                last_cross = datetime.now(timezone.utc)
-                for chat_id in app.chat_ids:
-                    await app.bot.send_message(
-                        chat_id=chat_id,
-                        text=f"\U0001f4e1 Сигнал: {signal}\n\U0001f4b0 Цена: {price:.4f}\n\u23f0 Время: {last_cross.strftime('%H:%M UTC')}"
-                    )
-        except Exception as e:
-            print("[error]", e)
-        await asyncio.sleep(30)
-
-# === COMMANDS ===
-async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    global monitoring
-    chat_id = update.effective_chat.id
-    ctx.application.chat_ids.add(chat_id)
-    monitoring = True
-    await update.message.reply_text("✅ Мониторинг запущен.")
-    asyncio.create_task(monitor_signal(ctx.application))
-
-async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    global monitoring
-    monitoring = False
-    await update.message.reply_text("❌ Мониторинг остановлен.")
-
-async def cmd_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    global position
+# === TRADING ACTIONS ===
+async def open_position(side: str, price: float, atr: float, app):
+    global state
     try:
-        deposit, entry, sl, tp = map(float, ctx.args[:4])
-        rr = abs((tp - entry) / (sl - entry))
-        position = {
-            "entry_time": datetime.now(timezone.utc),
-            "entry_deposit": deposit,
-            "entry_price": entry,
-            "sl": sl,
-            "tp": tp,
-            "rr": rr,
-            "direction": current_signal
-        }
-        await update.message.reply_text(
-            f"✅ Вход: {current_signal} @ {entry}\nДепозит: {deposit:.2f}$ | SL: {sl} | TP: {tp} | RR: {rr:.2f}"
-        )
-    except:
-        await update.message.reply_text("⚠️ Использование: /entry <депозит> <вход> <SL> <TP>")
-
-async def cmd_exit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    global position
-    try:
-        exit_deposit = float(ctx.args[0])
-        exit_price = float(ctx.args[1])
-        if not position:
-            await update.message.reply_text("⚠️ Позиция не открыта.")
+        balance_info = await exchange.fetch_balance()
+        usdt_balance = balance_info['USDT']['free']
+        if usdt_balance < 10:
+            await broadcast_message(app, "⚠️ Недостаточно средств для открытия позиции (< 10 USDT).")
             return
 
-        pnl = exit_deposit - position['entry_deposit']
-        apr = (pnl / position['entry_deposit']) * 100
-        duration = datetime.now(timezone.utc) - position['entry_time']
-        minutes = int(duration.total_seconds() // 60)
+        amount_in_usdt = usdt_balance * 0.95 
+        amount = amount_in_usdt / price
+        
+        log.info(f"Attempting to open {side} position of {amount:.4f} {PAIR} for {amount_in_usdt:.2f} USDT")
+        order = await exchange.create_market_order(PAIR, 'buy' if side == 'LONG' else 'sell', amount)
 
-        row = [
-            position['entry_time'].strftime('%Y-%m-%d %H:%M:%S'),
-            position['direction'],
-            position['entry_deposit'],
-            position['entry_price'],
-            position['sl'],
-            position['tp'],
-            round(position['rr'], 2),
-            round(pnl, 2),
-            round(apr, 1)
-        ]
-        await asyncio.to_thread(LOGS_WS.append_row, row, value_input_option='USER_ENTERED')
+        entry_price = order['average'] if order.get('average') else price
+        sl_price = entry_price - atr * SL_ATR_MUL if side == 'LONG' else entry_price + atr * SL_ATR_MUL
+        tp_price = entry_price + atr * TP_ATR_MUL if side == 'LONG' else entry_price - atr * TP_ATR_MUL
+        
+        state['position'] = {
+            "side": side, "entry_price": entry_price, "amount": order['filled'],
+            "sl": sl_price, "tp": tp_price, "entry_time": datetime.now(timezone.utc).isoformat()
+        }
+        save_state()
+        await broadcast_message(app, f"✅ Открыта {side} позиция @ {entry_price:.4f}\nSL: {sl_price:.4f} | TP: {tp_price:.4f}")
 
-        await update.message.reply_text(
-            f"✅ Сделка закрыта\n📈 P&L: {pnl:.2f} USDT\n📊 APR: {apr:.2f}%\n⏰ Время в позиции: {minutes} мин"
-        )
-        position = None
-    except:
-        await update.message.reply_text("⚠️ Использование: /exit <депозит> <цена>")
+    except Exception as e:
+        log.error("Failed to open position: %s", e)
+        await broadcast_message(app, f"❌ Ошибка открытия позиции: {e}")
+
+async def close_position(price: float, reason: str, app):
+    global state
+    pos = state['position']
+    if not pos: return
+
+    try:
+        order = await exchange.create_market_order(PAIR, 'sell' if pos['side'] == 'LONG' else 'buy', pos['amount'])
+        exit_price = order['average'] if order.get('average') else price
+        
+        pnl = (exit_price - pos['entry_price']) * pos['amount']
+        if pos['side'] == 'SHORT': pnl = -pnl
+        
+        await broadcast_message(app, f"⛔️ Позиция {pos['side']} закрыта по {reason} @ {exit_price:.4f}\nP&L: {pnl:.2f} USDT")
+        
+        if LOGS_WS:
+            entry_time = datetime.fromisoformat(pos['entry_time'])
+            rr = abs((pos['tp'] - pos['entry_price']) / (pos['sl'] - pos['entry_price']))
+            duration_days = (datetime.now(timezone.utc) - entry_time).total_seconds() / 86400
+            apr = (pnl / (pos['entry_price'] * pos['amount'])) * (365 / duration_days) * 100 if duration_days > 0 else 0
+            row = [
+                entry_time.strftime('%Y-%m-%d %H:%M:%S'), PAIR, pos['side'], 
+                pos['entry_price'] * pos['amount'], pos['entry_price'], pos['sl'], pos['tp'], 
+                round(rr, 2), round(pnl, 2), round(apr, 1)
+            ]
+            await asyncio.to_thread(LOGS_WS.append_row, row, value_input_option='USER_ENTERED')
+
+    except Exception as e:
+        log.error("Failed to close position: %s", e)
+        await broadcast_message(app, f"❌ Ошибка закрытия позиции: {e}")
+    finally:
+        state['position'] = None
+        save_state()
+
+# === MAIN MONITORING LOOP ===
+async def monitor_loop(app):
+    while state['monitoring']:
+        try:
+            ohlcv = await exchange.fetch_ohlcv(PAIR, timeframe='15m', limit=100)
+            df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            df = calculate_indicators(df.copy())
+            
+            if len(df) < 2: # Убедимся, что есть хотя бы 2 строки для сравнения
+                await asyncio.sleep(30)
+                continue
+
+            last_candle = df.iloc[-1]
+            prev_candle = df.iloc[-2]
+            price = last_candle['close']
+            
+            if state.get('position'):
+                pos = state['position']
+                if pos['side'] == 'LONG' and (price <= pos['sl'] or price >= pos['tp']):
+                    await close_position(price, "SL" if price <= pos['sl'] else "TP", app)
+                elif pos['side'] == 'SHORT' and (price >= pos['sl'] or price <= pos['tp']):
+                    await close_position(price, "SL" if price >= pos['sl'] else "TP", app)
+            
+            else: # Логика входа в новую позицию
+                # --- НОВАЯ ЛОГИКА СИГНАЛА ---
+                long_signal = last_candle['st_dir'] == 1 and prev_candle['st_dir'] == -1
+                short_signal = last_candle['st_dir'] == -1 and prev_candle['st_dir'] == 1
+                
+                if long_signal:
+                    # Проверяем фильтры
+                    if last_candle['close'] > last_candle['ema_fast'] and last_candle['ema_fast'] > last_candle['ema_slow'] and last_candle['rsi'] > RSI_LONG_T:
+                        await broadcast_message(app, f"🔍 Обнаружен сигнал LONG (Supertrend) @ {price:.4f}")
+                        await open_position('LONG', price, last_candle['atr'], app)
+                
+                elif short_signal:
+                    # Проверяем фильтры
+                    if last_candle['close'] < last_candle['ema_fast'] and last_candle['ema_fast'] < last_candle['ema_slow'] and last_candle['rsi'] < RSI_SHORT_T:
+                        await broadcast_message(app, f"🔍 Обнаружен сигнал SHORT (Supertrend) @ {price:.4f}")
+                        await open_position('SHORT', price, last_candle['atr'], app)
+
+        except Exception as e:
+            log.error("Error in monitor loop: %s", e)
+        
+        await asyncio.sleep(30)
+
+# === COMMANDS and RUN ===
+async def broadcast_message(app, text):
+    for chat_id in app.chat_ids:
+        await app.bot.send_message(chat_id=chat_id, text=text)
+
+async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    global state
+    chat_id = update.effective_chat.id
+    if not hasattr(ctx.application, 'chat_ids'):
+        ctx.application.chat_ids = set()
+    ctx.application.chat_ids.add(chat_id)
+    
+    if not state['monitoring']:
+        state['monitoring'] = True
+        save_state()
+        await update.message.reply_text("✅ Мониторинг запущен (v2.1 Supertrend).")
+        asyncio.create_task(monitor_loop(ctx.application))
+    else:
+        await update.message.reply_text("ℹ️ Мониторинг уже запущен.")
+
+async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    global state
+    state['monitoring'] = False
+    save_state()
+    await update.message.reply_text("❌ Мониторинг остановлен.")
 
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if position:
+    pos = state.get('position')
+    if pos:
         await update.message.reply_text(
-            f"🔍 Позиция: {position['direction']} от {position['entry_price']}\nБаланс: {position['entry_deposit']}$"
+            f"🔍 Открыта позиция: {pos['side']} @ {pos['entry_price']:.4f}\n"
+            f"Количество: {pos['amount']}\n"
+            f"SL: {pos['sl']:.4f} | TP: {pos['tp']:.4f}"
         )
     else:
         await update.message.reply_text("❌ Позиция не открыта.")
 
-async def cmd_log(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not log:
-        await update.message.reply_text("⚠️ Сделок пока нет.")
-        return
-    text = "📊 История сделок:\n"
-    for i, trade in enumerate(log[-5:], 1):
-        text += f"{i}. {trade['direction']} | P&L: {trade['pnl']:.2f}$ | APR: {trade['apr']:.2f}% | {trade['duration_min']} мин\n"
-    await update.message.reply_text(text)
-
-async def cmd_reset(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    global position, log
-    position = None
-    log.clear()
-    await update.message.reply_text("♻️ История и позиция сброшены.")
-
-# === RUN ===
 if __name__ == "__main__":
+    load_state() 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
-    app.chat_ids = set(CHAT_IDS)
-
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("stop", cmd_stop))
-    app.add_handler(CommandHandler("entry", cmd_entry))
-    app.add_handler(CommandHandler("exit", cmd_exit))
     app.add_handler(CommandHandler("status", cmd_status))
-    app.add_handler(CommandHandler("log", cmd_log))
-    app.add_handler(CommandHandler("reset", cmd_reset))
 
+    log.info("Bot started...")
     app.run_polling()
