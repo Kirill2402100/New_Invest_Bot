@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 # ============================================================================
-# v2.1 - Supertrend Signals
-# • Сигнал на вход теперь генерируется сменой направления Supertrend.
+# v4.0 - Advanced Signal Monitor
+# • Добавлены итеративные оповещения каждые 0.5% движения цены.
+# • Возвращена функция ручного логирования сделок в Google Sheets.
+# • Мониторинг сигналов и логирование сделок работают параллельно.
 # ============================================================================
 
 import os
@@ -22,7 +24,6 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_IDS = {int(cid) for cid in os.getenv("CHAT_IDS", "0").split(",") if cid}
 PAIR_RAW = os.getenv("PAIR", "BTC/USDT")
 SHEET_ID = os.getenv("SHEET_ID")
-LEVERAGE = int(os.getenv("LEVERAGE", 10))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("bot")
@@ -34,7 +35,7 @@ try:
     creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
     gs = gspread.authorize(creds)
     LOGS_WS = gs.open_by_key(SHEET_ID).worksheet("LP_Logs")
-    HEADERS = ["Дата-время", "Инструмент", "Направление", "Депозит", "Вход", "Stop Loss", "Take Profit", "RR", "P&L сделки (USDT)", "APR сделки (%)"]
+    HEADERS = ["Дата-время", "Инструмент", "Направление", "Депозит", "Вход", "Stop Loss", "Take Profit", "RR", "P&L сделки (USDT)", "Прибыль к депозиту (%)"]
     if LOGS_WS.row_values(1) != HEADERS:
         LOGS_WS.resize(rows=1); LOGS_WS.update('A1', [HEADERS])
 except Exception as e:
@@ -42,32 +43,34 @@ except Exception as e:
     LOGS_WS = None
 
 # === STATE MANAGEMENT ===
-STATE_FILE = "bot_state.json"
-state = {"monitoring": False, "position": None}
+STATE_FILE = "advanced_signal_state.json"
+# Теперь у нас два независимых состояния: для сигналов и для ручной позиции
+state = {"monitoring": False, "active_signal": None, "manual_position": None}
 
 def save_state():
     with open(STATE_FILE, 'w') as f:
-        json.dump(state, f)
+        json.dump(state, f, indent=2)
 
 def load_state():
     global state
     if os.path.exists(STATE_FILE):
         with open(STATE_FILE, 'r') as f:
             state = json.load(f)
-            log.info("State loaded from file. Current position: %s", state.get("position"))
+            log.info("State loaded. Active Signal: %s, Manual Position: %s", state.get("active_signal"), state.get("manual_position"))
 
-# === EXCHANGE ===
-exchange = ccxt.mexc({"apiKey": os.getenv("MEXC_API_KEY"), "secret": os.getenv("MEXC_SECRET")})
+# === EXCHANGE (только для данных) ===
+exchange = ccxt.mexc()
 PAIR = PAIR_RAW.upper()
 
 # === STRATEGY PARAMS ===
 RSI_LEN, ATR_LEN = 14, 14
 EMA_FAST_LEN, EMA_SLOW_LEN = 20, 50
-ST_ATR_LEN, ST_FACTOR = 10, 3  # Параметры для Supertrend
+ST_ATR_LEN, ST_FACTOR = 10, 3
 RSI_LONG_T, RSI_SHORT_T = 52, 48
-TP_ATR_MUL, SL_ATR_MUL = 3.0, 1.5
+PRICE_CHANGE_STEP_PCT = 0.5 # Шаг для итеративных оповещений
 
 # === INDICATORS ===
+# ... (Функции _ta_rsi, calc_atr, calculate_indicators остаются без изменений с v3.0)
 def _ta_rsi(series:pd.Series, length=14):
     delta = series.diff()
     gain = delta.clip(lower=0).rolling(window=length, min_periods=length).mean()
@@ -89,125 +92,99 @@ def calculate_indicators(df: pd.DataFrame):
     df['rsi'] = _ta_rsi(df['close'], RSI_LEN)
     df['atr'] = calc_atr(df, ATR_LEN)
     
-    # Расчет Supertrend
     st_atr = calc_atr(df, ST_ATR_LEN)
     hl2 = (df['high'] + df['low']) / 2
     upper_band = hl2 + (ST_FACTOR * st_atr)
     lower_band = hl2 - (ST_FACTOR * st_atr)
     
     st_direction = pd.Series(1, index=df.index)
+    st_line = pd.Series(np.nan, index=df.index)
+
     for i in range(1, len(df)):
-        if df['close'].iloc[i-1] <= upper_band.iloc[i-1]:
-             st_direction.iloc[i] = 1 if upper_band.iloc[i] < upper_band.iloc[i-1] else -1
+        prev_st_line = st_line.iloc[i-1]
+        if pd.isna(prev_st_line): prev_st_line = hl2.iloc[i-1]
+
+        if df['close'].iloc[i-1] <= prev_st_line:
+            st_direction.iloc[i] = 1 if upper_band.iloc[i] < prev_st_line else -1
         else:
-             st_direction.iloc[i] = -1 if lower_band.iloc[i] > lower_band.iloc[i-1] else 1
-    
+            st_direction.iloc[i] = -1 if lower_band.iloc[i] > prev_st_line else 1
+
+        if st_direction.iloc[i] == 1:
+            st_line.iloc[i] = max(lower_band.iloc[i], prev_st_line)
+        else:
+            st_line.iloc[i] = min(upper_band.iloc[i], prev_st_line)
+
     df['st_dir'] = st_direction
     return df.dropna()
-
-# === TRADING ACTIONS ===
-async def open_position(side: str, price: float, atr: float, app):
-    global state
-    try:
-        balance_info = await exchange.fetch_balance()
-        usdt_balance = balance_info['USDT']['free']
-        if usdt_balance < 10:
-            await broadcast_message(app, "⚠️ Недостаточно средств для открытия позиции (< 10 USDT).")
-            return
-
-        amount_in_usdt = usdt_balance * 0.95 
-        amount = amount_in_usdt / price
-        
-        log.info(f"Attempting to open {side} position of {amount:.4f} {PAIR} for {amount_in_usdt:.2f} USDT")
-        order = await exchange.create_market_order(PAIR, 'buy' if side == 'LONG' else 'sell', amount)
-
-        entry_price = order['average'] if order.get('average') else price
-        sl_price = entry_price - atr * SL_ATR_MUL if side == 'LONG' else entry_price + atr * SL_ATR_MUL
-        tp_price = entry_price + atr * TP_ATR_MUL if side == 'LONG' else entry_price - atr * TP_ATR_MUL
-        
-        state['position'] = {
-            "side": side, "entry_price": entry_price, "amount": order['filled'],
-            "sl": sl_price, "tp": tp_price, "entry_time": datetime.now(timezone.utc).isoformat()
-        }
-        save_state()
-        await broadcast_message(app, f"✅ Открыта {side} позиция @ {entry_price:.4f}\nSL: {sl_price:.4f} | TP: {tp_price:.4f}")
-
-    except Exception as e:
-        log.error("Failed to open position: %s", e)
-        await broadcast_message(app, f"❌ Ошибка открытия позиции: {e}")
-
-async def close_position(price: float, reason: str, app):
-    global state
-    pos = state['position']
-    if not pos: return
-
-    try:
-        order = await exchange.create_market_order(PAIR, 'sell' if pos['side'] == 'LONG' else 'buy', pos['amount'])
-        exit_price = order['average'] if order.get('average') else price
-        
-        pnl = (exit_price - pos['entry_price']) * pos['amount']
-        if pos['side'] == 'SHORT': pnl = -pnl
-        
-        await broadcast_message(app, f"⛔️ Позиция {pos['side']} закрыта по {reason} @ {exit_price:.4f}\nP&L: {pnl:.2f} USDT")
-        
-        if LOGS_WS:
-            entry_time = datetime.fromisoformat(pos['entry_time'])
-            rr = abs((pos['tp'] - pos['entry_price']) / (pos['sl'] - pos['entry_price']))
-            duration_days = (datetime.now(timezone.utc) - entry_time).total_seconds() / 86400
-            apr = (pnl / (pos['entry_price'] * pos['amount'])) * (365 / duration_days) * 100 if duration_days > 0 else 0
-            row = [
-                entry_time.strftime('%Y-%m-%d %H:%M:%S'), PAIR, pos['side'], 
-                pos['entry_price'] * pos['amount'], pos['entry_price'], pos['sl'], pos['tp'], 
-                round(rr, 2), round(pnl, 2), round(apr, 1)
-            ]
-            await asyncio.to_thread(LOGS_WS.append_row, row, value_input_option='USER_ENTERED')
-
-    except Exception as e:
-        log.error("Failed to close position: %s", e)
-        await broadcast_message(app, f"❌ Ошибка закрытия позиции: {e}")
-    finally:
-        state['position'] = None
-        save_state()
 
 # === MAIN MONITORING LOOP ===
 async def monitor_loop(app):
     while state['monitoring']:
         try:
-            ohlcv = await exchange.fetch_ohlcv(PAIR, timeframe='15m', limit=100)
-            df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-            df = calculate_indicators(df.copy())
+            current_price = (await exchange.fetch_ticker(PAIR))['last']
             
-            if len(df) < 2: # Убедимся, что есть хотя бы 2 строки для сравнения
-                await asyncio.sleep(30)
-                continue
+            # --- РЕЖИМ 2: СЛЕЖЕНИЕ ЗА АКТИВНЫМ СИГНАЛОМ ---
+            if state.get('active_signal'):
+                signal_data = state['active_signal']
+                signal_price = signal_data['price']
+                next_target = signal_data.get('next_target_pct', PRICE_CHANGE_STEP_PCT)
+                
+                # Проверка на смену тренда (требует загрузки полных данных)
+                ohlcv = await exchange.fetch_ohlcv(PAIR, timeframe='1h', limit=100)
+                df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+                df = calculate_indicators(df.copy())
+                last_candle = df.iloc[-1]
+                prev_candle = df.iloc[-2]
 
-            last_candle = df.iloc[-1]
-            prev_candle = df.iloc[-2]
-            price = last_candle['close']
-            
-            if state.get('position'):
-                pos = state['position']
-                if pos['side'] == 'LONG' and (price <= pos['sl'] or price >= pos['tp']):
-                    await close_position(price, "SL" if price <= pos['sl'] else "TP", app)
-                elif pos['side'] == 'SHORT' and (price >= pos['sl'] or price <= pos['tp']):
-                    await close_position(price, "SL" if price >= pos['sl'] else "TP", app)
-            
-            else: # Логика входа в новую позицию
-                # --- НОВАЯ ЛОГИКА СИГНАЛА ---
-                long_signal = last_candle['st_dir'] == 1 and prev_candle['st_dir'] == -1
-                short_signal = last_candle['st_dir'] == -1 and prev_candle['st_dir'] == 1
+                reversal_signal = None
+                if signal_data['side'] == 'LONG' and last_candle['st_dir'] == -1 and prev_candle['st_dir'] == 1:
+                    reversal_signal = 'SHORT'
+                elif signal_data['side'] == 'SHORT' and last_candle['st_dir'] == 1 and prev_candle['st_dir'] == -1:
+                    reversal_signal = 'LONG'
+
+                if reversal_signal:
+                    await broadcast_message(app, f"🔄 СМЕНА ТРЕНДА! Предыдущий сигнал {signal_data['side']} отменен. Новый сигнал: {reversal_signal} @ {current_price:.2f}")
+                    state['active_signal'] = {"side": reversal_signal, "price": current_price, "next_target_pct": PRICE_CHANGE_STEP_PCT}
+                    save_state()
+                    await asyncio.sleep(30)
+                    continue
+
+                # Проверка на изменение цены
+                price_change_pct = ((current_price - signal_price) / signal_price) * 100
+                if signal_data['side'] == 'LONG' and price_change_pct >= next_target:
+                    await broadcast_message(app, f"🎯 ЦЕЛЬ +{next_target:.1f}% ДОСТИГНУТА. Сигнал LONG от {signal_price:.2f}. Текущая цена: {current_price:.2f}")
+                    state['active_signal']['next_target_pct'] += PRICE_CHANGE_STEP_PCT # Готовимся к следующей цели
+                    save_state()
+                elif signal_data['side'] == 'SHORT' and price_change_pct <= -next_target:
+                    await broadcast_message(app, f"🎯 ЦЕЛЬ -{next_target:.1f}% ДОСТИГНУТА. Сигнал SHORT от {signal_price:.2f}. Текущая цена: {current_price:.2f}")
+                    state['active_signal']['next_target_pct'] += PRICE_CHANGE_STEP_PCT # Готовимся к следующей цели
+                    save_state()
+
+            # --- РЕЖИМ 1: ПОИСК НОВОГО СИГНАЛА ---
+            elif not state.get('active_signal'): # Ищем, только если не сопровождаем старый
+                ohlcv = await exchange.fetch_ohlcv(PAIR, timeframe='1h', limit=100)
+                df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+                df = calculate_indicators(df.copy())
                 
-                if long_signal:
-                    # Проверяем фильтры
-                    if last_candle['close'] > last_candle['ema_fast'] and last_candle['ema_fast'] > last_candle['ema_slow'] and last_candle['rsi'] > RSI_LONG_T:
-                        await broadcast_message(app, f"🔍 Обнаружен сигнал LONG (Supertrend) @ {price:.4f}")
-                        await open_position('LONG', price, last_candle['atr'], app)
+                if len(df) < 2: continue
+
+                last_candle = df.iloc[-1]
+                prev_candle = df.iloc[-2]
+                price = last_candle['close']
                 
-                elif short_signal:
-                    # Проверяем фильтры
-                    if last_candle['close'] < last_candle['ema_fast'] and last_candle['ema_fast'] < last_candle['ema_slow'] and last_candle['rsi'] < RSI_SHORT_T:
-                        await broadcast_message(app, f"🔍 Обнаружен сигнал SHORT (Supertrend) @ {price:.4f}")
-                        await open_position('SHORT', price, last_candle['atr'], app)
+                is_long_signal = last_candle['st_dir'] == 1 and prev_candle['st_dir'] == -1
+                is_short_signal = last_candle['st_dir'] == -1 and prev_candle['st_dir'] == 1
+                
+                side = None
+                if is_long_signal and last_candle['close'] > last_candle['ema_fast'] and last_candle['close'] > last_candle['ema_slow'] and last_candle['rsi'] > RSI_LONG_T:
+                    side = 'LONG'
+                elif is_short_signal and last_candle['close'] < last_candle['ema_fast'] and last_candle['close'] < last_candle['ema_slow'] and last_candle['rsi'] < RSI_SHORT_T:
+                    side = 'SHORT'
+                
+                if side:
+                    await broadcast_message(app, f"🔔 НОВЫЙ СИГНАЛ: {side} @ {price:.2f}\nНачинаю слежение за ценой...")
+                    state['active_signal'] = {"side": side, "price": price, "next_target_pct": PRICE_CHANGE_STEP_PCT}
+                    save_state()
 
         except Exception as e:
             log.error("Error in monitor loop: %s", e)
@@ -229,7 +206,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not state['monitoring']:
         state['monitoring'] = True
         save_state()
-        await update.message.reply_text("✅ Мониторинг запущен (v2.1 Supertrend).")
+        await update.message.reply_text("✅ Мониторинг запущен (v4.0 Adv. Monitor).")
         asyncio.create_task(monitor_loop(ctx.application))
     else:
         await update.message.reply_text("ℹ️ Мониторинг уже запущен.")
@@ -240,22 +217,70 @@ async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     save_state()
     await update.message.reply_text("❌ Мониторинг остановлен.")
 
+# ---> ВОЗВРАЩЕННЫЕ КОМАНДЫ ДЛЯ РУЧНОГО ЛОГИРОВАНИЯ <---
+async def cmd_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    global state
+    try:
+        deposit, entry, sl, tp = map(float, ctx.args[:4])
+        rr = abs((tp - entry) / (sl - entry))
+        state["manual_position"] = {
+            "entry_time": datetime.now(timezone.utc).isoformat(), "entry_deposit": deposit,
+            "entry_price": entry, "sl": sl, "tp": tp, "rr": rr,
+            "direction": state.get("active_signal", {}).get("side", "N/A")
+        }
+        save_state()
+        await update.message.reply_text(f"✅ Вход вручную зафиксирован: {state['manual_position']['direction']} @ {entry}\nSL: {sl} | TP: {tp}")
+    except (IndexError, ValueError):
+        await update.message.reply_text("⚠️ Использование: /entry <депозит> <цена_входа> <стоп_лосс> <тейк_профит>")
+
+async def cmd_exit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    global state
+    pos = state.get("manual_position")
+    if not pos:
+        await update.message.reply_text("⚠️ Нет открытой ручной позиции для закрытия."); return
+    try:
+        exit_price = float(ctx.args[0])
+        pnl = (exit_price - pos['entry_price']) * (pos['entry_deposit'] / pos['entry_price'])
+        if pos['direction'] == 'SHORT': pnl = -pnl
+        pct_change = (pnl / pos['entry_deposit']) * 100
+        
+        if LOGS_WS:
+            row = [
+                datetime.fromisoformat(pos['entry_time']).strftime('%Y-%m-%d %H:%M:%S'), PAIR, pos['direction'],
+                pos['entry_deposit'], pos['entry_price'], pos['sl'], pos['tp'], 
+                round(pos['rr'], 2), round(pnl, 2), round(pct_change, 2)
+            ]
+            await asyncio.to_thread(LOGS_WS.append_row, row, value_input_option='USER_ENTERED')
+        
+        await update.message.reply_text(f"✅ Сделка закрыта и записана.\nP&L: {pnl:.2f} USDT ({pct_change:.2f}%)")
+        state["manual_position"] = None
+        save_state()
+    except (IndexError, ValueError):
+        await update.message.reply_text("⚠️ Использование: /exit <цена_выхода>")
+
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    pos = state.get('position')
-    if pos:
-        await update.message.reply_text(
-            f"🔍 Открыта позиция: {pos['side']} @ {pos['entry_price']:.4f}\n"
-            f"Количество: {pos['amount']}\n"
-            f"SL: {pos['sl']:.4f} | TP: {pos['tp']:.4f}"
-        )
+    signal = state.get('active_signal')
+    pos = state.get('manual_position')
+    text = "📊 **Текущий статус**\n\n"
+    if signal:
+        text += f"**Мониторинг сигнала:**\n- Направление: {signal['side']}\n- Цена сигнала: {signal['price']:.2f}\n- Следующая цель: {signal.get('next_target_pct', 0):.1f}%\n\n"
     else:
-        await update.message.reply_text("❌ Позиция не открыта.")
+        text += "**Мониторинг сигнала:**\n- Нет активного сигнала, идет поиск.\n\n"
+    if pos:
+        text += f"**Ручная позиция:**\n- Направление: {pos['direction']}\n- Вход: {pos['entry_price']}"
+    else:
+        text += "**Ручная позиция:**\n- Не открыта."
+    await update.message.reply_text(text, parse_mode='Markdown')
+
 
 if __name__ == "__main__":
-    load_state() 
+    load_state()
     app = ApplicationBuilder().token(BOT_TOKEN).build()
+    
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("stop", cmd_stop))
+    app.add_handler(CommandHandler("entry", cmd_entry))
+    app.add_handler(CommandHandler("exit", cmd_exit))
     app.add_handler(CommandHandler("status", cmd_status))
 
     log.info("Bot started...")
