@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # ============================================================================
-# v4.0 - Advanced Signal Monitor (с поддержкой TIMEFRAME из переменной окружения)
+# v4.0 - Advanced Signal Monitor (SuperTrend via `ta`, TIMEFRAME from ENV)
 # ============================================================================
 
 import os
@@ -15,13 +15,14 @@ import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+from ta.trend import SuperTrend  # <-- NEW
 
 # === ENV / Logging ===
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_IDS = {int(cid) for cid in os.getenv("CHAT_IDS", "0").split(",") if cid}
 PAIR_RAW = os.getenv("PAIR", "BTC/USDT")
 SHEET_ID = os.getenv("SHEET_ID")
-TIMEFRAME = os.getenv("TIMEFRAME", "1h")  # <-- добавлена переменная таймфрейма
+TIMEFRAME = os.getenv("TIMEFRAME", "1h")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("bot")
@@ -87,32 +88,13 @@ def calculate_indicators(df: pd.DataFrame):
     df['ema_slow'] = df['close'].ewm(span=EMA_SLOW_LEN, adjust=False).mean()
     df['rsi'] = _ta_rsi(df['close'], RSI_LEN)
     df['atr'] = calc_atr(df, ATR_LEN)
-    
-    st_atr = calc_atr(df, ST_ATR_LEN)
-    hl2 = (df['high'] + df['low']) / 2
-    upper_band = hl2 + (ST_FACTOR * st_atr)
-    lower_band = hl2 - (ST_FACTOR * st_atr)
-    
-    st_direction = pd.Series(1, index=df.index)
-    st_line = pd.Series(np.nan, index=df.index)
 
-    for i in range(1, len(df)):
-        prev_st_line = st_line.iloc[i-1]
-        if pd.isna(prev_st_line): prev_st_line = hl2.iloc[i-1]
+    st = SuperTrend(high=df['high'], low=df['low'], close=df['close'], window=ST_ATR_LEN, multiplier=ST_FACTOR)
+    df['st'] = st.supertrend()
+    df['st_dir'] = st.supertrend_direction().astype(int)  # 1 = LONG, -1 = SHORT
 
-        if df['close'].iloc[i-1] <= prev_st_line:
-            st_direction.iloc[i] = 1 if upper_band.iloc[i] < prev_st_line else -1
-        else:
-            st_direction.iloc[i] = -1 if lower_band.iloc[i] > prev_st_line else 1
-
-        if st_direction.iloc[i] == 1:
-            st_line.iloc[i] = max(lower_band.iloc[i], prev_st_line)
-        else:
-            st_line.iloc[i] = min(upper_band.iloc[i], prev_st_line)
-
-    df['st_dir'] = st_direction
     return df.dropna()
-
+    
 # === MAIN MONITORING LOOP ===
 async def monitor_loop(app):
     while state['monitoring']:
