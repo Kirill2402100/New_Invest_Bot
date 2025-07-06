@@ -83,15 +83,18 @@ def calc_atr(df: pd.DataFrame, length=14):
     tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
     return tr.rolling(window=length, min_periods=length).mean()
 
+import pandas_ta as ta
+
 def calculate_indicators(df: pd.DataFrame):
     df['ema_fast'] = df['close'].ewm(span=EMA_FAST_LEN, adjust=False).mean()
     df['ema_slow'] = df['close'].ewm(span=EMA_SLOW_LEN, adjust=False).mean()
     df['rsi'] = _ta_rsi(df['close'], RSI_LEN)
     df['atr'] = calc_atr(df, ATR_LEN)
 
-    st = SuperTrend(high=df['high'], low=df['low'], close=df['close'], window=ST_ATR_LEN, multiplier=ST_FACTOR)
-    df['st'] = st.supertrend()
-    df['st_dir'] = st.supertrend_direction().astype(int)  # 1 = LONG, -1 = SHORT
+    # Supertrend через pandas-ta
+    st = ta.supertrend(high=df['high'], low=df['low'], close=df['close'], length=ST_ATR_LEN, multiplier=ST_FACTOR)
+    df = pd.concat([df, st], axis=1)
+    df['st_dir'] = df['SUPERTd_10_3.0'].map({True: 1, False: -1})
 
     return df.dropna()
     
