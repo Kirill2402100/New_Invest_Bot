@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-# =========================================================================
-# v4.1 - Условия запоминаются поэтапно, логируется прогресс, сигнал при полном совпадении
-# =========================================================================
+# ============================================================================
+# v5.0 - EMA Crossover Signal Monitor (вместо SuperTrend)
+# ============================================================================
 
 import os
 import asyncio
@@ -15,7 +15,6 @@ import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
-import pandas_ta as ta
 
 # === ENV / Logging ===
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -41,13 +40,18 @@ except Exception as e:
     log.error("Google Sheets init failed: %s", e)
     LOGS_WS = None
 
-# === STATE ===
+# === STATE MANAGEMENT ===
 STATE_FILE = "advanced_signal_state.json"
 state = {
     "monitoring": False,
     "active_signal": None,
     "manual_position": None,
-    "condition_flags": {}
+    "signal_status": {
+        "rsi": False,
+        "ema_position": False,
+        "ema_cross": False,
+        "side": None
+    }
 }
 
 def save_state():
@@ -59,85 +63,105 @@ def load_state():
     if os.path.exists(STATE_FILE):
         with open(STATE_FILE, 'r') as f:
             state = json.load(f)
+            log.info("State loaded: %s", state)
 
 # === EXCHANGE ===
 exchange = ccxt.mexc()
 PAIR = PAIR_RAW.upper()
 
 # === STRATEGY PARAMS ===
-RSI_LEN, ATR_LEN = 14, 14
-EMA_FAST_LEN, EMA_SLOW_LEN = 20, 50
-ST_ATR_LEN, ST_FACTOR = 10, 3
+RSI_LEN = 14
+EMA_FAST_LEN, EMA_SLOW_LEN = 9, 21
 RSI_LONG_T, RSI_SHORT_T = 52, 48
 PRICE_CHANGE_STEP_PCT = 0.1
 
 # === INDICATORS ===
 def _ta_rsi(series: pd.Series, length=14):
     delta = series.diff()
-    gain = delta.clip(lower=0).rolling(window=length).mean()
-    loss = -delta.clip(upper=0).rolling(window=length).mean()
+    gain = delta.clip(lower=0).rolling(window=length, min_periods=length).mean()
+    loss = (-delta.clip(upper=0)).rolling(window=length, min_periods=length).mean()
+    if loss.empty or loss.iloc[-1] == 0: return pd.Series(100, index=series.index)
     rs = gain / loss
     return 100 - (100 / (1 + rs))
 
-def calculate_indicators(df):
-    df['ema_fast'] = df['close'].ewm(span=EMA_FAST_LEN).mean()
-    df['ema_slow'] = df['close'].ewm(span=EMA_SLOW_LEN).mean()
+def calculate_indicators(df: pd.DataFrame):
+    df['ema_fast'] = df['close'].ewm(span=EMA_FAST_LEN, adjust=False).mean()
+    df['ema_slow'] = df['close'].ewm(span=EMA_SLOW_LEN, adjust=False).mean()
     df['rsi'] = _ta_rsi(df['close'], RSI_LEN)
-    st = ta.supertrend(df['high'], df['low'], df['close'], length=ST_ATR_LEN, multiplier=ST_FACTOR)
-    df = pd.concat([df, st], axis=1)
-    df['st_dir'] = df['SUPERTd_10_3.0'].map({True: 1, False: -1})
+    df['ema_cross'] = df['ema_fast'] > df['ema_slow']
     return df.dropna()
 
-# === MAIN LOOP ===
+# === MAIN MONITORING LOOP ===
 async def monitor_loop(app):
     while state['monitoring']:
         try:
-            current_price = (await exchange.fetch_ticker(PAIR))['last']
             ohlcv = await exchange.fetch_ohlcv(PAIR, timeframe=TIMEFRAME, limit=100)
             df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-            df = calculate_indicators(df)
-            last, prev = df.iloc[-1], df.iloc[-2]
+            df = calculate_indicators(df.copy())
+            last = df.iloc[-1]
+            prev = df.iloc[-2]
+            current_price = last['close']
 
-            flags = state.get("condition_flags", {"rsi": False, "ema": False, "st": False})
+            side = None
+            rsi_passed = last['rsi'] > RSI_LONG_T
+            ema_position_passed = last['close'] > last['ema_fast'] and last['close'] > last['ema_slow']
+            ema_cross_passed = prev['ema_fast'] < prev['ema_slow'] and last['ema_fast'] > last['ema_slow']
 
-            if last['rsi'] > RSI_LONG_T:
-                if not flags['rsi']:
-                    await broadcast_message(app, "🟡 RSI условие выполнено. Жду EMA и Supertrend...")
-                    flags['rsi'] = True
+            # Логика сигнала LONG
+            if rsi_passed and ema_position_passed and ema_cross_passed:
+                if not state['active_signal']:
+                    await broadcast_message(app, f"✅ СИГНАЛ LONG! Цена: {current_price:.2f}")
+                    state['active_signal'] = {
+                        "side": "LONG",
+                        "price": current_price,
+                        "next_target_pct": PRICE_CHANGE_STEP_PCT
+                    }
+                state['signal_status'] = {"rsi": True, "ema_position": True, "ema_cross": True, "side": "LONG"}
+
+            # Проверка на отмену или возврат
+            elif state['active_signal']:
+                # Условия всё ещё соблюдаются?
+                still_rsi = last['rsi'] > RSI_LONG_T
+                still_ema_pos = last['close'] > last['ema_fast'] and last['close'] > last['ema_slow']
+                still_cross = last['ema_fast'] > last['ema_slow']
+
+                missing = []
+                if not still_rsi: missing.append("RSI")
+                if not still_ema_pos: missing.append("EMA положение")
+                if not still_cross: missing.append("EMA пересечение")
+
+                if missing:
+                    await broadcast_message(app, f"⚠️ ОТМЕНА сигнала LONG. Нарушены условия: {', '.join(missing)}")
+                    state['active_signal'] = None
+                    state['signal_status'] = {"rsi": False, "ema_position": False, "ema_cross": False, "side": None}
+                else:
+                    # Проверка на движение цены
+                    signal_data = state['active_signal']
+                    price_change_pct = ((current_price - signal_data['price']) / signal_data['price']) * 100
+                    if price_change_pct >= signal_data['next_target_pct']:
+                        await broadcast_message(app, f"🎯 ЦЕЛЬ +{signal_data['next_target_pct']:.1f}% ДОСТИГНУТА. Текущая цена: {current_price:.2f}")
+                        state['active_signal']['next_target_pct'] += PRICE_CHANGE_STEP_PCT
+                        save_state()
             else:
-                flags['rsi'] = False
+                partials = []
+                if rsi_passed: partials.append("RSI")
+                if ema_position_passed: partials.append("EMA положение")
+                if ema_cross_passed: partials.append("EMA пересечение")
+                if partials:
+                    await broadcast_message(app, f"ℹ️ Выполнено: {', '.join(partials)}. Ждём остальные условия...")
 
-            if last['close'] > last['ema_fast'] and last['close'] > last['ema_slow']:
-                if not flags['ema']:
-                    await broadcast_message(app, "🟡 EMA условие выполнено. Жду RSI и Supertrend...")
-                    flags['ema'] = True
-            else:
-                flags['ema'] = False
-
-            if last['st_dir'] == 1 and prev['st_dir'] == -1:
-                if not flags['st']:
-                    await broadcast_message(app, "🟡 Supertrend условие выполнено. Жду RSI и EMA...")
-                    flags['st'] = True
-            else:
-                flags['st'] = False
-
-            if all(flags.values()) and not state.get('active_signal'):
-                state['active_signal'] = {"side": "LONG", "price": current_price, "next_target_pct": PRICE_CHANGE_STEP_PCT}
-                await broadcast_message(app, f"✅ Все условия выполнены. Сигнал LONG @ {current_price:.2f}")
-                flags = {"rsi": False, "ema": False, "st": False}
-
-            state['condition_flags'] = flags
             save_state()
-        except Exception as e:
-            log.error("Ошибка мониторинга: %s", e)
-        await asyncio.sleep(30)
+            await asyncio.sleep(30)
 
-# === BROADCAST ===
-async def broadcast_message(app, text):
-    for cid in CHAT_IDS:
-        await app.bot.send_message(chat_id=cid, text=text)
+        except Exception as e:
+            log.error("Error in monitor loop: %s", e)
+            await asyncio.sleep(30)
 
 # === COMMANDS ===
+async def broadcast_message(app, text):
+    for chat_id in CHAT_IDS:
+        await app.bot.send_message(chat_id=chat_id, text=text)
+
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     CHAT_IDS.add(chat_id)
@@ -147,14 +171,13 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("✅ Мониторинг запущен.")
         asyncio.create_task(monitor_loop(ctx.application))
     else:
-        await update.message.reply_text("Уже запущен.")
+        await update.message.reply_text("ℹ️ Мониторинг уже активен.")
 
 async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     state['monitoring'] = False
     save_state()
-    await update.message.reply_text("⛔️ Мониторинг остановлен.")
+    await update.message.reply_text("🛑 Мониторинг остановлен.")
 
-# === RUN ===
 if __name__ == "__main__":
     load_state()
     app = ApplicationBuilder().token(BOT_TOKEN).build()
