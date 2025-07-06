@@ -1,9 +1,6 @@
 #!/usr/bin/env python3
 # ============================================================================
-# v4.0 - Advanced Signal Monitor
-# • Добавлены итеративные оповещения каждые 0.5% движения цены.
-# • Возвращена функция ручного логирования сделок в Google Sheets.
-# • Мониторинг сигналов и логирование сделок работают параллельно.
+# v4.0 - Advanced Signal Monitor (с поддержкой TIMEFRAME из переменной окружения)
 # ============================================================================
 
 import os
@@ -24,6 +21,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_IDS = {int(cid) for cid in os.getenv("CHAT_IDS", "0").split(",") if cid}
 PAIR_RAW = os.getenv("PAIR", "BTC/USDT")
 SHEET_ID = os.getenv("SHEET_ID")
+TIMEFRAME = os.getenv("TIMEFRAME", "1h")  # <-- добавлена переменная таймфрейма
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("bot")
@@ -44,7 +42,6 @@ except Exception as e:
 
 # === STATE MANAGEMENT ===
 STATE_FILE = "advanced_signal_state.json"
-# Теперь у нас два независимых состояния: для сигналов и для ручной позиции
 state = {"monitoring": False, "active_signal": None, "manual_position": None}
 
 def save_state():
@@ -58,7 +55,7 @@ def load_state():
             state = json.load(f)
             log.info("State loaded. Active Signal: %s, Manual Position: %s", state.get("active_signal"), state.get("manual_position"))
 
-# === EXCHANGE (только для данных) ===
+# === EXCHANGE ===
 exchange = ccxt.mexc()
 PAIR = PAIR_RAW.upper()
 
@@ -67,11 +64,10 @@ RSI_LEN, ATR_LEN = 14, 14
 EMA_FAST_LEN, EMA_SLOW_LEN = 20, 50
 ST_ATR_LEN, ST_FACTOR = 10, 3
 RSI_LONG_T, RSI_SHORT_T = 52, 48
-PRICE_CHANGE_STEP_PCT = 0.5 # Шаг для итеративных оповещений
+PRICE_CHANGE_STEP_PCT = 0.5
 
 # === INDICATORS ===
-# ... (Функции _ta_rsi, calc_atr, calculate_indicators остаются без изменений с v3.0)
-def _ta_rsi(series:pd.Series, length=14):
+def _ta_rsi(series: pd.Series, length=14):
     delta = series.diff()
     gain = delta.clip(lower=0).rolling(window=length, min_periods=length).mean()
     loss = (-delta.clip(upper=0)).rolling(window=length, min_periods=length).mean()
@@ -123,14 +119,12 @@ async def monitor_loop(app):
         try:
             current_price = (await exchange.fetch_ticker(PAIR))['last']
             
-            # --- РЕЖИМ 2: СЛЕЖЕНИЕ ЗА АКТИВНЫМ СИГНАЛОМ ---
             if state.get('active_signal'):
                 signal_data = state['active_signal']
                 signal_price = signal_data['price']
                 next_target = signal_data.get('next_target_pct', PRICE_CHANGE_STEP_PCT)
                 
-                # Проверка на смену тренда (требует загрузки полных данных)
-                ohlcv = await exchange.fetch_ohlcv(PAIR, timeframe='1h', limit=100)
+                ohlcv = await exchange.fetch_ohlcv(PAIR, timeframe=TIMEFRAME, limit=100)
                 df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
                 df = calculate_indicators(df.copy())
                 last_candle = df.iloc[-1]
@@ -149,20 +143,18 @@ async def monitor_loop(app):
                     await asyncio.sleep(30)
                     continue
 
-                # Проверка на изменение цены
                 price_change_pct = ((current_price - signal_price) / signal_price) * 100
                 if signal_data['side'] == 'LONG' and price_change_pct >= next_target:
                     await broadcast_message(app, f"🎯 ЦЕЛЬ +{next_target:.1f}% ДОСТИГНУТА. Сигнал LONG от {signal_price:.2f}. Текущая цена: {current_price:.2f}")
-                    state['active_signal']['next_target_pct'] += PRICE_CHANGE_STEP_PCT # Готовимся к следующей цели
+                    state['active_signal']['next_target_pct'] += PRICE_CHANGE_STEP_PCT
                     save_state()
                 elif signal_data['side'] == 'SHORT' and price_change_pct <= -next_target:
                     await broadcast_message(app, f"🎯 ЦЕЛЬ -{next_target:.1f}% ДОСТИГНУТА. Сигнал SHORT от {signal_price:.2f}. Текущая цена: {current_price:.2f}")
-                    state['active_signal']['next_target_pct'] += PRICE_CHANGE_STEP_PCT # Готовимся к следующей цели
+                    state['active_signal']['next_target_pct'] += PRICE_CHANGE_STEP_PCT
                     save_state()
 
-            # --- РЕЖИМ 1: ПОИСК НОВОГО СИГНАЛА ---
-            elif not state.get('active_signal'): # Ищем, только если не сопровождаем старый
-                ohlcv = await exchange.fetch_ohlcv(PAIR, timeframe='1h', limit=100)
+            elif not state.get('active_signal'):
+                ohlcv = await exchange.fetch_ohlcv(PAIR, timeframe=TIMEFRAME, limit=100)
                 df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
                 df = calculate_indicators(df.copy())
                 
@@ -191,7 +183,7 @@ async def monitor_loop(app):
         
         await asyncio.sleep(30)
 
-# === COMMANDS and RUN ===
+# === COMMANDS ===
 async def broadcast_message(app, text):
     for chat_id in app.chat_ids:
         await app.bot.send_message(chat_id=chat_id, text=text)
@@ -217,7 +209,6 @@ async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     save_state()
     await update.message.reply_text("❌ Мониторинг остановлен.")
 
-# ---> ВОЗВРАЩЕННЫЕ КОМАНДЫ ДЛЯ РУЧНОГО ЛОГИРОВАНИЯ <---
 async def cmd_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     global state
     try:
@@ -272,7 +263,7 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         text += "**Ручная позиция:**\n- Не открыта."
     await update.message.reply_text(text, parse_mode='Markdown')
 
-
+# === START ===
 if __name__ == "__main__":
     load_state()
     app = ApplicationBuilder().token(BOT_TOKEN).build()
