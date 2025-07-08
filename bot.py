@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 # ============================================================================
-# v6.0 - Двусторонний мониторинг (LONG/SHORT) с предварительными сигналами
+# v6.1 - Двусторонний мониторинг с валидацией настроек
 # ============================================================================
 
 import os
 import asyncio
 import json
 import logging
+import re
 from datetime import datetime, timezone
 import numpy as np
 import pandas as pd
@@ -31,6 +32,14 @@ log = logging.getLogger(__name__)
 if not BOT_TOKEN:
     log.critical("Переменная окружения BOT_TOKEN не найдена! Бот не может быть запущен.")
     exit()
+
+# --- Новая проверка ---
+# Валидация таймфрейма, чтобы избежать ошибок в ccxt
+if not re.match(r'^\d+[mhdM]$', TIMEFRAME):
+    log.critical(f"Неверный формат таймфрейма: '{TIMEFRAME}'. "
+                 f"Правильный формат: число и буква (m, h, d). Например: 1h, 15m, 1d.")
+    exit()
+# --- Конец проверки ---
 
 CHAT_IDS = {int(cid.strip()) for cid in CHAT_IDS_RAW.split(",") if cid.strip()}
 if not CHAT_IDS:
