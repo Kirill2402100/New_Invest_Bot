@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # ============================================================================
-# v7.0 - Устранение спама, чёткое управление состоянием
+# v8.0 - Улучшенная логика пересечений и детальное логирование для отладки
 # ============================================================================
 
 import os
@@ -24,8 +24,12 @@ SHEET_ID = os.getenv("SHEET_ID")
 PAIR_RAW = os.getenv("PAIR", "BTC/USDT")
 TIMEFRAME = os.getenv("TIMEFRAME", "1h")
 
+# Настройка логирования
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 log = logging.getLogger(__name__)
+# Устанавливаем уровень логирования для библиотеки httpcore, чтобы убрать лишний спам в логах
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+
 
 if not BOT_TOKEN:
     log.critical("Переменная окружения BOT_TOKEN не найдена!")
@@ -39,12 +43,8 @@ CHAT_IDS = {int(cid.strip()) for cid in CHAT_IDS_RAW.split(",") if cid.strip()}
 if not CHAT_IDS:
     log.warning("CHAT_IDS не установлен. Уведомления придут только тем, кто напишет /start.")
 
-# === GOOGLE SHEETS (опционально) ===
-LOGS_WS = None
-# ... (код для Google Sheets оставлен без изменений)
-
 # === STATE MANAGEMENT ===
-STATE_FILE = "advanced_signal_state_v3.json"
+STATE_FILE = "advanced_signal_state_v4.json"
 state = {
     "monitoring": False,
     "active_signal": None,
@@ -80,19 +80,19 @@ PRICE_CHANGE_STEP_PCT = 0.1
 ANTI_TARGET_STEP_PCT = 0.05
 
 # === INDICATORS ===
-# ... (код индикаторов оставлен без изменений)
 def _ta_rsi(series: pd.Series, length=14):
     delta = series.diff()
     gain = delta.clip(lower=0).rolling(window=length, min_periods=length).mean()
     loss = (-delta.clip(upper=0)).rolling(window=length, min_periods=length).mean()
-    if loss.empty or loss.iloc[-1] == 0: return pd.Series(100, index=series.index)
-    rs = gain / loss
+    if loss.empty or (loss_val := loss.iloc[-1]) == 0: return pd.Series(100, index=series.index)
+    rs = gain.iloc[-1] / loss_val
     return 100 - (100 / (1 + rs))
 
 def calculate_indicators(df: pd.DataFrame):
     df['ema_fast'] = df['close'].ewm(span=EMA_FAST_LEN, adjust=False).mean()
     df['ema_slow'] = df['close'].ewm(span=EMA_SLOW_LEN, adjust=False).mean()
-    df['rsi'] = _ta_rsi(df['close'], RSI_LEN)
+    # Применяем расчет RSI ко всему столбцу, чтобы избежать ошибок с одиночными значениями
+    df['rsi'] = df['close'].rolling(window=RSI_LEN + 1).apply(lambda x: _ta_rsi(x, RSI_LEN), raw=False)
     return df.dropna()
 
 # === CORE FUNCTIONS ===
@@ -100,7 +100,7 @@ async def broadcast_message(bot: Bot, text: str):
     if not CHAT_IDS:
         log.warning("Список CHAT_IDS пуст. Сообщение не отправлено.")
         return
-    log.info(f"Отправка сообщения в {len(CHAT_IDS)} чатов: \"{text}\"")
+    log.info(f"ОТПРАВКА СООБЩЕНИЯ -> {text}")
     for chat_id in CHAT_IDS:
         try:
             await bot.send_message(chat_id=chat_id, text=text)
@@ -123,19 +123,25 @@ async def monitor_loop(app: Application):
             prev = df.iloc[-2]
             price = last['close']
 
+            # --- НОВИНКА: Детальное логирование для отладки ---
+            log.info(f"[ОТЛАДКА] Цена: {price:.4f}, RSI: {last['rsi']:.2f}, EMA_fast: {last['ema_fast']:.4f}, EMA_slow: {last['ema_slow']:.4f}")
+
+            # Определяем состояние пересечения
+            is_bull_cross = last['ema_fast'] > last['ema_slow']
+            was_bull_cross = prev['ema_fast'] > prev['ema_slow']
+
             long_conditions = {
                 "rsi": last['rsi'] > RSI_LONG_ENTRY,
-                "price_pos": price > last['ema_fast'] and price > last['ema_slow'],
-                "cross": prev['ema_fast'] < prev['ema_slow'] and last['ema_fast'] > last['ema_slow']
+                "price_pos": price > last['ema_fast'] and price > last['ema_slow']
             }
             short_conditions = {
                 "rsi": last['rsi'] < RSI_SHORT_ENTRY,
-                "price_pos": price < last['ema_fast'] and price < last['ema_slow'],
-                "cross": prev['ema_fast'] > prev['ema_slow'] and last['ema_fast'] < last['ema_slow']
+                "price_pos": price < last['ema_fast'] and price < last['ema_slow']
             }
 
             # --- 1. УПРАВЛЕНИЕ АКТИВНЫМ СИГНАЛОМ ---
             if active_signal := state.get('active_signal'):
+                # ... (этот блок без изменений)
                 side = active_signal['side']
                 entry_price = active_signal['price']
                 
@@ -176,7 +182,6 @@ async def monitor_loop(app: Application):
             elif preliminary_signal := state.get('preliminary_signal'):
                 side = preliminary_signal['side']
                 
-                # Проверка на подтверждение
                 if side == "LONG" and long_conditions["rsi"] and long_conditions["price_pos"]:
                     state['active_signal'] = {"side": "LONG", "price": price, "next_target_pct": PRICE_CHANGE_STEP_PCT, "next_anti_target_pct": -ANTI_TARGET_STEP_PCT}
                     state['preliminary_signal'] = None
@@ -188,30 +193,23 @@ async def monitor_loop(app: Application):
                     await broadcast_message(app.bot, f"✅ ПОДТВЕРЖДЕНИЕ сигнала SHORT по {PAIR}! Цена: {price:.4f}")
                     save_state()
                 
-                # Проверка на отмену (например, пересечение в обратную сторону)
-                elif (side == "LONG" and short_conditions["cross"]) or (side == "SHORT" and long_conditions["cross"]):
+                # Отмена, если пересечение ушло в другую сторону
+                elif (side == "LONG" and not is_bull_cross) or (side == "SHORT" and is_bull_cross):
                     await broadcast_message(app.bot, f"🚫 Предварительный сигнал {side} по {PAIR} отменён из-за обратного пересечения.")
                     state['preliminary_signal'] = None
                     save_state()
 
             # --- 3. ПОИСК НОВОГО СИГНАЛА ---
             else:
-                if long_conditions["cross"]:
-                    if long_conditions["rsi"] and long_conditions["price_pos"]:
-                        state['active_signal'] = {"side": "LONG", "price": price, "next_target_pct": PRICE_CHANGE_STEP_PCT, "next_anti_target_pct": -ANTI_TARGET_STEP_PCT}
-                        await broadcast_message(app.bot, f"✅ СИГНАЛ LONG по {PAIR}! Цена: {price:.4f}")
-                    else:
-                        state['preliminary_signal'] = {"side": "LONG"}
-                        await broadcast_message(app.bot, f"⏳ Предварительный сигнал LONG по {PAIR}. Ждём подтверждения RSI и положения цены.")
+                # --- ИСПРАВЛЕННАЯ ЛОГИКА ---
+                # Ищем изменение состояния пересечения
+                if is_bull_cross and not was_bull_cross: # Произошел "золотой крест"
+                    state['preliminary_signal'] = {"side": "LONG"}
+                    await broadcast_message(app.bot, f"⏳ Предварительный сигнал LONG по {PAIR}. Ждём подтверждения.")
                     save_state()
-
-                elif short_conditions["cross"]:
-                    if short_conditions["rsi"] and short_conditions["price_pos"]:
-                        state['active_signal'] = {"side": "SHORT", "price": price, "next_target_pct": PRICE_CHANGE_STEP_PCT, "next_anti_target_pct": -ANTI_TARGET_STEP_PCT}
-                        await broadcast_message(app.bot, f"✅ СИГНАЛ SHORT по {PAIR}! Цена: {price:.4f}")
-                    else:
-                        state['preliminary_signal'] = {"side": "SHORT"}
-                        await broadcast_message(app.bot, f"⏳ Предварительный сигнал SHORT по {PAIR}. Ждём подтверждения RSI и положения цены.")
+                elif not is_bull_cross and was_bull_cross: # Произошел "крест смерти"
+                    state['preliminary_signal'] = {"side": "SHORT"}
+                    await broadcast_message(app.bot, f"⏳ Предварительный сигнал SHORT по {PAIR}. Ждём подтверждения.")
                     save_state()
 
         except ccxt.NetworkError as e:
@@ -225,7 +223,7 @@ async def monitor_loop(app: Application):
     log.info("Цикл мониторинга остановлен.")
 
 # === COMMANDS & LIFECYCLE ===
-# ... (код команд и жизненного цикла оставлен без изменений)
+# ... (этот блок без изменений)
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     if chat_id not in CHAT_IDS:
