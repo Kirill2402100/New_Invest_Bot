@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 # ============================================================================
-# v10.0 - Детальное логирование сделок в Google Sheets для анализа
+# v11.0 - Sniper Strategy v2.0 (Autonomous)
+# • Bot is now fully autonomous, implementing the "Sniper" strategy.
+# • On CONFIRMATION, it automatically sets a fixed +0.1% TP and -0.1% SL.
+# • Tracks MFE/MAE for every trade.
+# • Logs a comprehensive set of indicators (RSI, ADX, ATR, BBands) to
+#   a new Google Sheet for deep data analysis.
 # ============================================================================
 
 import os
@@ -8,6 +13,7 @@ import asyncio
 import json
 import logging
 import re
+import uuid
 from datetime import datetime, timezone
 import numpy as np
 import pandas as pd
@@ -16,13 +22,14 @@ import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 from telegram import Update, Bot
 from telegram.ext import Application, ApplicationBuilder, CommandHandler, ContextTypes
+import pandas_ta as ta
 
 # === ENV / Logging ===
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_IDS_RAW = os.getenv("CHAT_IDS", "")
 SHEET_ID = os.getenv("SHEET_ID")
 PAIR_RAW = os.getenv("PAIR", "BTC/USDT")
-TIMEFRAME = os.getenv("TIMEFRAME", "1h")
+TIMEFRAME = os.getenv("TIMEFRAME", "5m")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 log = logging.getLogger(__name__)
@@ -39,62 +46,53 @@ if not re.match(r'^\d+[mhdM]$', TIMEFRAME):
 CHAT_IDS = {int(cid.strip()) for cid in CHAT_IDS_RAW.split(",") if cid.strip()}
 
 # === GOOGLE SHEETS ===
-LOGS_WS = None
-# Новые заголовки для детального логирования
-GSHEET_HEADERS = [
-    "Signal_ID", "Timestamp_UTC", "Event_Type", "Pair", "Side",
-    "Entry_Price", "Event_Price", "RSI", "EMA_Fast", "EMA_Slow",
-    "ATR_14", "Volume", "Comment"
-]
-try:
-    creds_json_string = os.getenv("GOOGLE_CREDENTIALS")
-    if creds_json_string and SHEET_ID:
+TRADE_LOG_WS = None
+def setup_google_sheets():
+    try:
         scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-        creds_dict = json.loads(creds_json_string)
+        creds_dict = json.loads(os.getenv("GOOGLE_CREDENTIALS"))
         creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
         gs = gspread.authorize(creds)
-        worksheet_name = f"TradeLog_{PAIR_RAW.replace('/', '_')}_{TIMEFRAME}"
-        try:
-            LOGS_WS = gs.open_by_key(SHEET_ID).worksheet(worksheet_name)
-        except gspread.WorksheetNotFound:
-            LOGS_WS = gs.open_by_key(SHEET_ID).add_worksheet(title=worksheet_name, rows="1", cols=len(GSHEET_HEADERS))
+        spreadsheet = gs.open_by_key(SHEET_ID)
         
-        # Проверяем и устанавливаем заголовки
-        if LOGS_WS.row_values(1) != GSHEET_HEADERS:
-            LOGS_WS.update('A1', [GSHEET_HEADERS])
-            LOGS_WS.format('A1:M1', {'textFormat': {'bold': True}})
-
-        log.info(f"Успешное подключение к Google Sheets. Логи будут писаться в лист '{worksheet_name}'.")
-    else:
-        log.warning("Переменные для Google Sheets не найдены. Логирование в таблицу отключено.")
-except Exception as e:
-    log.error(f"Ошибка инициализации Google Sheets: {e}", exc_info=True)
-    LOGS_WS = None
-
+        headers = [
+            "Signal_ID", "Status", "Side", "Entry_Time_UTC", "Exit_Time_UTC",
+            "Entry_Price", "Exit_Price", "SL_Price", "TP_Price",
+            "MFE_Price", "MAE_Price",
+            "Entry_RSI", "Entry_ADX", "Entry_ATR", "Entry_Volume", "Entry_BB_Position"
+        ]
+        
+        sheet_name = f"SniperLog_{PAIR_RAW.replace('/', '_')}_{TIMEFRAME}"
+        try:
+            worksheet = spreadsheet.worksheet(sheet_name)
+        except gspread.WorksheetNotFound:
+            worksheet = spreadsheet.add_worksheet(title=sheet_name, rows="1000", cols=len(headers))
+        
+        if worksheet.row_values(1) != headers:
+            worksheet.clear()
+            worksheet.update('A1', [headers])
+            worksheet.format(f'A1:{chr(ord("A")+len(headers)-1)}1', {'textFormat': {'bold': True}})
+        
+        log.info(f"Google Sheets setup complete. Logging to '{sheet_name}'.")
+        return worksheet
+    except Exception as e:
+        log.error("Google Sheets init failed: %s", e)
+        return None
+TRADE_LOG_WS = setup_google_sheets()
 
 # === STATE MANAGEMENT ===
-STATE_FILE = "advanced_signal_state_v6.json"
-state = {"monitoring": False, "active_signal": None, "preliminary_signal": None}
+STATE_FILE = "btc_sniper_state.json"
+state = {"monitoring": False, "active_trade": None, "preliminary_signal": None}
 
 def save_state():
-    # ... (без изменений)
-    try:
-        with open(STATE_FILE, 'w') as f:
-            json.dump(state, f, indent=2)
-    except Exception as e:
-        log.error(f"Не удалось сохранить состояние: {e}")
-
+    with open(STATE_FILE, 'w') as f: json.dump(state, f, indent=2)
 def load_state():
-    # ... (без изменений)
     global state
     if os.path.exists(STATE_FILE):
-        try:
-            with open(STATE_FILE, 'r') as f:
-                loaded_state = json.load(f)
-                state.update(loaded_state)
-            log.info(f"Состояние успешно загружено: {state}")
-        except Exception as e:
-            log.error(f"Не удалось загрузить состояние: {e}")
+        with open(STATE_FILE, 'r') as f: state = json.load(f)
+    if 'monitoring' not in state:
+        state.update({"monitoring": False, "active_trade": None, "preliminary_signal": None})
+    log.info(f"State loaded: {state}")
 
 # === EXCHANGE & STRATEGY PARAMS ===
 exchange = ccxt.mexc()
@@ -103,74 +101,48 @@ PAIR = PAIR_RAW.upper()
 RSI_LEN = 14
 EMA_FAST_LEN, EMA_SLOW_LEN = 9, 21
 ATR_LEN = 14
+ADX_LEN = 14
+BBANDS_LEN = 20
+
 RSI_LONG_ENTRY, RSI_SHORT_ENTRY = 52, 48
-PRICE_CHANGE_STEP_PCT = 0.1
-ANTI_TARGET_STEP_PCT = 0.05
+PROFIT_TARGET_PCT = 0.1 # Наша цель в 0.1%
+STOP_LOSS_PCT = 0.1   # Наш стоп в 0.1%
 
 # === INDICATORS ===
-def _ta_rsi(series: pd.Series, length=14):
-    # ... (без изменений)
-    delta = series.diff()
-    gain = delta.clip(lower=0).rolling(window=length, min_periods=length).mean()
-    loss = (-delta.clip(upper=0)).rolling(window=length, min_periods=length).mean()
-    if loss.empty or (loss_val := loss.iloc[-1]) == 0: return pd.Series(100, index=series.index)
-    rs = gain.iloc[-1] / loss_val
-    return 100 - (100 / (1 + rs))
-
-def _ta_atr(high: pd.Series, low: pd.Series, close: pd.Series, length=14):
-    tr1 = pd.DataFrame(high - low)
-    tr2 = pd.DataFrame(abs(high - close.shift(1)))
-    tr3 = pd.DataFrame(abs(low - close.shift(1)))
-    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-    atr = tr.ewm(alpha=1/length, adjust=False).mean()
-    return atr
-
 def calculate_indicators(df: pd.DataFrame):
-    df['ema_fast'] = df['close'].ewm(span=EMA_FAST_LEN, adjust=False).mean()
-    df['ema_slow'] = df['close'].ewm(span=EMA_SLOW_LEN, adjust=False).mean()
-    df['rsi'] = df['close'].rolling(window=RSI_LEN + 1).apply(lambda x: _ta_rsi(pd.Series(x)), raw=False)
-    # Добавляем расчет ATR
-    df['atr'] = _ta_atr(df['high'], df['low'], df['close'], length=ATR_LEN)
+    df.ta.ema(length=EMA_FAST_LEN, append=True, col_names=(f"EMA_{EMA_FAST_LEN}",))
+    df.ta.ema(length=EMA_SLOW_LEN, append=True, col_names=(f"EMA_{EMA_SLOW_LEN}",))
+    df.ta.rsi(length=RSI_LEN, append=True, col_names=(f"RSI_{RSI_LEN}",))
+    df.ta.atr(length=ATR_LEN, append=True, col_names=(f"ATR_{ATR_LEN}",))
+    df.ta.adx(length=ADX_LEN, append=True, col_names=(f"ADX_{ADX_LEN}",))
+    df.ta.bbands(length=BBANDS_LEN, std=2, append=True, col_names=(f"BBL_{BBANDS_LEN}_2.0", f"BBM_{BBANDS_LEN}_2.0", f"BBU_{BBANDS_LEN}_2.0", f"BBB_{BBANDS_LEN}_2.0", f"BBP_{BBANDS_LEN}_2.0"))
     return df.dropna()
 
 # === CORE FUNCTIONS ===
-async def log_trade_event(event_type: str, comment: str, signal_data: dict, current_data: dict):
-    if not LOGS_WS:
-        return
-    
+async def log_trade_to_gs(trade_data: dict):
+    if not TRADE_LOG_WS: return
     try:
-        row_data = [
-            signal_data.get('id'),
-            datetime.now(timezone.utc).isoformat(),
-            event_type,
-            PAIR,
-            signal_data.get('side'),
-            signal_data.get('price'),
-            current_data.get('price'),
-            round(current_data.get('rsi', 0), 2),
-            round(current_data.get('ema_fast', 0), 4),
-            round(current_data.get('ema_slow', 0), 4),
-            round(current_data.get('atr', 0), 5),
-            current_data.get('volume'),
-            comment
+        row = [
+            trade_data.get('id'), trade_data.get('status'), trade_data.get('side'),
+            trade_data.get('entry_time_utc'), datetime.now(timezone.utc).isoformat(),
+            trade_data.get('entry_price'), trade_data.get('exit_price'),
+            trade_data.get('sl_price'), trade_data.get('tp_price'),
+            trade_data.get('mfe_price'), trade_data.get('mae_price'),
+            trade_data.get('entry_rsi'), trade_data.get('entry_adx'),
+            trade_data.get('entry_atr'), trade_data.get('entry_volume'),
+            trade_data.get('entry_bb_pos')
         ]
-        LOGS_WS.append_row(row_data, value_input_option='USER_ENTERED')
-        log.info(f"Событие '{event_type}' для сигнала {signal_data.get('id')} записано в Google Sheet.")
+        await asyncio.to_thread(TRADE_LOG_WS.append_row, row, value_input_option='USER_ENTERED')
+        log.info(f"Trade {trade_data.get('id')} logged to Google Sheets.")
     except Exception as e:
-        log.error(f"Не удалось записать событие в Google Sheet: {e}", exc_info=True)
-
+        log.error(f"Failed to write trade to Google Sheets: {e}", exc_info=True)
 
 async def broadcast_message(bot: Bot, text: str):
-    # ... (без изменений)
-    if not CHAT_IDS:
-        log.warning("Список CHAT_IDS пуст. Сообщение не отправлено.")
-        return
-    log.info(f"ОТПРАВКА СООБЩЕНИЯ -> {text}")
     for chat_id in CHAT_IDS:
         try:
-            await bot.send_message(chat_id=chat_id, text=text)
+            await bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
         except Exception as e:
-            log.error(f"Не удалось отправить сообщение в чат {chat_id}: {e}")
+            log.error(f"Failed to send message to {chat_id}: {e}")
 
 async def monitor_loop(app: Application):
     log.info(f"Цикл мониторинга запущен для {PAIR} на таймфрейме {TIMEFRAME}.")
@@ -184,106 +156,86 @@ async def monitor_loop(app: Application):
                 await asyncio.sleep(30)
                 continue
 
-            last = df.iloc[-1]
-            prev = df.iloc[-2]
-            
-            current_market_data = {
-                "price": last['close'], "rsi": last['rsi'], "ema_fast": last['ema_fast'],
-                "ema_slow": last['ema_slow'], "atr": last['atr'], "volume": last['volume']
-            }
+            last, prev = df.iloc[-1], df.iloc[-2]
+            price = last['close']
 
-            log.info(f"[ОТЛАДКА] Цена: {current_market_data['price']:.4f}, RSI: {current_market_data['rsi']:.2f}, ATR: {current_market_data['atr']:.5f}")
+            is_bull_cross = last[f'EMA_{EMA_FAST_LEN}'] > last[f'EMA_{EMA_SLOW_LEN}']
+            was_bull_cross = prev[f'EMA_{EMA_FAST_LEN}'] > prev[f'EMA_{EMA_SLOW_LEN}']
 
-            is_bull_cross = last['ema_fast'] > last['ema_slow']
-            was_bull_cross = prev['ema_fast'] > prev['ema_slow']
-
-            long_conditions = {"rsi": last['rsi'] > RSI_LONG_ENTRY, "price_pos": last['close'] > last['ema_fast'] and last['close'] > last['ema_slow']}
-            short_conditions = {"rsi": last['rsi'] < RSI_SHORT_ENTRY, "price_pos": last['close'] < last['ema_fast'] and last['close'] < last['ema_slow']}
-
-            if active_signal := state.get('active_signal'):
-                side = active_signal['side']
+            # --- 1. УПРАВЛЕНИЕ АКТИВНОЙ СДЕЛКОЙ ---
+            if active_trade := state.get('active_trade'):
+                side, sl, tp = active_trade['side'], active_trade['sl_price'], active_trade['tp_price']
                 
-                cancel = False
-                if side == "LONG" and (last['rsi'] < RSI_SHORT_ENTRY or last['close'] < last['ema_slow']):
-                    cancel = True
-                elif side == "SHORT" and (last['rsi'] > RSI_LONG_ENTRY or last['close'] > last['ema_slow']):
-                    cancel = True
-                
-                if cancel:
-                    msg = f"⚠️ ОТМЕНА сигнала {side} по {PAIR}."
+                # Обновляем MFE/MAE
+                if side == 'LONG':
+                    if price > active_trade['mfe_price']: active_trade['mfe_price'] = price
+                    if price < active_trade['mae_price']: active_trade['mae_price'] = price
+                elif side == 'SHORT':
+                    if price < active_trade['mfe_price']: active_trade['mfe_price'] = price
+                    if price > active_trade['mae_price']: active_trade['mae_price'] = price
+
+                outcome, status = None, None
+                # Проверка TP/SL
+                if side == 'LONG' and price >= tp: outcome, status = "TP_HIT", "WIN"
+                elif side == 'LONG' and price <= sl: outcome, status = "SL_HIT", "LOSS"
+                elif side == 'SHORT' and price <= tp: outcome, status = "TP_HIT", "WIN"
+                elif side == 'SHORT' and price >= sl: outcome, status = "SL_HIT", "LOSS"
+                # Проверка отмены по условиям
+                elif side == "LONG" and (last[f'RSI_{RSI_LEN}'] < RSI_SHORT_ENTRY or price < last[f'EMA_{EMA_SLOW_LEN}']):
+                    outcome, status = "CANCELED", "LOSS"
+                elif side == "SHORT" and (last[f'RSI_{RSI_LEN}'] > RSI_LONG_ENTRY or price > last[f'EMA_{EMA_SLOW_LEN}']):
+                    outcome, status = "CANCELED", "LOSS"
+
+                if outcome:
+                    active_trade['status'] = status
+                    active_trade['exit_price'] = price
+                    emoji = "✅" if status == "WIN" else "❌"
+                    msg = f"{emoji} <b>СДЕЛКА ЗАКРЫТА ({outcome})</b> {emoji}\n\n<b>ID:</b> {active_trade['id']}\n<b>Цена выхода:</b> {price:.4f}"
                     await broadcast_message(app.bot, msg)
-                    await log_trade_event("CANCELLATION", msg, active_signal, current_market_data)
-                    state['active_signal'] = None
+                    await log_trade_to_gs(active_trade)
+                    state['active_trade'] = None
                     save_state()
-                    continue
-
-                price_change_pct = ((current_market_data['price'] - active_signal['price']) / active_signal['price']) * 100
-                
-                if side == "LONG":
-                    if price_change_pct >= active_signal['next_target_pct']:
-                        target_pct = active_signal['next_target_pct']
-                        msg = f"🎯 ЦЕЛЬ +{target_pct:.2f}% по {PAIR} ({side}) ДОСТИГНУТА. Цена: {current_market_data['price']:.4f}"
-                        await broadcast_message(app.bot, msg)
-                        await log_trade_event("TARGET", msg, active_signal, current_market_data)
-                        state['active_signal']['next_target_pct'] += PRICE_CHANGE_STEP_PCT
-                        save_state()
-                    elif price_change_pct <= active_signal['next_anti_target_pct']:
-                        anti_target_pct = active_signal['next_anti_target_pct']
-                        msg = f"📉 АНТИ-ЦЕЛЬ {anti_target_pct:.2f}% по {PAIR} ({side}). ВНИМАНИЕ! Цена: {current_market_data['price']:.4f}"
-                        await broadcast_message(app.bot, msg)
-                        await log_trade_event("ANTI_TARGET", msg, active_signal, current_market_data)
-                        state['active_signal']['next_anti_target_pct'] -= ANTI_TARGET_STEP_PCT
-                        save_state()
-                
-                elif side == "SHORT":
-                    if price_change_pct <= -active_signal['next_target_pct']:
-                        target_pct = active_signal['next_target_pct']
-                        msg = f"🎯 ЦЕЛЬ +{target_pct:.2f}% по {PAIR} ({side}) ДОСТИГНУТА. Цена: {current_market_data['price']:.4f}"
-                        await broadcast_message(app.bot, msg)
-                        await log_trade_event("TARGET", msg, active_signal, current_market_data)
-                        state['active_signal']['next_target_pct'] += PRICE_CHANGE_STEP_PCT
-                        save_state()
-                    elif price_change_pct >= -active_signal['next_anti_target_pct']:
-                        anti_target_pct = active_signal['next_anti_target_pct']
-                        msg = f"📈 АНТИ-ЦЕЛЬ {anti_target_pct:.2f}% по {PAIR} ({side}). ВНИМАНИЕ! Цена: {current_market_data['price']:.4f}"
-                        await broadcast_message(app.bot, msg)
-                        await log_trade_event("ANTI_TARGET", msg, active_signal, current_market_data)
-                        state['active_signal']['next_anti_target_pct'] -= ANTI_TARGET_STEP_PCT
-                        save_state()
             
-            elif preliminary_signal := state.get('preliminary_signal'):
-                side = preliminary_signal['side']
-                
-                def confirm_signal(side_to_confirm):
-                    signal_id = f"{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}_{side_to_confirm}"
-                    state['active_signal'] = {
-                        "id": signal_id, "side": side_to_confirm, "price": current_market_data['price'],
-                        "next_target_pct": PRICE_CHANGE_STEP_PCT, "next_anti_target_pct": -ANTI_TARGET_STEP_PCT
-                    }
-                    state['preliminary_signal'] = None
-                    msg = f"✅ ПОДТВЕРЖДЕНИЕ сигнала {side_to_confirm} по {PAIR}! Цена: {current_market_data['price']:.4f}"
-                    asyncio.create_task(broadcast_message(app.bot, msg))
-                    asyncio.create_task(log_trade_event("CONFIRMATION", msg, state['active_signal'], current_market_data))
-                    save_state()
-
-                if side == "LONG" and long_conditions["rsi"] and long_conditions["price_pos"]:
-                    confirm_signal("LONG")
-                elif side == "SHORT" and short_conditions["rsi"] and short_conditions["price_pos"]:
-                    confirm_signal("SHORT")
-                elif (side == "LONG" and not is_bull_cross) or (side == "SHORT" and is_bull_cross):
-                    await broadcast_message(app.bot, f"🚫 Предварительный сигнал {side} по {PAIR} отменён.")
-                    state['preliminary_signal'] = None
-                    save_state()
-
+            # --- 2. ПОИСК НОВОГО СИГНАЛА ---
             else:
-                if is_bull_cross and not was_bull_cross:
-                    state['preliminary_signal'] = {"side": "LONG"}
-                    await broadcast_message(app.bot, f"⏳ Предварительный сигнал LONG по {PAIR}. Ждём подтверждения.")
+                long_cond = last[f'RSI_{RSI_LEN}'] > RSI_LONG_ENTRY and price > last[f'EMA_{EMA_FAST_LEN}']
+                short_cond = last[f'RSI_{RSI_LEN}'] < RSI_SHORT_ENTRY and price < last[f'EMA_{EMA_FAST_LEN}']
+                
+                side_to_confirm = None
+                if is_bull_cross and not was_bull_cross and long_cond:
+                    side_to_confirm = "LONG"
+                elif not is_bull_cross and was_bull_cross and short_cond:
+                    side_to_confirm = "SHORT"
+
+                if side_to_confirm:
+                    entry_price = price
+                    tp_price = entry_price * (1 + PROFIT_TARGET_PCT / 100) if side_to_confirm == 'LONG' else entry_price * (1 - PROFIT_TARGET_PCT / 100)
+                    sl_price = entry_price * (1 - STOP_LOSS_PCT / 100) if side_to_confirm == 'LONG' else entry_price * (1 + STOP_LOSS_PCT / 100)
+                    
+                    # Определяем положение цены относительно Полос Боллинджера
+                    bb_upper, bb_lower = last.get(f'BBU_{BBANDS_LEN}_2.0'), last.get(f'BBL_{BBANDS_LEN}_2.0')
+                    bb_pos = "Inside"
+                    if entry_price > bb_upper: bb_pos = "Above_Upper"
+                    elif entry_price < bb_lower: bb_pos = "Below_Lower"
+
+                    state['active_trade'] = {
+                        "id": str(uuid.uuid4())[:8],
+                        "side": side_to_confirm,
+                        "entry_time_utc": datetime.now(timezone.utc).isoformat(),
+                        "entry_price": entry_price,
+                        "tp_price": tp_price,
+                        "sl_price": sl_price,
+                        "mfe_price": entry_price,
+                        "mae_price": entry_price,
+                        "entry_rsi": round(last.get(f'RSI_{RSI_LEN}'), 2),
+                        "entry_adx": round(last.get(f'ADX_{ADX_LEN}'), 2),
+                        "entry_atr": round(last.get(f'ATR_{ATR_LEN}'), 5),
+                        "entry_volume": last.get('volume'),
+                        "entry_bb_pos": bb_pos
+                    }
                     save_state()
-                elif not is_bull_cross and was_bull_cross:
-                    state['preliminary_signal'] = {"side": "SHORT"}
-                    await broadcast_message(app.bot, f"⏳ Предварительный сигнал SHORT по {PAIR}. Ждём подтверждения.")
-                    save_state()
+                    msg = f"🔔 <b>НОВЫЙ СИГНАЛ ({side_to_confirm})</b> 🔔\n\n<b>ID:</b> {state['active_trade']['id']}\n<b>Цена входа:</b> {entry_price:.4f}\n<b>TP:</b> {tp_price:.4f}, <b>SL:</b> {sl_price:.4f}"
+                    await broadcast_message(app.bot, msg)
 
         except ccxt.NetworkError as e:
             log.warning(f"Ошибка сети CCXT: {e}. Повторная попытка через 60 секунд.")
@@ -292,51 +244,39 @@ async def monitor_loop(app: Application):
             log.error(f"Критическая ошибка в цикле мониторинга: {e}", exc_info=True)
             await asyncio.sleep(30)
         
-        await asyncio.sleep(30)
+        await asyncio.sleep(60) # Проверяем раз в минуту
     log.info("Цикл мониторинга остановлен.")
 
 # === COMMANDS & LIFECYCLE ===
-# ... (код без изменений)
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    if chat_id not in CHAT_IDS:
-        CHAT_IDS.add(chat_id)
-        log.info(f"Временный CHAT_ID добавлен: {chat_id}.")
+    if chat_id not in CHAT_IDS: CHAT_IDS.add(chat_id)
     if not state.get('monitoring'):
         state['monitoring'] = True
         save_state()
-        await update.message.reply_text(f"✅ Мониторинг по паре {PAIR} ({TIMEFRAME}) запущен.")
+        await update.message.reply_text("✅ BTC-бот (Снайпер v2.0) запущен. Начинаю мониторинг.")
         asyncio.create_task(monitor_loop(ctx.application))
     else:
-        await update.message.reply_text("ℹ️ Мониторинг уже активен.")
+        await update.message.reply_text("ℹ️ Бот уже запущен.")
 
 async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if state.get('monitoring'):
         state['monitoring'] = False
         save_state()
-        await update.message.reply_text("🛑 Мониторинг остановлен.")
+        await update.message.reply_text("❌ Бот остановлен.")
     else:
-        await update.message.reply_text("ℹ️ Мониторинг не был запущен.")
+        await update.message.reply_text("ℹ️ Бот уже был остановлен.")
 
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not state['monitoring']:
-        await update.message.reply_text(f"Мониторинг по {PAIR} неактивен.")
-        return
-    
-    msg = f"Статус по {PAIR} ({TIMEFRAME}):\n"
-    if active_signal := state.get('active_signal'):
-        side = active_signal['side']
-        price = active_signal['price']
-        next_target = active_signal['next_target_pct']
-        next_anti = active_signal['next_anti_target_pct']
-        msg += f"\n- Активный сигнал: {side} ({active_signal.get('id')})\n- Цена входа: {price:.4f}\n- Следующая цель: +{next_target:.2f}%\n- Следующая анти-цель: {next_anti:.2f}%"
-    elif preliminary_signal := state.get('preliminary_signal'):
-        side = preliminary_signal['side']
-        msg += f"\n- Предварительный сигнал: {side}\n- Ожидается подтверждение от RSI и положения цены."
+    msg = f"<b>Статус бота:</b> {'АКТИВЕН' if state.get('monitoring') else 'ОСТАНОВЛЕН'}\n\n"
+    if active_trade := state.get('active_trade'):
+        msg += "<b><u>Активная сделка:</u></b>\n"
+        msg += (f"  - <b>{active_trade['side']}</b> (ID: {active_trade['id']})\n"
+                f"    Вход: {active_trade['entry_price']:.4f}\n"
+                f"    TP: {active_trade['tp_price']:.4f}, SL: {active_trade['sl_price']:.4f}\n")
     else:
-        msg += "\n- Активных сигналов нет. Идёт поиск пересечения EMA."
-        
-    await update.message.reply_text(msg)
+        msg += "<i>Нет активных сделок. Идёт поиск сигнала.</i>"
+    await update.message.reply_text(msg, parse_mode="HTML")
 
 async def post_init(app: Application):
     load_state()
@@ -344,19 +284,9 @@ async def post_init(app: Application):
         log.info("Обнаружен активный статус мониторинга. Возобновление работы...")
         asyncio.create_task(monitor_loop(app))
 
-async def on_shutdown(app: Application):
-    log.info("Бот завершает работу. Сохранение состояния...")
-    save_state()
-    await exchange.close()
-    log.info("Сессия с биржей закрыта.")
-
-def main():
-    log.info("Запуск бота...")
-    app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).post_shutdown(on_shutdown).build()
+if __name__ == "__main__":
+    app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("stop", cmd_stop))
     app.add_handler(CommandHandler("status", cmd_status))
     app.run_polling()
-
-if __name__ == "__main__":
-    main()
