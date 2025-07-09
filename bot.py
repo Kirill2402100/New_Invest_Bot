@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 # ============================================================================
-# v11.0 - Sniper Strategy v2.0 (Autonomous)
-# • Bot is now fully autonomous, implementing the "Sniper" strategy.
-# • On CONFIRMATION, it automatically sets a fixed +0.1% TP and -0.1% SL.
-# • Tracks MFE/MAE for every trade.
-# • Logs a comprehensive set of indicators (RSI, ADX, ATR, BBands) to
-#   a new Google Sheet for deep data analysis.
+# v11.1 - Sniper Strategy v2.0 (Autonomous)
+# • CRITICAL FIX: Corrected an error in the ADX indicator calculation
+#   that was causing the main loop to crash.
+# • The `calculate_indicators` function now correctly handles the multiple
+#   output columns from the ADX indicator.
 # ============================================================================
 
 import os
@@ -114,7 +113,9 @@ def calculate_indicators(df: pd.DataFrame):
     df.ta.ema(length=EMA_SLOW_LEN, append=True, col_names=(f"EMA_{EMA_SLOW_LEN}",))
     df.ta.rsi(length=RSI_LEN, append=True, col_names=(f"RSI_{RSI_LEN}",))
     df.ta.atr(length=ATR_LEN, append=True, col_names=(f"ATR_{ATR_LEN}",))
-    df.ta.adx(length=ADX_LEN, append=True, col_names=(f"ADX_{ADX_LEN}",))
+    # --- ИСПРАВЛЕНИЕ ОШИБКИ ADX ---
+    # Индикатор ADX возвращает 3 столбца, поэтому мы должны указать 3 имени
+    df.ta.adx(length=ADX_LEN, append=True, col_names=(f"ADX_{ADX_LEN}", f"DMP_{ADX_LEN}", f"DMN_{ADX_LEN}"))
     df.ta.bbands(length=BBANDS_LEN, std=2, append=True, col_names=(f"BBL_{BBANDS_LEN}_2.0", f"BBM_{BBANDS_LEN}_2.0", f"BBU_{BBANDS_LEN}_2.0", f"BBB_{BBANDS_LEN}_2.0", f"BBP_{BBANDS_LEN}_2.0"))
     return df.dropna()
 
