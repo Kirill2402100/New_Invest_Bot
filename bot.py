@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 # ============================================================================
-# Trend Rider v3.0 • 10 Jul 2025
+# Market Chameleon v4.0 • 10 Jul 2025
 # ============================================================================
-# • СТРАТЕГИЯ      : Трендовая (EMA Cross + ADX Filter)
-# • ФИЛЬТР ТРЕНДА  : ADX > MIN_ADX (default 25)
-# • RISK/REWARD    : 1 / 1.5 (настраиваемый)
-# • P&L РАСЧЁТ     : Автоматический ($/%)
-# • ОТЧЁТНОСТЬ     : Ежедневный отчёт по P&L
+# • АДАПТИВНАЯ СТРАТЕГИЯ: Автоматическое переключение Тренд/Флэт
+# • ТРЕНД (ADX > 25)    : Вход по пересечению EMA
+# • ФЛЭТ (ADX < 25)     : Вход от границ Полос Боллинджера
+# • P&L и ОТЧЁТНОСТЬ    : Полный функционал
 # ============================================================================
 
 import os
@@ -35,17 +34,24 @@ CHAT_IDS_RAW  = os.getenv("CHAT_IDS", "")
 SHEET_ID      = os.getenv("SHEET_ID")
 PAIR_RAW      = os.getenv("PAIR", "BTC/USDT")
 TIMEFRAME     = os.getenv("TIMEFRAME", "5m")
-STRAT_VERSION = "v3_0_trend_rider"
-
-# --- Параметры стратегии ---
-MIN_VOLUME_BTC = float(os.getenv("MIN_VOLUME_BTC", "1"))
-MIN_ADX        = float(os.getenv("MIN_ADX",        "25")) # Теперь MIN вместо MAX
-RR_RATIO       = float(os.getenv("RR_RATIO",       "1.5")) # Соотношение TP к SL
+STRAT_VERSION = "v4_0_chameleon"
 
 # --- Параметры P&L и отчётности ---
 ENTRY_USD      = float(os.getenv("ENTRY_USD", "50"))
 LEVERAGE       = float(os.getenv("LEVERAGE",  "500"))
-REPORT_TIME_UTC= os.getenv("REPORT_TIME_UTC", "21:00") # Время для ежедневного отчёта в UTC
+REPORT_TIME_UTC= os.getenv("REPORT_TIME_UTC", "21:00")
+
+# --- Общие параметры стратегий ---
+MIN_VOLUME_BTC = float(os.getenv("MIN_VOLUME_BTC", "1"))
+MARKET_STATE_ADX_THRESHOLD = float(os.getenv("MARKET_STATE_ADX_THRESHOLD", "25"))
+
+# --- Параметры ТРЕНДОВОЙ стратегии ---
+TREND_RR_RATIO = float(os.getenv("TREND_RR_RATIO", "1.5"))
+
+# --- Параметры ФЛЭТОВОЙ стратегии ---
+FLAT_RR_RATIO       = float(os.getenv("FLAT_RR_RATIO", "1.0"))
+FLAT_RSI_OVERSOLD   = float(os.getenv("FLAT_RSI_OVERSOLD", "35"))
+FLAT_RSI_OVERBOUGHT = float(os.getenv("FLAT_RSI_OVERBOUGHT", "65"))
 
 # --- Настройки ATR для определения размера SL ---
 ATR_LOW_USD   = float(os.getenv("ATR_LOW_USD",  "80"))
@@ -79,15 +85,13 @@ def setup_google_sheets() -> None:
         gs = gspread.authorize(creds)
         ss = gs.open_by_key(SHEET_ID)
 
-        # !!! ДОБАВЛЕН НОВЫЙ ЗАГОЛОВОК "P&L_USD" !!!
         headers = [
-            "Signal_ID","Version","Status","Side",
-            "Entry_Time_UTC","Exit_Time_UTC",
-            "Entry_Price","Exit_Price","SL_Price","TP_Price",
-            "P&L_USD", # <-- НОВОЕ ПОЛЕ
-            "MFE_Price","MAE_Price",
-            "Entry_RSI","Entry_ADX","Entry_ATR",
-            "Entry_Volume","Entry_BB_Position"
+            "Signal_ID", "Version", "Strategy_Used", "Status", "Side",
+            "Entry_Time_UTC", "Exit_Time_UTC",
+            "Entry_Price", "Exit_Price", "SL_Price", "TP_Price",
+            "P&L_USD", "MFE_Price", "MAE_Price",
+            "Entry_RSI", "Entry_ADX", "Entry_ATR",
+            "Entry_Volume", "Entry_BB_Position"
         ]
 
         name = f"SniperLog_{PAIR_RAW.replace('/','_')}_{TIMEFRAME}_{STRAT_VERSION}"
@@ -109,13 +113,13 @@ def setup_google_sheets() -> None:
 setup_google_sheets()
 
 # ── УПРАВЛЕНИЕ СОСТОЯНИЕМ ───────────────────────────────────────────────────
-STATE_FILE = "btc_sniper_state.json"
+STATE_FILE = "btc_chameleon_state.json"
 state = {"monitoring": False, "active_trade": None, "daily_report_data": []}
 if os.path.exists(STATE_FILE):
     try:
         with open(STATE_FILE, 'r') as f:
             state.update(json.load(f))
-        if "daily_report_data" not in state: # Для совместимости со старым файлом
+        if "daily_report_data" not in state:
             state["daily_report_data"] = []
     except json.JSONDecodeError:
         log.error("Не удалось прочитать файл состояния, будет создан новый.")
@@ -132,13 +136,12 @@ RSI_LEN = 14
 EMA_FAST, EMA_SLOW = 9, 21
 ATR_LEN, ADX_LEN = 14, 14
 BBANDS_LEN = 20
-RSI_LONG_ENTRY, RSI_SHORT_ENTRY = 52, 48
 
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    df.ta.ema(length=EMA_FAST , append=True, col_names=(f"EMA_{EMA_FAST}",))
-    df.ta.ema(length=EMA_SLOW , append=True, col_names=(f"EMA_{EMA_SLOW}",))
-    df.ta.rsi(length=RSI_LEN  , append=True, col_names=(f"RSI_{RSI_LEN}",))
-    df.ta.atr(length=ATR_LEN  , append=True, col_names=(f"ATR_{ATR_LEN}",))
+    df.ta.ema(length=EMA_FAST, append=True, col_names=(f"EMA_{EMA_FAST}",))
+    df.ta.ema(length=EMA_SLOW, append=True, col_names=(f"EMA_{EMA_SLOW}",))
+    df.ta.rsi(length=RSI_LEN, append=True, col_names=(f"RSI_{RSI_LEN}",))
+    df.ta.atr(length=ATR_LEN, append=True, col_names=(f"ATR_{ATR_LEN}",))
     df.ta.adx(length=ADX_LEN, append=True,
               col_names=(f"ADX_{ADX_LEN}", f"DMP_{ADX_LEN}", f"DMN_{ADX_LEN}"))
     df.ta.bbands(length=BBANDS_LEN, std=2, append=True,
@@ -163,18 +166,59 @@ async def notify(bot: Bot, text: str):
 async def log_trade(tr: dict):
     if not TRADE_LOG_WS: return
     row = [
-        tr["id"], STRAT_VERSION, tr["status"], tr["side"],
+        tr["id"], STRAT_VERSION, tr.get("strategy_name"), tr["status"], tr["side"],
         tr["entry_time_utc"], datetime.now(timezone.utc).isoformat(),
         tr["entry_price"], tr["exit_price"],
         tr["sl_price"], tr["tp_price"],
-        tr.get("pnl_usd"), # <-- НОВОЕ ПОЛЕ
-        tr["mfe_price"], tr["mae_price"],
+        tr.get("pnl_usd"), tr["mfe_price"], tr["mae_price"],
         tr["entry_rsi"], tr["entry_adx"], tr["entry_atr"],
         tr["entry_volume"], tr["entry_bb_pos"]
     ]
     await asyncio.to_thread(
         TRADE_LOG_WS.append_row, row, value_input_option="USER_ENTERED"
     )
+
+# ── ДИСПЕТЧЕР СТРАТЕГИЙ ─────────────────────────────────────────────────────
+def get_market_state(last_candle: pd.Series) -> str:
+    adx = last_candle[f"ADX_{ADX_LEN}"]
+    if adx > MARKET_STATE_ADX_THRESHOLD:
+        return "TREND"
+    else:
+        return "FLAT"
+
+def run_trend_strategy(last_candle: pd.Series, prev_candle: pd.Series):
+    price = last_candle["close"]
+    bull_now = last_candle[f"EMA_{EMA_FAST}"] > last_candle[f"EMA_{EMA_SLOW}"]
+    bull_prev = prev_candle[f"EMA_{EMA_FAST}"] > prev_candle[f"EMA_{EMA_SLOW}"]
+
+    long_cond  = last_candle[f"RSI_{RSI_LEN}"] > 52 and price > last_candle[f"EMA_{EMA_FAST}"]
+    short_cond = last_candle[f"RSI_{RSI_LEN}"] < 48 and price < last_candle[f"EMA_{EMA_FAST}"]
+
+    side = None
+    if bull_now and not bull_prev and long_cond:
+        side = "LONG"
+    elif not bull_now and bull_prev and short_cond:
+        side = "SHORT"
+    
+    if side:
+        return {"side": side, "rr_ratio": TREND_RR_RATIO, "strategy_name": "Trend_EMA_Cross"}
+    return None
+
+def run_flat_strategy(last_candle: pd.Series):
+    price = last_candle["close"]
+    rsi = last_candle[f"RSI_{RSI_LEN}"]
+    bb_lower = last_candle[f"BBL_{BBANDS_LEN}_2.0"]
+    bb_upper = last_candle[f"BBU_{BBANDS_LEN}_2.0"]
+
+    side = None
+    if price <= bb_lower and rsi < FLAT_RSI_OVERSOLD:
+        side = "LONG"
+    elif price >= bb_upper and rsi > FLAT_RSI_OVERBOUGHT:
+        side = "SHORT"
+
+    if side:
+        return {"side": side, "rr_ratio": FLAT_RR_RATIO, "strategy_name": "Flat_BB_Fade"}
+    return None
 
 # ── ОСНОВНОЙ ЦИКЛ БОТА ───────────────────────────────────────────────────────
 async def monitor(app: Application):
@@ -185,6 +229,8 @@ async def monitor(app: Application):
             df = add_indicators(pd.DataFrame(
                 ohlcv, columns=["ts","open","high","low","close","volume"]
             ))
+            if len(df) < 2:
+                await asyncio.sleep(30); continue
 
             last, prev = df.iloc[-1], df.iloc[-2]
             price = last["close"]
@@ -193,7 +239,6 @@ async def monitor(app: Application):
             if trade := state.get("active_trade"):
                 side, sl, tp = trade["side"], trade["sl_price"], trade["tp_price"]
 
-                # Обновление MFE/MAE
                 if side == "LONG":
                     trade["mfe_price"] = max(trade["mfe_price"], price)
                     trade["mae_price"] = min(trade["mae_price"], price)
@@ -202,27 +247,19 @@ async def monitor(app: Application):
                     trade["mae_price"] = max(trade["mae_price"], price)
 
                 done = status = None
-                if side == "LONG"  and price >= tp: done, status = "TP_HIT", "WIN"
+                if side == "LONG" and price >= tp: done, status = "TP_HIT", "WIN"
                 elif side == "LONG" and price <= sl: done, status = "SL_HIT", "LOSS"
                 elif side == "SHORT" and price <= tp: done, status = "TP_HIT", "WIN"
                 elif side == "SHORT" and price >= sl: done, status = "SL_HIT", "LOSS"
 
                 if done:
-                    # --- РАСЧЁТ P&L ---
                     entry_price = trade["entry_price"]
-                    pnl_pct = 0
-                    if side == "LONG":
-                        pnl_pct = (price / entry_price - 1)
-                    else: # SHORT
-                        pnl_pct = (entry_price / price - 1)
-                    
+                    pnl_pct = (price / entry_price - 1) if side == "LONG" else (entry_price / price - 1)
                     pnl_usd = pnl_pct * ENTRY_USD * LEVERAGE
                     trade["pnl_usd"] = round(pnl_usd, 2)
                     
-                    # --- Обновление данных для отчёта ---
                     state["daily_report_data"].append({
-                        "pnl_usd": trade["pnl_usd"],
-                        "entry_usd": ENTRY_USD
+                        "pnl_usd": trade["pnl_usd"], "entry_usd": ENTRY_USD
                     })
 
                     trade["status"] = status
@@ -233,7 +270,8 @@ async def monitor(app: Application):
                     
                     await notify(app.bot,
                         f"{msg_icon} <b>СДЕЛКА ЗАКРЫТА: {status}</b> {msg_icon}\n\n"
-                        f"<b>Тип:</b> {side} (v: {STRAT_VERSION})\n"
+                        f"<b>Стратегия:</b> {trade['strategy_name']}\n"
+                        f"<b>Тип:</b> {side}\n"
                         f"<b>ID:</b> {trade['id']}\n\n"
                         f"<b>Вход:</b> {entry_price:.2f}\n"
                         f"<b>Выход:</b> {price:.2f}\n"
@@ -245,26 +283,25 @@ async def monitor(app: Application):
 
             # ---------------- 2. Поиск нового сигнала -----------------------
             else:
-                vol_ok = last["volume"] >= MIN_VOLUME_BTC
-                adx_ok = last[f"ADX_{ADX_LEN}"] > MIN_ADX # <-- ИЗМЕНЕНА ЛОГИКА
-
-                if not (vol_ok and adx_ok):
+                if not last["volume"] >= MIN_VOLUME_BTC:
                     await asyncio.sleep(60); continue
 
-                bull_now = last[f"EMA_{EMA_FAST}"] > last[f"EMA_{EMA_SLOW}"]
-                bull_prev= prev[f"EMA_{EMA_FAST}"] > prev[f"EMA_{EMA_SLOW}"]
+                market_state = get_market_state(last)
+                signal_data = None
+                
+                if market_state == "TREND":
+                    signal_data = run_trend_strategy(last, prev)
+                elif market_state == "FLAT":
+                    signal_data = run_flat_strategy(last)
 
-                long_cond  = last[f"RSI_{RSI_LEN}"] > RSI_LONG_ENTRY and price > last[f"EMA_{EMA_FAST}"]
-                short_cond = last[f"RSI_{RSI_LEN}"] < RSI_SHORT_ENTRY and price < last[f"EMA_{EMA_FAST}"]
+                if signal_data:
+                    side = signal_data["side"]
+                    rr_ratio = signal_data["rr_ratio"]
+                    strategy_name = signal_data["strategy_name"]
 
-                side = None
-                if   bull_now and not bull_prev and long_cond:  side = "LONG"
-                elif not bull_now and bull_prev and short_cond: side = "SHORT"
-
-                if side:
                     atr = last[f"ATR_{ATR_LEN}"]
                     sl_pct = get_sl_pct_by_atr(atr)
-                    tp_pct = sl_pct * RR_RATIO # <-- НОВЫЙ РАСЧЕТ TP
+                    tp_pct = sl_pct * rr_ratio
 
                     entry = price
                     sl = entry * (1 - sl_pct/100) if side=="LONG" else entry * (1 + sl_pct/100)
@@ -276,7 +313,7 @@ async def monitor(app: Application):
                     elif entry < bb_lo: bb_pos = "Ниже нижней"
 
                     trade = dict(
-                        id=uuid.uuid4().hex[:8], side=side,
+                        id=uuid.uuid4().hex[:8], side=side, strategy_name=strategy_name,
                         entry_time_utc=datetime.now(timezone.utc).isoformat(),
                         entry_price=entry, tp_price=tp, sl_price=sl,
                         mfe_price=entry, mae_price=entry,
@@ -290,13 +327,13 @@ async def monitor(app: Application):
 
                     await notify(
                         app.bot,
-                        f"🔔 <b>НОВЫЙ СИГНАЛ: {side}</b> 🔔\n\n"
-                        f"<b>Версия:</b> {STRAT_VERSION}\n"
+                        f"🔔 <b>НОВЫЙ СИГНАЛ ({strategy_name})</b> 🔔\n\n"
+                        f"<b>Тип:</b> {side} (v: {STRAT_VERSION})\n"
                         f"<b>ID:</b> {trade['id']}\n\n"
                         f"<b>Цена входа:</b> {entry:.2f}\n"
                         f"<b>Take Profit:</b> {tp:.2f} ({tp_pct:.2f}%)\n"
                         f"<b>Stop Loss:</b> {sl:.2f} ({sl_pct:.2f}%)\n\n"
-                        f"<i>Параметры: ADX={trade['entry_adx']}, RSI={trade['entry_rsi']}, ATR={trade['entry_atr']}</i>"
+                        f"<i>Параметры: ADX={trade['entry_adx']}, RSI={trade['entry_rsi']}</i>"
                     )
 
         except ccxt.NetworkError as e:
@@ -312,21 +349,24 @@ async def daily_reporter(app: Application):
     log.info("📈 Сервис ежедневных отчётов запущен.")
     while True:
         now_utc = datetime.now(timezone.utc)
-        report_h, report_m = map(int, REPORT_TIME_UTC.split(':'))
-        report_time = now_utc.replace(hour=report_h, minute=report_m, second=0, microsecond=0)
-        
+        try:
+            report_h, report_m = map(int, REPORT_TIME_UTC.split(':'))
+            report_time = now_utc.replace(hour=report_h, minute=report_m, second=0, microsecond=0)
+        except ValueError:
+            log.error("Неверный формат REPORT_TIME_UTC. Используйте HH:MM. Отчеты отключены.")
+            return
+
         if now_utc > report_time:
-            # Если время уже прошло, ждём до завтра
             report_time = report_time.replace(day=now_utc.day + 1)
 
         wait_seconds = (report_time - now_utc).total_seconds()
         log.info(f"Следующий суточный отчёт будет отправлен в {REPORT_TIME_UTC} UTC (через {wait_seconds/3600:.2f} ч).")
         await asyncio.sleep(wait_seconds)
 
-        # Время пришло, генерируем отчёт
         report_data = state.get("daily_report_data", [])
         if not report_data:
-            await notify(app.bot, "📊 <b>Суточный отчёт</b> 📊\n\nЗа последние 24 часа сделок не было.")
+            await notify(app.bot, f"📊 <b>Суточный отчёт ({STRAT_VERSION})</b> 📊\n\nЗа последние 24 часа сделок не было.")
+            await asyncio.sleep(60) # Небольшая задержка после отправки
             continue
 
         total_pnl_usd = sum(item['pnl_usd'] for item in report_data)
@@ -335,7 +375,6 @@ async def daily_reporter(app: Application):
         losses = total_trades - wins
         win_rate = (wins / total_trades) * 100 if total_trades > 0 else 0
         
-        # PnL в % от общего вложенного капитала (неплечевого)
         total_investment = sum(item['entry_usd'] for item in report_data)
         pnl_percent = (total_pnl_usd / total_investment) * 100 if total_investment > 0 else 0
         
@@ -350,28 +389,31 @@ async def daily_reporter(app: Application):
         )
         await notify(app.bot, report_msg)
 
-        # Очищаем данные для следующего дня
         state["daily_report_data"] = []
         save_state()
+        await asyncio.sleep(60) # Небольшая задержка после отправки
 
 # ── КОМАНДЫ TELEGRAM И ЗАПУСК ────────────────────────────────────────────────
 async def _start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     CHAT_IDS.add(update.effective_chat.id)
-    if not state["monitoring"]:
-        state["monitoring"] = True; save_state()
-        await update.message.reply_text(f"✅ Бот <b>{STRAT_VERSION}</b> запущен. Начинаю мониторинг.", parse_mode="HTML")
+    if not state.get("monitoring"):
+        state["monitoring"] = True
+        save_state()
+        await update.message.reply_text(f"✅ Бот <b>{STRAT_VERSION}</b> запущен.", parse_mode="HTML")
         asyncio.create_task(monitor(ctx.application))
     else:
         await update.message.reply_text("ℹ️ Бот уже работает.")
 
 async def _stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    state["monitoring"] = False; save_state()
+    state["monitoring"] = False
+    save_state()
     await update.message.reply_text("❌ Бот остановлен.")
 
 async def _status(update: Update, _):
-    msg = f"<b>Статус:</b> {'АКТИВЕН' if state['monitoring'] else 'ОСТАНОВЛЕН'}\n"
-    if tr := state["active_trade"]:
-        msg += (f"<b>Активная сделка: {tr['side']}</b> (ID: {tr['id']})\n"
+    msg = f"<b>Статус:</b> {'АКТИВЕН' if state.get('monitoring') else 'ОСТАНОВЛЕН'}\n"
+    if tr := state.get("active_trade"):
+        msg += (f"<b>Активная сделка: {tr['side']}</b> ({tr['strategy_name']})\n"
+                f"ID: {tr['id']}\n"
                 f"Вход: {tr['entry_price']:.2f} | TP: {tr['tp_price']:.2f} | SL: {tr['sl_price']:.2f}")
     else:
         msg += "<i>Нет активных сделок.</i>"
@@ -380,10 +422,9 @@ async def _status(update: Update, _):
 async def _post_init(app: Application):
     if os.path.exists(STATE_FILE):
         log.info("Файл состояния найден, загружаю.")
-    if state["monitoring"]:
+    if state.get("monitoring"):
         asyncio.create_task(monitor(app))
     
-    # Запускаем фоновую задачу для отчётов
     asyncio.create_task(daily_reporter(app))
 
 if __name__ == "__main__":
@@ -391,7 +432,7 @@ if __name__ == "__main__":
            .token(BOT_TOKEN)
            .post_init(_post_init)
            .build())
-    app.add_handler(CommandHandler("start",  _start))
-    app.add_handler(CommandHandler("stop",   _stop))
+    app.add_handler(CommandHandler("start", _start))
+    app.add_handler(CommandHandler("stop", _stop))
     app.add_handler(CommandHandler("status", _status))
     app.run_polling()
