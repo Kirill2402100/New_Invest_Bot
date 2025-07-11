@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 # ============================================================================
-# Market Chameleon v4.0 • 10 Jul 2025
+# Market Chameleon v5.0 • 11 Jul 2025
 # ============================================================================
 # • АДАПТИВНАЯ СТРАТЕГИЯ: Автоматическое переключение Тренд/Флэт
-# • ТРЕНД (ADX > 25)    : Вход по пересечению EMA
-# • ФЛЭТ (ADX < 25)     : Вход от границ Полос Боллинджера
-# • P&L и ОТЧЁТНОСТЬ    : Полный функционал
+# • УЛУЧШЕНИЯ v5.0:
+#   - Фильтр шорт-сигналов по дневному тренду/RSI
+#   - Динамический порог ADX для определения состояния рынка
+#   - Учёт комиссии 0.04% в расчёте P&L
+#   - "Динамический депозит" (25$/50$) для управления риском
 # ============================================================================
 
 import os
@@ -14,7 +16,7 @@ import logging
 import re
 import uuid
 import asyncio
-from datetime import datetime, timezone, time
+from datetime import datetime, timezone, time, timedelta
 
 import numpy as np
 import pandas as pd
@@ -34,16 +36,20 @@ CHAT_IDS_RAW  = os.getenv("CHAT_IDS", "")
 SHEET_ID      = os.getenv("SHEET_ID")
 PAIR_RAW      = os.getenv("PAIR", "BTC/USDT")
 TIMEFRAME     = os.getenv("TIMEFRAME", "5m")
-STRAT_VERSION = "v4_0_chameleon"
+STRAT_VERSION = "v5_0_chameleon_pro"
 
 # --- Параметры P&L и отчётности ---
-ENTRY_USD      = float(os.getenv("ENTRY_USD", "50"))
-LEVERAGE       = float(os.getenv("LEVERAGE",  "500"))
-REPORT_TIME_UTC= os.getenv("REPORT_TIME_UTC", "21:00")
+LEVERAGE             = float(os.getenv("LEVERAGE", "500"))
+FEE_PCT              = float(os.getenv("FEE_PCT", "0.0004")) # 0.04% комиссия
+REPORT_TIME_UTC      = os.getenv("REPORT_TIME_UTC", "21:00")
+
+# --- Параметры динамического депозита ---
+INITIAL_DEPOSIT      = float(os.getenv("INITIAL_DEPOSIT", "50.0"))
+REDUCED_DEPOSIT      = float(os.getenv("REDUCED_DEPOSIT", "25.0"))
+DRAWDOWN_THRESHOLD_PCT = float(os.getenv("DRAWDOWN_THRESHOLD_PCT", "20.0"))
 
 # --- Общие параметры стратегий ---
 MIN_VOLUME_BTC = float(os.getenv("MIN_VOLUME_BTC", "1"))
-MARKET_STATE_ADX_THRESHOLD = float(os.getenv("MARKET_STATE_ADX_THRESHOLD", "25"))
 
 # --- Параметры ТРЕНДОВОЙ стратегии ---
 TREND_RR_RATIO = float(os.getenv("TREND_RR_RATIO", "1.5"))
@@ -89,8 +95,8 @@ def setup_google_sheets() -> None:
             "Signal_ID", "Version", "Strategy_Used", "Status", "Side",
             "Entry_Time_UTC", "Exit_Time_UTC",
             "Entry_Price", "Exit_Price", "SL_Price", "TP_Price",
-            "P&L_USD", "MFE_Price", "MAE_Price",
-            "Entry_RSI", "Entry_ADX", "Entry_ATR",
+            "P&L_USD", "Fee_USD", "Entry_Deposit_USD", "MFE_Price", "MAE_Price",
+            "Entry_RSI", "Entry_ADX", "Dynamic_ADX_Threshold", "Entry_ATR",
             "Entry_Volume", "Entry_BB_Position"
         ]
 
@@ -113,15 +119,28 @@ def setup_google_sheets() -> None:
 setup_google_sheets()
 
 # ── УПРАВЛЕНИЕ СОСТОЯНИЕМ ───────────────────────────────────────────────────
-STATE_FILE = "btc_chameleon_state.json"
-state = {"monitoring": False, "active_trade": None, "daily_report_data": []}
+STATE_FILE = f"state_{STRAT_VERSION}_{PAIR_RAW.replace('/','_')}.json"
+state = {
+    "monitoring": False,
+    "active_trade": None,
+    "daily_report_data": [],
+    "entry_usd_current": INITIAL_DEPOSIT,
+    "equity_curve": [],
+    "equity_peak": 0.0,
+    "dynamic_adx_threshold": 25.0, # Начальное значение
+    "last_adx_recalc_time": None
+}
+
 if os.path.exists(STATE_FILE):
     try:
         with open(STATE_FILE, 'r') as f:
-            state.update(json.load(f))
-        if "daily_report_data" not in state:
-            state["daily_report_data"] = []
-    except json.JSONDecodeError:
+            loaded_state = json.load(f)
+            # Убедимся, что все новые ключи присутствуют
+            for key, default_value in state.items():
+                if key not in loaded_state:
+                    loaded_state[key] = default_value
+            state.update(loaded_state)
+    except (json.JSONDecodeError, TypeError):
         log.error("Не удалось прочитать файл состояния, будет создан новый.")
 
 def save_state():
@@ -145,9 +164,9 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df.ta.adx(length=ADX_LEN, append=True,
               col_names=(f"ADX_{ADX_LEN}", f"DMP_{ADX_LEN}", f"DMN_{ADX_LEN}"))
     df.ta.bbands(length=BBANDS_LEN, std=2, append=True,
-                 col_names=(f"BBL_{BBANDS_LEN}_2.0", f"BBM_{BBANDS_LEN}_2.0",
-                            f"BBU_{BBANDS_LEN}_2.0", f"BBB_{BBANDS_LEN}_2.0",
-                            f"BBP_{BBANDS_LEN}_2.0"))
+                col_names=(f"BBL_{BBANDS_LEN}_2.0", f"BBM_{BBANDS_LEN}_2.0",
+                           f"BBU_{BBANDS_LEN}_2.0", f"BBB_{BBANDS_LEN}_2.0",
+                           f"BBP_{BBANDS_LEN}_2.0"))
     return df.dropna()
 
 def get_sl_pct_by_atr(atr: float) -> float:
@@ -170,18 +189,91 @@ async def log_trade(tr: dict):
         tr["entry_time_utc"], datetime.now(timezone.utc).isoformat(),
         tr["entry_price"], tr["exit_price"],
         tr["sl_price"], tr["tp_price"],
-        tr.get("pnl_usd"), tr["mfe_price"], tr["mae_price"],
-        tr["entry_rsi"], tr["entry_adx"], tr["entry_atr"],
+        tr.get("pnl_usd"), tr.get("fee_usd"), tr.get("entry_deposit_usd"),
+        tr["mfe_price"], tr["mae_price"],
+        tr["entry_rsi"], tr["entry_adx"], tr.get("dynamic_adx_threshold"), tr["entry_atr"],
         tr["entry_volume"], tr["entry_bb_pos"]
     ]
     await asyncio.to_thread(
         TRADE_LOG_WS.append_row, row, value_input_option="USER_ENTERED"
     )
 
-# ── ДИСПЕТЧЕР СТРАТЕГИЙ ─────────────────────────────────────────────────────
+# ── ЛОГИКА СТРАТЕГИИ И ФИЛЬТРОВ ───────────────────────────────────────────────
+async def recalculate_adx_threshold():
+    """Пересчитывает порог ADX каждые 60 минут."""
+    try:
+        log.info("Пересчет динамического порога ADX...")
+        # Загружаем данные за ~7 дней (2000 свечей * 5 мин)
+        ohlcv = await exchange.fetch_ohlcv(PAIR, timeframe=TIMEFRAME, limit=2000)
+        df = pd.DataFrame(ohlcv, columns=["ts","open","high","low","close","volume"])
+        df.ta.adx(length=ADX_LEN, append=True, col_names=(f"ADX_{ADX_LEN}", "DMP", "DMN"))
+        df.dropna(inplace=True)
+
+        if not df.empty:
+            adx_values = df[f"ADX_{ADX_LEN}"]
+            p20 = np.percentile(adx_values, 20)
+            p30 = np.percentile(adx_values, 30)
+            new_threshold = (p20 + p30) / 2
+            state["dynamic_adx_threshold"] = new_threshold
+            state["last_adx_recalc_time"] = datetime.now(timezone.utc).isoformat()
+            save_state()
+            log.info(f"Новый порог ADX: {new_threshold:.2f} (p20={p20:.2f}, p30={p30:.2f})")
+    except Exception as e:
+        log.error(f"Ошибка при пересчете порога ADX: {e}")
+
+async def is_short_allowed() -> bool:
+    """Проверяет, разрешена ли короткая позиция по дневному тренду."""
+    try:
+        ohlcv_1d = await exchange.fetch_ohlcv(PAIR, timeframe='1d', limit=201)
+        df_1d = pd.DataFrame(ohlcv_1d, columns=["ts","open","high","low","close","volume"])
+        df_1d.ta.ema(length=200, append=True, col_names=("EMA_200",))
+        df_1d.ta.rsi(length=14, append=True, col_names=("RSI_14",))
+        df_1d.dropna(inplace=True)
+
+        if df_1d.empty:
+            log.warning("Не удалось получить данные 1d для фильтра, шорт разрешен по умолчанию.")
+            return True
+
+        last_daily = df_1d.iloc[-1]
+        price_close_1d = last_daily['close']
+        ema200_1d = last_daily['EMA_200']
+        rsi14_1d = last_daily['RSI_14']
+
+        # Условие разрешения: цена ниже EMA или RSI выше 60
+        if price_close_1d < ema200_1d or rsi14_1d > 60:
+            return True
+        else:
+            log.info(f"SHORT blocked by trend filter. Price_1d={price_close_1d:.2f}, EMA200_1d={ema200_1d:.2f}, RSI14_1d={rsi14_1d:.2f}")
+            return False
+    except Exception as e:
+        log.error(f"Ошибка в фильтре дневного тренда: {e}")
+        return True # В случае ошибки разрешаем сделку
+
+def update_dynamic_deposit(pnl_usd: float):
+    """Обновляет размер депозита на основе кривой эквити."""
+    state["equity_curve"].append(pnl_usd)
+    current_equity = sum(state["equity_curve"])
+    
+    new_peak = max(state.get("equity_peak", 0.0), current_equity)
+
+    if current_equity >= new_peak: # Новый максимум
+        state["entry_usd_current"] = INITIAL_DEPOSIT
+        log.info(f"Кривая эквити достигла нового максимума! Депозит возвращен к {INITIAL_DEPOSIT}$")
+    else:
+        # Считаем просадку только если пик был положительным
+        if new_peak > 0:
+            drawdown = (new_peak - current_equity) / new_peak
+            if drawdown * 100 >= DRAWDOWN_THRESHOLD_PCT:
+                if state["entry_usd_current"] != REDUCED_DEPOSIT:
+                    log.warning(f"Просадка {drawdown*100:.2f}% >= {DRAWDOWN_THRESHOLD_PCT}%. Депозит снижен до {REDUCED_DEPOSIT}$")
+                    state["entry_usd_current"] = REDUCED_DEPOSIT
+    
+    state["equity_peak"] = new_peak
+    save_state()
+
 def get_market_state(last_candle: pd.Series) -> str:
     adx = last_candle[f"ADX_{ADX_LEN}"]
-    if adx > MARKET_STATE_ADX_THRESHOLD:
+    if adx > state["dynamic_adx_threshold"]:
         return "TREND"
     else:
         return "FLAT"
@@ -225,6 +317,16 @@ async def monitor(app: Application):
     log.info("🚀 Основной цикл запущен: %s %s (%s)", PAIR, TIMEFRAME, STRAT_VERSION)
     while state["monitoring"]:
         try:
+            # --- Пересчет порога ADX раз в час ---
+            now_utc = datetime.now(timezone.utc)
+            last_recalc_str = state.get("last_adx_recalc_time")
+            if last_recalc_str:
+                last_recalc_time = datetime.fromisoformat(last_recalc_str)
+                if now_utc - last_recalc_time > timedelta(minutes=60):
+                    await recalculate_adx_threshold()
+            else: # Первый запуск
+                await recalculate_adx_threshold()
+
             ohlcv = await exchange.fetch_ohlcv(PAIR, timeframe=TIMEFRAME, limit=100)
             df = add_indicators(pd.DataFrame(
                 ohlcv, columns=["ts","open","high","low","close","volume"]
@@ -254,18 +356,28 @@ async def monitor(app: Application):
 
                 if done:
                     entry_price = trade["entry_price"]
+                    current_deposit = trade["entry_deposit_usd"]
+                    
                     pnl_pct = (price / entry_price - 1) if side == "LONG" else (entry_price / price - 1)
-                    pnl_usd = pnl_pct * ENTRY_USD * LEVERAGE
-                    trade["pnl_usd"] = round(pnl_usd, 2)
+                    
+                    gross_pnl_usd = pnl_pct * current_deposit * LEVERAGE
+                    fee_usd = current_deposit * LEVERAGE * FEE_PCT * 2
+                    net_pnl_usd = gross_pnl_usd - fee_usd
+
+                    trade["pnl_usd"] = round(net_pnl_usd, 2)
+                    trade["fee_usd"] = round(fee_usd, 2)
                     
                     state["daily_report_data"].append({
-                        "pnl_usd": trade["pnl_usd"], "entry_usd": ENTRY_USD
+                        "pnl_usd": trade["pnl_usd"], "entry_usd": current_deposit
                     })
+                    
+                    # Обновляем динамический депозит
+                    update_dynamic_deposit(trade["pnl_usd"])
 
                     trade["status"] = status
                     trade["exit_price"] = price
 
-                    pnl_text = f"💰 <b>P&L: {trade['pnl_usd']:.2f}$</b>"
+                    pnl_text = f"💰 <b>P&L: {trade['pnl_usd']:.2f}$</b> (Fee: {trade['fee_usd']:.2f}$)"
                     msg_icon = "✅" if status == "WIN" else "❌"
                     
                     await notify(app.bot,
@@ -296,6 +408,12 @@ async def monitor(app: Application):
 
                 if signal_data:
                     side = signal_data["side"]
+                    
+                    # Фильтр для шортов
+                    if side == "SHORT":
+                        if not await is_short_allowed():
+                            continue # Игнорируем сигнал
+
                     rr_ratio = signal_data["rr_ratio"]
                     strategy_name = signal_data["strategy_name"]
 
@@ -312,13 +430,17 @@ async def monitor(app: Application):
                     if entry > bb_up:   bb_pos = "Выше верхней"
                     elif entry < bb_lo: bb_pos = "Ниже нижней"
 
+                    current_deposit = state['entry_usd_current']
+
                     trade = dict(
                         id=uuid.uuid4().hex[:8], side=side, strategy_name=strategy_name,
                         entry_time_utc=datetime.now(timezone.utc).isoformat(),
                         entry_price=entry, tp_price=tp, sl_price=sl,
+                        entry_deposit_usd=current_deposit,
                         mfe_price=entry, mae_price=entry,
                         entry_rsi=round(last[f"RSI_{RSI_LEN}"],2),
                         entry_adx=round(last[f"ADX_{ADX_LEN}"],2),
+                        dynamic_adx_threshold=round(state["dynamic_adx_threshold"], 2),
                         entry_atr=round(atr,2),
                         entry_volume=last["volume"], entry_bb_pos=bb_pos
                     )
@@ -333,7 +455,8 @@ async def monitor(app: Application):
                         f"<b>Цена входа:</b> {entry:.2f}\n"
                         f"<b>Take Profit:</b> {tp:.2f} ({tp_pct:.2f}%)\n"
                         f"<b>Stop Loss:</b> {sl:.2f} ({sl_pct:.2f}%)\n\n"
-                        f"<i>Параметры: ADX={trade['entry_adx']}, RSI={trade['entry_rsi']}</i>"
+                        f"<b>Размер депозита:</b> {current_deposit:.2f}$\n"
+                        f"<i>Параметры: ADX={trade['entry_adx']} (T: {trade['dynamic_adx_threshold']}), RSI={trade['entry_rsi']}</i>"
                     )
 
         except ccxt.NetworkError as e:
@@ -357,7 +480,7 @@ async def daily_reporter(app: Application):
             return
 
         if now_utc > report_time:
-            report_time = report_time.replace(day=now_utc.day + 1)
+            report_time += timedelta(days=1)
 
         wait_seconds = (report_time - now_utc).total_seconds()
         log.info(f"Следующий суточный отчёт будет отправлен в {REPORT_TIME_UTC} UTC (через {wait_seconds/3600:.2f} ч).")
@@ -366,7 +489,7 @@ async def daily_reporter(app: Application):
         report_data = state.get("daily_report_data", [])
         if not report_data:
             await notify(app.bot, f"📊 <b>Суточный отчёт ({STRAT_VERSION})</b> 📊\n\nЗа последние 24 часа сделок не было.")
-            await asyncio.sleep(60) # Небольшая задержка после отправки
+            await asyncio.sleep(60)
             continue
 
         total_pnl_usd = sum(item['pnl_usd'] for item in report_data)
@@ -375,6 +498,7 @@ async def daily_reporter(app: Application):
         losses = total_trades - wins
         win_rate = (wins / total_trades) * 100 if total_trades > 0 else 0
         
+        # Расчет ROI на основе фактически использованных в сделках средств
         total_investment = sum(item['entry_usd'] for item in report_data)
         pnl_percent = (total_pnl_usd / total_investment) * 100 if total_investment > 0 else 0
         
@@ -385,13 +509,13 @@ async def daily_reporter(app: Application):
             f"<b>Винрейт:</b> {win_rate:.2f}%\n\n"
             f"<b>Финансовый результат:</b>\n"
             f"💵 <b>P&L ($): {total_pnl_usd:+.2f}$</b>\n"
-            f"💹 <b>P&L (%): {pnl_percent:+.2f}%</b>"
+            f"💹 <b>ROI (%): {pnl_percent:+.2f}%</b>"
         )
         await notify(app.bot, report_msg)
 
         state["daily_report_data"] = []
         save_state()
-        await asyncio.sleep(60) # Небольшая задержка после отправки
+        await asyncio.sleep(60)
 
 # ── КОМАНДЫ TELEGRAM И ЗАПУСК ────────────────────────────────────────────────
 async def _start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -411,12 +535,16 @@ async def _stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def _status(update: Update, _):
     msg = f"<b>Статус:</b> {'АКТИВЕН' if state.get('monitoring') else 'ОСТАНОВЛЕН'}\n"
+    msg += f"<b>Текущий депозит:</b> {state['entry_usd_current']:.2f}$\n"
+    msg += f"<b>Пик эквити:</b> {state['equity_peak']:.2f}$\n"
+    msg += f"<b>Текущий порог ADX:</b> {state['dynamic_adx_threshold']:.2f}\n"
+
     if tr := state.get("active_trade"):
-        msg += (f"<b>Активная сделка: {tr['side']}</b> ({tr['strategy_name']})\n"
+        msg += (f"\n<b>Активная сделка: {tr['side']}</b> ({tr['strategy_name']})\n"
                 f"ID: {tr['id']}\n"
                 f"Вход: {tr['entry_price']:.2f} | TP: {tr['tp_price']:.2f} | SL: {tr['sl_price']:.2f}")
     else:
-        msg += "<i>Нет активных сделок.</i>"
+        msg += "\n<i>Нет активных сделок.</i>"
     await update.message.reply_text(msg, parse_mode="HTML")
 
 async def _post_init(app: Application):
