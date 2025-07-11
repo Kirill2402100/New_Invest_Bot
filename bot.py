@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 # ============================================================================
-# Market Chameleon v5.0 • 11 Jul 2025
+# Market Chameleon v5.2 • 11 Jul 2025
 # ============================================================================
 # • АДАПТИВНАЯ СТРАТЕГИЯ: Автоматическое переключение Тренд/Флэт
-# • УЛУЧШЕНИЯ v5.0:
+# • УЛУЧШЕНИЯ v5.2:
+#   - Разделены Gross и Net P&L в логах для детального анализа
 #   - Фильтр шорт-сигналов по дневному тренду/RSI
 #   - Динамический порог ADX для определения состояния рынка
-#   - Учёт комиссии 0.04% в расчёте P&L
 #   - "Динамический депозит" (25$/50$) для управления риском
 # ============================================================================
 
@@ -36,11 +36,11 @@ CHAT_IDS_RAW  = os.getenv("CHAT_IDS", "")
 SHEET_ID      = os.getenv("SHEET_ID")
 PAIR_RAW      = os.getenv("PAIR", "BTC/USDT")
 TIMEFRAME     = os.getenv("TIMEFRAME", "5m")
-STRAT_VERSION = "v5_0_chameleon_pro"
+STRAT_VERSION = "v5_2_chameleon_pro"
 
 # --- Параметры P&L и отчётности ---
 LEVERAGE             = float(os.getenv("LEVERAGE", "500"))
-FEE_PCT              = float(os.getenv("FEE_PCT", "0.0004")) # 0.04% комиссия
+FEE_PCT              = float(os.getenv("FEE_PCT", "0.0004")) # 0.04% комиссия (вход + выход)
 REPORT_TIME_UTC      = os.getenv("REPORT_TIME_UTC", "21:00")
 
 # --- Параметры динамического депозита ---
@@ -95,7 +95,7 @@ def setup_google_sheets() -> None:
             "Signal_ID", "Version", "Strategy_Used", "Status", "Side",
             "Entry_Time_UTC", "Exit_Time_UTC",
             "Entry_Price", "Exit_Price", "SL_Price", "TP_Price",
-            "P&L_USD", "Fee_USD", "Entry_Deposit_USD", "MFE_Price", "MAE_Price",
+            "Gross_P&L_USD", "Fee_USD", "Net_P&L_USD", "Entry_Deposit_USD", "MFE_Price", "MAE_Price",
             "Entry_RSI", "Entry_ADX", "Dynamic_ADX_Threshold", "Entry_ATR",
             "Entry_Volume", "Entry_BB_Position"
         ]
@@ -189,8 +189,8 @@ async def log_trade(tr: dict):
         tr["entry_time_utc"], datetime.now(timezone.utc).isoformat(),
         tr["entry_price"], tr["exit_price"],
         tr["sl_price"], tr["tp_price"],
-        tr.get("pnl_usd"), tr.get("fee_usd"), tr.get("entry_deposit_usd"),
-        tr["mfe_price"], tr["mae_price"],
+        tr.get("gross_pnl_usd"), tr.get("fee_usd"), tr.get("net_pnl_usd"),
+        tr.get("entry_deposit_usd"), tr["mfe_price"], tr["mae_price"],
         tr["entry_rsi"], tr["entry_adx"], tr.get("dynamic_adx_threshold"), tr["entry_atr"],
         tr["entry_volume"], tr["entry_bb_pos"]
     ]
@@ -249,9 +249,9 @@ async def is_short_allowed() -> bool:
         log.error(f"Ошибка в фильтре дневного тренда: {e}")
         return True # В случае ошибки разрешаем сделку
 
-def update_dynamic_deposit(pnl_usd: float):
+def update_dynamic_deposit(net_pnl_usd: float):
     """Обновляет размер депозита на основе кривой эквити."""
-    state["equity_curve"].append(pnl_usd)
+    state["equity_curve"].append(net_pnl_usd)
     current_equity = sum(state["equity_curve"])
     
     new_peak = max(state.get("equity_peak", 0.0), current_equity)
@@ -361,23 +361,25 @@ async def monitor(app: Application):
                     pnl_pct = (price / entry_price - 1) if side == "LONG" else (entry_price / price - 1)
                     
                     gross_pnl_usd = pnl_pct * current_deposit * LEVERAGE
-                    fee_usd = current_deposit * LEVERAGE * FEE_PCT * 2
+                    fee_usd = current_deposit * LEVERAGE * FEE_PCT
                     net_pnl_usd = gross_pnl_usd - fee_usd
 
-                    trade["pnl_usd"] = round(net_pnl_usd, 2)
+                    trade["gross_pnl_usd"] = round(gross_pnl_usd, 2)
                     trade["fee_usd"] = round(fee_usd, 2)
+                    trade["net_pnl_usd"] = round(net_pnl_usd, 2)
                     
                     state["daily_report_data"].append({
-                        "pnl_usd": trade["pnl_usd"], "entry_usd": current_deposit
+                        "pnl_usd": net_pnl_usd, 
+                        "entry_usd": current_deposit
                     })
                     
-                    # Обновляем динамический депозит
-                    update_dynamic_deposit(trade["pnl_usd"])
+                    # Обновляем динамический депозит на основе чистого P&L
+                    update_dynamic_deposit(net_pnl_usd)
 
                     trade["status"] = status
                     trade["exit_price"] = price
 
-                    pnl_text = f"💰 <b>P&L: {trade['pnl_usd']:.2f}$</b> (Fee: {trade['fee_usd']:.2f}$)"
+                    pnl_text = f"💰 <b>Net P&L: {trade['net_pnl_usd']:.2f}$</b> (Fee: {trade['fee_usd']:.2f}$)"
                     msg_icon = "✅" if status == "WIN" else "❌"
                     
                     await notify(app.bot,
@@ -508,7 +510,7 @@ async def daily_reporter(app: Application):
             f"<b>Всего сделок:</b> {total_trades} (📈{wins} / 📉{losses})\n"
             f"<b>Винрейт:</b> {win_rate:.2f}%\n\n"
             f"<b>Финансовый результат:</b>\n"
-            f"💵 <b>P&L ($): {total_pnl_usd:+.2f}$</b>\n"
+            f"💵 <b>Net P&L ($): {total_pnl_usd:+.2f}$</b>\n"
             f"💹 <b>ROI (%): {pnl_percent:+.2f}%</b>"
         )
         await notify(app.bot, report_msg)
