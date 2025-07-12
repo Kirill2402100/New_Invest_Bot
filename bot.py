@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 # ============================================================================
-# Market Chameleon v5.3 • 12 Jul 2025
+# Market Chameleon v5.4 • 12 Jul 2025
 # ============================================================================
 # • АДАПТИВНАЯ СТРАТЕГИЯ: Автоматическое переключение Тренд/Флэт
-# • УЛУЧШЕНИЯ v5.3:
+# • УЛУЧШЕНИЯ v5.4:
+#   - Исправлена ошибка 'NameError' в трендовой стратегии
 #   - Более точное исполнение TP/SL (проверка по High/Low свечи)
 #   - Подтверждение цены входа с задержкой в 2 сек. для защиты от "шипов"
 #   - Разделены Gross и Net P&L в логах
@@ -38,7 +39,7 @@ CHAT_IDS_RAW  = os.getenv("CHAT_IDS", "")
 SHEET_ID      = os.getenv("SHEET_ID")
 PAIR_RAW      = os.getenv("PAIR", "BTC/USDT")
 TIMEFRAME     = os.getenv("TIMEFRAME", "5m")
-STRAT_VERSION = "v5_3_chameleon_pro"
+STRAT_VERSION = "v5_4_chameleon_pro"
 
 # --- Параметры P&L и отчётности ---
 LEVERAGE             = float(os.getenv("LEVERAGE", "500"))
@@ -277,8 +278,9 @@ def run_trend_strategy(last_candle: pd.Series, prev_candle: pd.Series):
     bull_now = last_candle[f"EMA_{EMA_FAST}"] > last_candle[f"EMA_{EMA_SLOW}"]
     bull_prev = prev_candle[f"EMA_{EMA_FAST}"] > prev_candle[f"EMA_{EMA_SLOW}"]
 
-    long_cond  = last_candle[f"RSI_{RSI_LEN}"] > 52 and price > last_candle[f"EMA_{FAST}"]
-    short_cond = last_candle[f"RSI_{RSI_LEN}"] < 48 and price < last_candle[f"EMA_{FAST}"]
+    # ИСПРАВЛЕНО: EMA_FAST вместо FAST
+    long_cond  = last_candle[f"RSI_{RSI_LEN}"] > 52 and price > last_candle[f"EMA_{EMA_FAST}"]
+    short_cond = last_candle[f"RSI_{RSI_LEN}"] < 48 and price < last_candle[f"EMA_{EMA_FAST}"]
 
     side = None
     if bull_now and not bull_prev and long_cond:
