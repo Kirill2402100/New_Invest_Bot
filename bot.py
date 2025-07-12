@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 # ============================================================================
-# Market Chameleon v5.2 • 11 Jul 2025
+# Market Chameleon v5.3 • 12 Jul 2025
 # ============================================================================
 # • АДАПТИВНАЯ СТРАТЕГИЯ: Автоматическое переключение Тренд/Флэт
-# • УЛУЧШЕНИЯ v5.2:
-#   - Разделены Gross и Net P&L в логах для детального анализа
+# • УЛУЧШЕНИЯ v5.3:
+#   - Более точное исполнение TP/SL (проверка по High/Low свечи)
+#   - Подтверждение цены входа с задержкой в 2 сек. для защиты от "шипов"
+#   - Разделены Gross и Net P&L в логах
 #   - Фильтр шорт-сигналов по дневному тренду/RSI
-#   - Динамический порог ADX для определения состояния рынка
-#   - "Динамический депозит" (25$/50$) для управления риском
+#   - Динамический порог ADX
+#   - "Динамический депозит"
 # ============================================================================
 
 import os
@@ -36,7 +38,7 @@ CHAT_IDS_RAW  = os.getenv("CHAT_IDS", "")
 SHEET_ID      = os.getenv("SHEET_ID")
 PAIR_RAW      = os.getenv("PAIR", "BTC/USDT")
 TIMEFRAME     = os.getenv("TIMEFRAME", "5m")
-STRAT_VERSION = "v5_2_chameleon_pro"
+STRAT_VERSION = "v5_3_chameleon_pro"
 
 # --- Параметры P&L и отчётности ---
 LEVERAGE             = float(os.getenv("LEVERAGE", "500"))
@@ -135,7 +137,6 @@ if os.path.exists(STATE_FILE):
     try:
         with open(STATE_FILE, 'r') as f:
             loaded_state = json.load(f)
-            # Убедимся, что все новые ключи присутствуют
             for key, default_value in state.items():
                 if key not in loaded_state:
                     loaded_state[key] = default_value
@@ -200,10 +201,8 @@ async def log_trade(tr: dict):
 
 # ── ЛОГИКА СТРАТЕГИИ И ФИЛЬТРОВ ───────────────────────────────────────────────
 async def recalculate_adx_threshold():
-    """Пересчитывает порог ADX каждые 60 минут."""
     try:
         log.info("Пересчет динамического порога ADX...")
-        # Загружаем данные за ~7 дней (2000 свечей * 5 мин)
         ohlcv = await exchange.fetch_ohlcv(PAIR, timeframe=TIMEFRAME, limit=2000)
         df = pd.DataFrame(ohlcv, columns=["ts","open","high","low","close","volume"])
         df.ta.adx(length=ADX_LEN, append=True, col_names=(f"ADX_{ADX_LEN}", "DMP", "DMN"))
@@ -222,7 +221,6 @@ async def recalculate_adx_threshold():
         log.error(f"Ошибка при пересчете порога ADX: {e}")
 
 async def is_short_allowed() -> bool:
-    """Проверяет, разрешена ли короткая позиция по дневному тренду."""
     try:
         ohlcv_1d = await exchange.fetch_ohlcv(PAIR, timeframe='1d', limit=201)
         df_1d = pd.DataFrame(ohlcv_1d, columns=["ts","open","high","low","close","volume"])
@@ -239,7 +237,6 @@ async def is_short_allowed() -> bool:
         ema200_1d = last_daily['EMA_200']
         rsi14_1d = last_daily['RSI_14']
 
-        # Условие разрешения: цена ниже EMA или RSI выше 60
         if price_close_1d < ema200_1d or rsi14_1d > 60:
             return True
         else:
@@ -247,20 +244,17 @@ async def is_short_allowed() -> bool:
             return False
     except Exception as e:
         log.error(f"Ошибка в фильтре дневного тренда: {e}")
-        return True # В случае ошибки разрешаем сделку
+        return True
 
 def update_dynamic_deposit(net_pnl_usd: float):
-    """Обновляет размер депозита на основе кривой эквити."""
     state["equity_curve"].append(net_pnl_usd)
     current_equity = sum(state["equity_curve"])
-    
     new_peak = max(state.get("equity_peak", 0.0), current_equity)
 
-    if current_equity >= new_peak: # Новый максимум
+    if current_equity >= new_peak:
         state["entry_usd_current"] = INITIAL_DEPOSIT
         log.info(f"Кривая эквити достигла нового максимума! Депозит возвращен к {INITIAL_DEPOSIT}$")
     else:
-        # Считаем просадку только если пик был положительным
         if new_peak > 0:
             drawdown = (new_peak - current_equity) / new_peak
             if drawdown * 100 >= DRAWDOWN_THRESHOLD_PCT:
@@ -283,8 +277,8 @@ def run_trend_strategy(last_candle: pd.Series, prev_candle: pd.Series):
     bull_now = last_candle[f"EMA_{EMA_FAST}"] > last_candle[f"EMA_{EMA_SLOW}"]
     bull_prev = prev_candle[f"EMA_{EMA_FAST}"] > prev_candle[f"EMA_{EMA_SLOW}"]
 
-    long_cond  = last_candle[f"RSI_{RSI_LEN}"] > 52 and price > last_candle[f"EMA_{EMA_FAST}"]
-    short_cond = last_candle[f"RSI_{RSI_LEN}"] < 48 and price < last_candle[f"EMA_{EMA_FAST}"]
+    long_cond  = last_candle[f"RSI_{RSI_LEN}"] > 52 and price > last_candle[f"EMA_{FAST}"]
+    short_cond = last_candle[f"RSI_{RSI_LEN}"] < 48 and price < last_candle[f"EMA_{FAST}"]
 
     side = None
     if bull_now and not bull_prev and long_cond:
@@ -317,14 +311,12 @@ async def monitor(app: Application):
     log.info("🚀 Основной цикл запущен: %s %s (%s)", PAIR, TIMEFRAME, STRAT_VERSION)
     while state["monitoring"]:
         try:
-            # --- Пересчет порога ADX раз в час ---
             now_utc = datetime.now(timezone.utc)
             last_recalc_str = state.get("last_adx_recalc_time")
             if last_recalc_str:
-                last_recalc_time = datetime.fromisoformat(last_recalc_str)
-                if now_utc - last_recalc_time > timedelta(minutes=60):
+                if now_utc - datetime.fromisoformat(last_recalc_str) > timedelta(minutes=60):
                     await recalculate_adx_threshold()
-            else: # Первый запуск
+            else:
                 await recalculate_adx_threshold()
 
             ohlcv = await exchange.fetch_ohlcv(PAIR, timeframe=TIMEFRAME, limit=100)
@@ -335,49 +327,50 @@ async def monitor(app: Application):
                 await asyncio.sleep(30); continue
 
             last, prev = df.iloc[-1], df.iloc[-2]
-            price = last["close"]
-
+            
             # ---------------- 1. Управление активной сделкой ----------------
             if trade := state.get("active_trade"):
                 side, sl, tp = trade["side"], trade["sl_price"], trade["tp_price"]
+                candle_high, candle_low = last["high"], last["low"]
 
                 if side == "LONG":
-                    trade["mfe_price"] = max(trade["mfe_price"], price)
-                    trade["mae_price"] = min(trade["mae_price"], price)
+                    trade["mfe_price"] = max(trade["mfe_price"], candle_high)
+                    trade["mae_price"] = min(trade["mae_price"], candle_low)
                 else:
-                    trade["mfe_price"] = min(trade["mfe_price"], price)
-                    trade["mae_price"] = max(trade["mae_price"], price)
+                    trade["mfe_price"] = min(trade["mfe_price"], candle_low)
+                    trade["mae_price"] = max(trade["mae_price"], candle_high)
 
-                done = status = None
-                if side == "LONG" and price >= tp: done, status = "TP_HIT", "WIN"
-                elif side == "LONG" and price <= sl: done, status = "SL_HIT", "LOSS"
-                elif side == "SHORT" and price <= tp: done, status = "TP_HIT", "WIN"
-                elif side == "SHORT" and price >= sl: done, status = "SL_HIT", "LOSS"
+                done = status = exit_price = None
+                if side == "LONG":
+                    if candle_high >= tp: done, status, exit_price = "TP_HIT", "WIN", tp
+                    elif candle_low <= sl: done, status, exit_price = "SL_HIT", "LOSS", sl
+                elif side == "SHORT":
+                    if candle_low <= tp: done, status, exit_price = "TP_HIT", "WIN", tp
+                    elif candle_high >= sl: done, status, exit_price = "SL_HIT", "LOSS", sl
 
                 if done:
                     entry_price = trade["entry_price"]
                     current_deposit = trade["entry_deposit_usd"]
                     
-                    pnl_pct = (price / entry_price - 1) if side == "LONG" else (entry_price / price - 1)
+                    pnl_pct = (exit_price / entry_price - 1) if side == "LONG" else (entry_price / exit_price - 1)
                     
                     gross_pnl_usd = pnl_pct * current_deposit * LEVERAGE
                     fee_usd = current_deposit * LEVERAGE * FEE_PCT
                     net_pnl_usd = gross_pnl_usd - fee_usd
 
-                    trade["gross_pnl_usd"] = round(gross_pnl_usd, 2)
-                    trade["fee_usd"] = round(fee_usd, 2)
-                    trade["net_pnl_usd"] = round(net_pnl_usd, 2)
-                    
-                    state["daily_report_data"].append({
-                        "pnl_usd": net_pnl_usd, 
-                        "entry_usd": current_deposit
+                    trade.update({
+                        "gross_pnl_usd": round(gross_pnl_usd, 2),
+                        "fee_usd": round(fee_usd, 2),
+                        "net_pnl_usd": round(net_pnl_usd, 2),
+                        "status": status,
+                        "exit_price": exit_price
                     })
                     
-                    # Обновляем динамический депозит на основе чистого P&L
+                    state["daily_report_data"].append({
+                        "pnl_usd": net_pnl_usd, "entry_usd": current_deposit
+                    })
+                    
                     update_dynamic_deposit(net_pnl_usd)
-
-                    trade["status"] = status
-                    trade["exit_price"] = price
 
                     pnl_text = f"💰 <b>Net P&L: {trade['net_pnl_usd']:.2f}$</b> (Fee: {trade['fee_usd']:.2f}$)"
                     msg_icon = "✅" if status == "WIN" else "❌"
@@ -385,10 +378,8 @@ async def monitor(app: Application):
                     await notify(app.bot,
                         f"{msg_icon} <b>СДЕЛКА ЗАКРЫТА: {status}</b> {msg_icon}\n\n"
                         f"<b>Стратегия:</b> {trade['strategy_name']}\n"
-                        f"<b>Тип:</b> {side}\n"
-                        f"<b>ID:</b> {trade['id']}\n\n"
-                        f"<b>Вход:</b> {entry_price:.2f}\n"
-                        f"<b>Выход:</b> {price:.2f}\n"
+                        f"<b>Тип:</b> {side}\n<b>ID:</b> {trade['id']}\n\n"
+                        f"<b>Вход:</b> {entry_price:.2f}\n<b>Выход:</b> {exit_price:.2f}\n"
                         f"{pnl_text}"
                     )
                     await log_trade(trade)
@@ -411,10 +402,20 @@ async def monitor(app: Application):
                 if signal_data:
                     side = signal_data["side"]
                     
-                    # Фильтр для шортов
-                    if side == "SHORT":
-                        if not await is_short_allowed():
-                            continue # Игнорируем сигнал
+                    if side == "SHORT" and not await is_short_allowed():
+                        continue
+
+                    # --- Подтверждение цены входа ---
+                    log.info(f"Сигнал {side} получен. Ожидание 2 сек для подтверждения цены...")
+                    await asyncio.sleep(2)
+                    try:
+                        ticker = await exchange.fetch_ticker(PAIR)
+                        entry = ticker['last']
+                        log.info(f"Цена входа подтверждена: {entry}")
+                    except Exception as e:
+                        log.error(f"Не удалось подтвердить цену входа: {e}")
+                        continue
+                    # --------------------------------
 
                     rr_ratio = signal_data["rr_ratio"]
                     strategy_name = signal_data["strategy_name"]
@@ -423,7 +424,6 @@ async def monitor(app: Application):
                     sl_pct = get_sl_pct_by_atr(atr)
                     tp_pct = sl_pct * rr_ratio
 
-                    entry = price
                     sl = entry * (1 - sl_pct/100) if side=="LONG" else entry * (1 + sl_pct/100)
                     tp = entry * (1 + tp_pct/100) if side=="LONG" else entry * (1 - tp_pct/100)
 
@@ -500,7 +500,6 @@ async def daily_reporter(app: Application):
         losses = total_trades - wins
         win_rate = (wins / total_trades) * 100 if total_trades > 0 else 0
         
-        # Расчет ROI на основе фактически использованных в сделках средств
         total_investment = sum(item['entry_usd'] for item in report_data)
         pnl_percent = (total_pnl_usd / total_investment) * 100 if total_investment > 0 else 0
         
