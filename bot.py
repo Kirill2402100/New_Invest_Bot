@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 # ============================================================================
-# Market Chameleon v5.4 • 12 Jul 2025
+# Market Chameleon v5.5 • 12 Jul 2025
 # ============================================================================
 # • АДАПТИВНАЯ СТРАТЕГИЯ: Автоматическое переключение Тренд/Флэт
-# • УЛУЧШЕНИЯ v5.4:
+# • УЛУЧШЕНИЯ v5.5:
+#   - Двойная проверка TP/SL (по текущей и предыдущей свече) для защиты от пропущенных скачков
 #   - Исправлена ошибка 'NameError' в трендовой стратегии
-#   - Более точное исполнение TP/SL (проверка по High/Low свечи)
-#   - Подтверждение цены входа с задержкой в 2 сек. для защиты от "шипов"
+#   - Подтверждение цены входа с задержкой в 2 сек.
 #   - Разделены Gross и Net P&L в логах
 #   - Фильтр шорт-сигналов по дневному тренду/RSI
 #   - Динамический порог ADX
@@ -39,7 +39,7 @@ CHAT_IDS_RAW  = os.getenv("CHAT_IDS", "")
 SHEET_ID      = os.getenv("SHEET_ID")
 PAIR_RAW      = os.getenv("PAIR", "BTC/USDT")
 TIMEFRAME     = os.getenv("TIMEFRAME", "5m")
-STRAT_VERSION = "v5_4_chameleon_pro"
+STRAT_VERSION = "v5_5_chameleon_pro"
 
 # --- Параметры P&L и отчётности ---
 LEVERAGE             = float(os.getenv("LEVERAGE", "500"))
@@ -253,8 +253,9 @@ def update_dynamic_deposit(net_pnl_usd: float):
     new_peak = max(state.get("equity_peak", 0.0), current_equity)
 
     if current_equity >= new_peak:
-        state["entry_usd_current"] = INITIAL_DEPOSIT
-        log.info(f"Кривая эквити достигла нового максимума! Депозит возвращен к {INITIAL_DEPOSIT}$")
+        if state["entry_usd_current"] != INITIAL_DEPOSIT:
+            log.info(f"Кривая эквити достигла нового максимума! Депозит возвращен к {INITIAL_DEPOSIT}$")
+            state["entry_usd_current"] = INITIAL_DEPOSIT
     else:
         if new_peak > 0:
             drawdown = (new_peak - current_equity) / new_peak
@@ -278,7 +279,6 @@ def run_trend_strategy(last_candle: pd.Series, prev_candle: pd.Series):
     bull_now = last_candle[f"EMA_{EMA_FAST}"] > last_candle[f"EMA_{EMA_SLOW}"]
     bull_prev = prev_candle[f"EMA_{EMA_FAST}"] > prev_candle[f"EMA_{EMA_SLOW}"]
 
-    # ИСПРАВЛЕНО: EMA_FAST вместо FAST
     long_cond  = last_candle[f"RSI_{RSI_LEN}"] > 52 and price > last_candle[f"EMA_{EMA_FAST}"]
     short_cond = last_candle[f"RSI_{RSI_LEN}"] < 48 and price < last_candle[f"EMA_{EMA_FAST}"]
 
@@ -333,22 +333,29 @@ async def monitor(app: Application):
             # ---------------- 1. Управление активной сделкой ----------------
             if trade := state.get("active_trade"):
                 side, sl, tp = trade["side"], trade["sl_price"], trade["tp_price"]
-                candle_high, candle_low = last["high"], last["low"]
-
+                
+                # Обновляем MFE/MAE по обеим свечам для точности
                 if side == "LONG":
-                    trade["mfe_price"] = max(trade["mfe_price"], candle_high)
-                    trade["mae_price"] = min(trade["mae_price"], candle_low)
+                    trade["mfe_price"] = max(trade["mfe_price"], prev["high"], last["high"])
+                    trade["mae_price"] = min(trade["mae_price"], prev["low"], last["low"])
                 else:
-                    trade["mfe_price"] = min(trade["mfe_price"], candle_low)
-                    trade["mae_price"] = max(trade["mae_price"], candle_high)
+                    trade["mfe_price"] = min(trade["mfe_price"], prev["low"], last["low"])
+                    trade["mae_price"] = max(trade["mae_price"], prev["high"], last["high"])
 
                 done = status = exit_price = None
-                if side == "LONG":
-                    if candle_high >= tp: done, status, exit_price = "TP_HIT", "WIN", tp
-                    elif candle_low <= sl: done, status, exit_price = "SL_HIT", "LOSS", sl
-                elif side == "SHORT":
-                    if candle_low <= tp: done, status, exit_price = "TP_HIT", "WIN", tp
-                    elif candle_high >= sl: done, status, exit_price = "SL_HIT", "LOSS", sl
+                
+                # --- Двойная проверка TP/SL ---
+                # Сначала проверяем предыдущую (уже закрытую) свечу
+                candles_to_check = [prev, last]
+                for candle in candles_to_check:
+                    candle_high, candle_low = candle["high"], candle["low"]
+                    if side == "LONG":
+                        if candle_high >= tp: done, status, exit_price = "TP_HIT", "WIN", tp; break
+                        elif candle_low <= sl: done, status, exit_price = "SL_HIT", "LOSS", sl; break
+                    elif side == "SHORT":
+                        if candle_low <= tp: done, status, exit_price = "TP_HIT", "WIN", tp; break
+                        elif candle_high >= sl: done, status, exit_price = "SL_HIT", "LOSS", sl; break
+                # -----------------------------
 
                 if done:
                     entry_price = trade["entry_price"]
@@ -407,7 +414,6 @@ async def monitor(app: Application):
                     if side == "SHORT" and not await is_short_allowed():
                         continue
 
-                    # --- Подтверждение цены входа ---
                     log.info(f"Сигнал {side} получен. Ожидание 2 сек для подтверждения цены...")
                     await asyncio.sleep(2)
                     try:
@@ -417,7 +423,6 @@ async def monitor(app: Application):
                     except Exception as e:
                         log.error(f"Не удалось подтвердить цену входа: {e}")
                         continue
-                    # --------------------------------
 
                     rr_ratio = signal_data["rr_ratio"]
                     strategy_name = signal_data["strategy_name"]
