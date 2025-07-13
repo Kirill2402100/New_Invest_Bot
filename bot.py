@@ -1,16 +1,14 @@
 #!/usr/bin/env python3
 # ============================================================================
-# Market Chameleon v5.6 • 13 Jul 2025
+# Market Chameleon v5.7 • 13 Jul 2025
 # ============================================================================
 # • АДАПТИВНАЯ СТРАТЕГИЯ: Автоматическое переключение Тренд/Флэт
-# • УЛУЧШЕНИЯ v5.6:
-#   - Фильтр "Подтверждение тренда": вход в трендовую сделку только после отката к EMA_FAST
-#   - Двойная проверка TP/SL (по текущей и предыдущей свече)
-#   - Подтверждение цены входа с задержкой в 2 сек.
-#   - Разделены Gross и Net P&L в логах
-#   - Фильтр шорт-сигналов по дневному тренду/RSI
-#   - Динамический порог ADX
-#   - "Динамический депозит"
+# • УЛУЧШЕНИЯ v5.7:
+#   - Исправлена логика "Подтверждения тренда": теперь бот корректно ждет отката после пересечения EMA
+#   - Добавлен тайм-аут для отмены устаревших сигналов на откат
+#   - Двойная проверка TP/SL
+#   - Подтверждение цены входа
+#   - Разделены Gross и Net P&L
 # ============================================================================
 
 import os
@@ -39,7 +37,7 @@ CHAT_IDS_RAW  = os.getenv("CHAT_IDS", "")
 SHEET_ID      = os.getenv("SHEET_ID")
 PAIR_RAW      = os.getenv("PAIR", "BTC/USDT")
 TIMEFRAME     = os.getenv("TIMEFRAME", "5m")
-STRAT_VERSION = "v5_6_chameleon_pro"
+STRAT_VERSION = "v5_7_chameleon_pro"
 
 # --- Параметры P&L и отчётности ---
 LEVERAGE             = float(os.getenv("LEVERAGE", "500"))
@@ -53,6 +51,8 @@ DRAWDOWN_THRESHOLD_PCT = float(os.getenv("DRAWDOWN_THRESHOLD_PCT", "20.0"))
 
 # --- Общие параметры стратегий ---
 MIN_VOLUME_BTC = float(os.getenv("MIN_VOLUME_BTC", "1"))
+TREND_PULLBACK_TIMEOUT_CANDLES = int(os.getenv("TREND_PULLBACK_TIMEOUT_CANDLES", "15"))
+
 
 # --- Параметры ТРЕНДОВОЙ стратегии ---
 TREND_RR_RATIO = float(os.getenv("TREND_RR_RATIO", "1.5"))
@@ -131,7 +131,8 @@ state = {
     "equity_curve": [],
     "equity_peak": 0.0,
     "dynamic_adx_threshold": 25.0,
-    "last_adx_recalc_time": None
+    "last_adx_recalc_time": None,
+    "trend_signal_pending": None # Для ожидания отката
 }
 
 if os.path.exists(STATE_FILE):
@@ -274,28 +275,6 @@ def get_market_state(last_candle: pd.Series) -> str:
     else:
         return "FLAT"
 
-def run_trend_strategy(last_candle: pd.Series, prev_candle: pd.Series):
-    price = last_candle["close"]
-    ema_fast_val = last_candle[f"EMA_{EMA_FAST}"]
-    
-    bull_now = ema_fast_val > last_candle[f"EMA_{EMA_SLOW}"]
-    bull_prev = prev_candle[f"EMA_{EMA_FAST}"] > prev_candle[f"EMA_{EMA_SLOW}"]
-
-    side = None
-    # Условие пересечения
-    if bull_now and not bull_prev: # Бычье пересечение
-        # Условие подтверждения (откат к EMA)
-        if price <= ema_fast_val:
-            side = "LONG"
-    elif not bull_now and bull_prev: # Медвежье пересечение
-        # Условие подтверждения (откат к EMA)
-        if price >= ema_fast_val:
-            side = "SHORT"
-    
-    if side:
-        return {"side": side, "rr_ratio": TREND_RR_RATIO, "strategy_name": "Trend_Pullback"}
-    return None
-
 def run_flat_strategy(last_candle: pd.Series):
     price = last_candle["close"]
     rsi = last_candle[f"RSI_{RSI_LEN}"]
@@ -329,7 +308,7 @@ async def monitor(app: Application):
             df = add_indicators(pd.DataFrame(
                 ohlcv, columns=["ts","open","high","low","close","volume"]
             ))
-            if len(df) < 3: # Нужно минимум 3 свечи для проверки last и prev
+            if len(df) < 3:
                 await asyncio.sleep(30); continue
 
             last, prev = df.iloc[-1], df.iloc[-2]
@@ -349,7 +328,7 @@ async def monitor(app: Application):
                 
                 candles_to_check = [prev, last]
                 for candle in candles_to_check:
-                    if done: break # Выходим из цикла, если сделка уже закрыта по prev
+                    if done: break
                     candle_high, candle_low = candle["high"], candle["low"]
                     if side == "LONG":
                         if candle_high >= tp: done, status, exit_price = "TP_HIT", "WIN", tp
@@ -405,9 +384,47 @@ async def monitor(app: Application):
                 signal_data = None
                 
                 if market_state == "TREND":
-                    signal_data = run_trend_strategy(last, prev)
+                    bull_now = last[f"EMA_{EMA_FAST}"] > last[f"EMA_{EMA_SLOW}"]
+                    bull_prev = prev[f"EMA_{EMA_FAST}"] > prev[f"EMA_{EMA_SLOW}"]
+                    
+                    if bull_now and not bull_prev:
+                        log.info("Bullish EMA cross detected. Waiting for pullback.")
+                        timeout_ms = last['ts'] + (TREND_PULLBACK_TIMEOUT_CANDLES * 5 * 60 * 1000)
+                        state["trend_signal_pending"] = {"direction": "bullish", "timeout_ts": timeout_ms}
+                        save_state()
+                    elif not bull_now and bull_prev:
+                        log.info("Bearish EMA cross detected. Waiting for pullback.")
+                        timeout_ms = last['ts'] + (TREND_PULLBACK_TIMEOUT_CANDLES * 5 * 60 * 1000)
+                        state["trend_signal_pending"] = {"direction": "bearish", "timeout_ts": timeout_ms}
+                        save_state()
+
+                    if pending_signal := state.get("trend_signal_pending"):
+                        if last['ts'] > pending_signal['timeout_ts']:
+                            log.info("Pending trend signal timed out.")
+                            state["trend_signal_pending"] = None
+                            save_state()
+                        else:
+                            price = last["close"]
+                            ema_fast_val = last[f"EMA_{EMA_FAST}"]
+                            side = None
+                            
+                            if pending_signal['direction'] == 'bullish' and price <= ema_fast_val:
+                                side = "LONG"
+                            elif pending_signal['direction'] == 'bearish' and price >= ema_fast_val:
+                                side = "SHORT"
+                            
+                            if side:
+                                log.info(f"Pullback confirmed for {side} signal.")
+                                signal_data = {"side": side, "rr_ratio": TREND_RR_RATIO, "strategy_name": "Trend_Pullback"}
+                                state["trend_signal_pending"] = None
+                                save_state()
+
                 elif market_state == "FLAT":
                     signal_data = run_flat_strategy(last)
+                    if state.get("trend_signal_pending"):
+                        log.info("Market entered FLAT state. Canceling pending trend signal.")
+                        state["trend_signal_pending"] = None
+                        save_state()
 
                 if signal_data:
                     side = signal_data["side"]
@@ -544,6 +561,8 @@ async def _stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def _status(update: Update, _):
     msg = f"<b>Статус:</b> {'АКТИВЕН' if state.get('monitoring') else 'ОСТАНОВЛЕН'}\n"
+    if pending := state.get("trend_signal_pending"):
+        msg += f"<b>Ожидание отката:</b> {pending['direction']}\n"
     msg += f"<b>Текущий депозит:</b> {state['entry_usd_current']:.2f}$\n"
     msg += f"<b>Пик эквити:</b> {state['equity_peak']:.2f}$\n"
     msg += f"<b>Текущий порог ADX:</b> {state['dynamic_adx_threshold']:.2f}\n"
