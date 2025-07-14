@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 # ============================================================================
-# Market Chameleon v5.7 • 13 Jul 2025
+# Market Chameleon v5.8 • 14 Jul 2025
 # ============================================================================
 # • АДАПТИВНАЯ СТРАТЕГИЯ: Автоматическое переключение Тренд/Флэт
-# • УЛУЧШЕНИЯ v5.7:
-#   - Исправлена логика "Подтверждения тренда": теперь бот корректно ждет отката после пересечения EMA
-#   - Добавлен тайм-аут для отмены устаревших сигналов на откат
+# • УЛУЧШЕНИЯ v5.8:
+#   - Фильтр "Свеча подтверждения" для трендовой стратегии
 #   - Двойная проверка TP/SL
 #   - Подтверждение цены входа
 #   - Разделены Gross и Net P&L
+#   - Фильтр шорт-сигналов по дневному тренду/RSI
+#   - Динамический порог ADX
+#   - "Динамический депозит"
 # ============================================================================
 
 import os
@@ -37,7 +39,7 @@ CHAT_IDS_RAW  = os.getenv("CHAT_IDS", "")
 SHEET_ID      = os.getenv("SHEET_ID")
 PAIR_RAW      = os.getenv("PAIR", "BTC/USDT")
 TIMEFRAME     = os.getenv("TIMEFRAME", "5m")
-STRAT_VERSION = "v5_7_chameleon_pro"
+STRAT_VERSION = "v5_8_chameleon_pro"
 
 # --- Параметры P&L и отчётности ---
 LEVERAGE             = float(os.getenv("LEVERAGE", "500"))
@@ -132,7 +134,7 @@ state = {
     "equity_peak": 0.0,
     "dynamic_adx_threshold": 25.0,
     "last_adx_recalc_time": None,
-    "trend_signal_pending": None # Для ожидания отката
+    "trend_setup_state": None # {direction, stage, timeout_ts, pullback_candle_ts}
 }
 
 if os.path.exists(STATE_FILE):
@@ -313,7 +315,6 @@ async def monitor(app: Application):
 
             last, prev = df.iloc[-1], df.iloc[-2]
             
-            # ---------------- 1. Управление активной сделкой ----------------
             if trade := state.get("active_trade"):
                 side, sl, tp = trade["side"], trade["sl_price"], trade["tp_price"]
                 
@@ -340,9 +341,7 @@ async def monitor(app: Application):
                 if done:
                     entry_price = trade["entry_price"]
                     current_deposit = trade["entry_deposit_usd"]
-                    
                     pnl_pct = (exit_price / entry_price - 1) if side == "LONG" else (entry_price / exit_price - 1)
-                    
                     gross_pnl_usd = pnl_pct * current_deposit * LEVERAGE
                     fee_usd = current_deposit * LEVERAGE * FEE_PCT
                     net_pnl_usd = gross_pnl_usd - fee_usd
@@ -355,10 +354,7 @@ async def monitor(app: Application):
                         "exit_price": exit_price
                     })
                     
-                    state["daily_report_data"].append({
-                        "pnl_usd": net_pnl_usd, "entry_usd": current_deposit
-                    })
-                    
+                    state["daily_report_data"].append({"pnl_usd": net_pnl_usd, "entry_usd": current_deposit})
                     update_dynamic_deposit(net_pnl_usd)
 
                     pnl_text = f"💰 <b>Net P&L: {trade['net_pnl_usd']:.2f}$</b> (Fee: {trade['fee_usd']:.2f}$)"
@@ -366,16 +362,13 @@ async def monitor(app: Application):
                     
                     await notify(app.bot,
                         f"{msg_icon} <b>СДЕЛКА ЗАКРЫТА: {status}</b> {msg_icon}\n\n"
-                        f"<b>Стратегия:</b> {trade['strategy_name']}\n"
-                        f"<b>Тип:</b> {side}\n<b>ID:</b> {trade['id']}\n\n"
-                        f"<b>Вход:</b> {entry_price:.2f}\n<b>Выход:</b> {exit_price:.2f}\n"
-                        f"{pnl_text}"
+                        f"<b>Стратегия:</b> {trade['strategy_name']}\n<b>Тип:</b> {side}\n<b>ID:</b> {trade['id']}\n\n"
+                        f"<b>Вход:</b> {entry_price:.2f}\n<b>Выход:</b> {exit_price:.2f}\n{pnl_text}"
                     )
                     await log_trade(trade)
                     state["active_trade"] = None
                     save_state()
 
-            # ---------------- 2. Поиск нового сигнала -----------------------
             else:
                 if not last["volume"] >= MIN_VOLUME_BTC:
                     await asyncio.sleep(60); continue
@@ -387,43 +380,49 @@ async def monitor(app: Application):
                     bull_now = last[f"EMA_{EMA_FAST}"] > last[f"EMA_{EMA_SLOW}"]
                     bull_prev = prev[f"EMA_{EMA_FAST}"] > prev[f"EMA_{EMA_SLOW}"]
                     
-                    if bull_now and not bull_prev:
-                        log.info("Bullish EMA cross detected. Waiting for pullback.")
-                        timeout_ms = last['ts'] + (TREND_PULLBACK_TIMEOUT_CANDLES * 5 * 60 * 1000)
-                        state["trend_signal_pending"] = {"direction": "bullish", "timeout_ts": timeout_ms}
-                        save_state()
-                    elif not bull_now and bull_prev:
-                        log.info("Bearish EMA cross detected. Waiting for pullback.")
-                        timeout_ms = last['ts'] + (TREND_PULLBACK_TIMEOUT_CANDLES * 5 * 60 * 1000)
-                        state["trend_signal_pending"] = {"direction": "bearish", "timeout_ts": timeout_ms}
+                    if (bull_now and not bull_prev) or (not bull_now and bull_prev):
+                        direction = "bullish" if bull_now else "bearish"
+                        log.info(f"{direction.capitalize()} EMA cross detected. Stage 1: Waiting for pullback.")
+                        timeout_ts = last['ts'] + (TREND_PULLBACK_TIMEOUT_CANDLES * 5 * 60 * 1000)
+                        state["trend_setup_state"] = {"direction": direction, "stage": "waiting_for_pullback", "timeout_ts": timeout_ts}
                         save_state()
 
-                    if pending_signal := state.get("trend_signal_pending"):
-                        if last['ts'] > pending_signal['timeout_ts']:
-                            log.info("Pending trend signal timed out.")
-                            state["trend_signal_pending"] = None
-                            save_state()
-                        else:
-                            price = last["close"]
+                    if setup := state.get("trend_setup_state"):
+                        if last['ts'] > setup['timeout_ts']:
+                            log.info(f"Pending trend setup for {setup['direction']} timed out.")
+                            state["trend_setup_state"] = None
+                        elif setup['stage'] == 'waiting_for_pullback':
+                            price_low, price_high = last['low'], last['high']
                             ema_fast_val = last[f"EMA_{EMA_FAST}"]
-                            side = None
+                            pullback_detected = (setup['direction'] == 'bullish' and price_low <= ema_fast_val) or \
+                                                (setup['direction'] == 'bearish' and price_high >= ema_fast_val)
                             
-                            if pending_signal['direction'] == 'bullish' and price <= ema_fast_val:
-                                side = "LONG"
-                            elif pending_signal['direction'] == 'bearish' and price >= ema_fast_val:
-                                side = "SHORT"
-                            
-                            if side:
-                                log.info(f"Pullback confirmed for {side} signal.")
-                                signal_data = {"side": side, "rr_ratio": TREND_RR_RATIO, "strategy_name": "Trend_Pullback"}
-                                state["trend_signal_pending"] = None
-                                save_state()
+                            if pullback_detected:
+                                log.info(f"Pullback detected for {setup['direction']} signal. Stage 2: Waiting for confirmation candle.")
+                                setup.update({'stage': 'waiting_for_confirmation', 'pullback_candle_ts': last['ts']})
+                                state["trend_setup_state"] = setup
+                        
+                        elif setup['stage'] == 'waiting_for_confirmation':
+                            if last['ts'] > setup['pullback_candle_ts']:
+                                is_confirmed = (setup['direction'] == 'bullish' and last['close'] > last['open']) or \
+                                               (setup['direction'] == 'bearish' and last['close'] < last['open'])
+                                
+                                if is_confirmed:
+                                    log.info(f"{setup['direction'].capitalize()} confirmation candle detected. Generating signal.")
+                                    signal_data = {"side": "LONG" if setup['direction'] == 'bullish' else "SHORT", 
+                                                   "rr_ratio": TREND_RR_RATIO, 
+                                                   "strategy_name": "Trend_Pullback_Confirmed"}
+                                else:
+                                    log.info("Confirmation candle was not valid. Resetting trend setup.")
+                                
+                                state["trend_setup_state"] = None
+                        save_state()
 
                 elif market_state == "FLAT":
                     signal_data = run_flat_strategy(last)
-                    if state.get("trend_signal_pending"):
-                        log.info("Market entered FLAT state. Canceling pending trend signal.")
-                        state["trend_signal_pending"] = None
+                    if state.get("trend_setup_state"):
+                        log.info("Market entered FLAT state. Canceling pending trend setup.")
+                        state["trend_setup_state"] = None
                         save_state()
 
                 if signal_data:
@@ -444,27 +443,22 @@ async def monitor(app: Application):
 
                     rr_ratio = signal_data["rr_ratio"]
                     strategy_name = signal_data["strategy_name"]
-
                     atr = last[f"ATR_{ATR_LEN}"]
                     sl_pct = get_sl_pct_by_atr(atr)
                     tp_pct = sl_pct * rr_ratio
-
                     sl = entry * (1 - sl_pct/100) if side=="LONG" else entry * (1 + sl_pct/100)
                     tp = entry * (1 + tp_pct/100) if side=="LONG" else entry * (1 - tp_pct/100)
-
                     bb_up, bb_lo = last[f"BBU_{BBANDS_LEN}_2.0"], last[f"BBL_{BBANDS_LEN}_2.0"]
                     bb_pos = "Внутри"
                     if entry > bb_up:   bb_pos = "Выше верхней"
                     elif entry < bb_lo: bb_pos = "Ниже нижней"
-
                     current_deposit = state['entry_usd_current']
 
                     trade = dict(
                         id=uuid.uuid4().hex[:8], side=side, strategy_name=strategy_name,
                         entry_time_utc=datetime.now(timezone.utc).isoformat(),
                         entry_price=entry, tp_price=tp, sl_price=sl,
-                        entry_deposit_usd=current_deposit,
-                        mfe_price=entry, mae_price=entry,
+                        entry_deposit_usd=current_deposit, mfe_price=entry, mae_price=entry,
                         entry_rsi=round(last[f"RSI_{RSI_LEN}"],2),
                         entry_adx=round(last[f"ADX_{ADX_LEN}"],2),
                         dynamic_adx_threshold=round(state["dynamic_adx_threshold"], 2),
@@ -477,10 +471,8 @@ async def monitor(app: Application):
                     await notify(
                         app.bot,
                         f"🔔 <b>НОВЫЙ СИГНАЛ ({strategy_name})</b> 🔔\n\n"
-                        f"<b>Тип:</b> {side} (v: {STRAT_VERSION})\n"
-                        f"<b>ID:</b> {trade['id']}\n\n"
-                        f"<b>Цена входа:</b> {entry:.2f}\n"
-                        f"<b>Take Profit:</b> {tp:.2f} ({tp_pct:.2f}%)\n"
+                        f"<b>Тип:</b> {side} (v: {STRAT_VERSION})\n<b>ID:</b> {trade['id']}\n\n"
+                        f"<b>Цена входа:</b> {entry:.2f}\n<b>Take Profit:</b> {tp:.2f} ({tp_pct:.2f}%)\n"
                         f"<b>Stop Loss:</b> {sl:.2f} ({sl_pct:.2f}%)\n\n"
                         f"<b>Размер депозита:</b> {current_deposit:.2f}$\n"
                         f"<i>Параметры: ADX={trade['entry_adx']} (T: {trade['dynamic_adx_threshold']}), RSI={trade['entry_rsi']}</i>"
@@ -561,8 +553,8 @@ async def _stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def _status(update: Update, _):
     msg = f"<b>Статус:</b> {'АКТИВЕН' if state.get('monitoring') else 'ОСТАНОВЛЕН'}\n"
-    if pending := state.get("trend_signal_pending"):
-        msg += f"<b>Ожидание отката:</b> {pending['direction']}\n"
+    if setup := state.get("trend_setup_state"):
+        msg += f"<b>Ожидание тренда:</b> {setup['direction']}, этап: {setup['stage'].replace('_', ' ')}\n"
     msg += f"<b>Текущий депозит:</b> {state['entry_usd_current']:.2f}$\n"
     msg += f"<b>Пик эквити:</b> {state['equity_peak']:.2f}$\n"
     msg += f"<b>Текущий порог ADX:</b> {state['dynamic_adx_threshold']:.2f}\n"
