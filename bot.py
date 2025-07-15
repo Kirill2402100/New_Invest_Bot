@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 # ============================================================================
-# Flat-Liner v6.1 • 15 Jul 2025
+# Flat-Liner v6.2 • 15 Jul 2025
 # ============================================================================
 # • СТРАТЕГИЯ: Только флэтовая стратегия 'Flat_BB_Fade'
 # • БИРЖА: OKX (Production)
 # • АВТОТРЕЙДИНГ: Полная интеграция с API для размещения ордеров
 # • УПРАВЛЕНИЕ: Команды для настройки депозита, плеча и тестовой торговли
-# • ИСПРАВЛЕНИЕ v6.1: Корректная установка плеча (posSide) для OKX
+# • ИСПРАВЛЕНИЕ v6.2: Принудительная установка режима позиции (long/short)
 # ============================================================================
 
 import os
@@ -32,7 +32,7 @@ BOT_TOKEN     = os.getenv("BOT_TOKEN")
 CHAT_IDS_RAW  = os.getenv("CHAT_IDS", "")
 PAIR_SYMBOL   = os.getenv("PAIR_SYMBOL", "BTC-USDT-SWAP") # Формат OKX
 TIMEFRAME     = os.getenv("TIMEFRAME", "5m")
-STRAT_VERSION = "v6_1_flatliner_okx"
+STRAT_VERSION = "v6_2_flatliner_okx"
 
 # --- OKX API ---
 OKX_API_KEY      = os.getenv("OKX_API_KEY")
@@ -133,12 +133,24 @@ async def initialize_exchange():
         log.critical(f"Критическая ошибка инициализации биржи: {e}")
         return None
 
+async def set_position_mode(exchange):
+    """Принудительно устанавливает режим 'long_short_mode' (хеджирование)."""
+    try:
+        await exchange.set_position_mode(hedged=True)
+        log.info("Режим позиции на бирже успешно установлен: 'long_short_mode' (хеджирование).")
+        return True
+    except Exception as e:
+        # Игнорируем ошибку, если режим уже установлен
+        if '51033' in str(e): # 51033: The position mode is the same as before
+             log.info("Режим позиции уже был установлен в 'long_short_mode'.")
+             return True
+        log.error(f"Ошибка установки режима позиции: {e}")
+        return False
+
 async def set_leverage_on_exchange(exchange, symbol, leverage):
     """Устанавливает кредитное плечо для long и short позиций."""
     try:
-        # Установка плеча для LONG
         await exchange.set_leverage(leverage, symbol, {'mgnMode': 'isolated', 'posSide': 'long'})
-        # Установка плеча для SHORT
         await exchange.set_leverage(leverage, symbol, {'mgnMode': 'isolated', 'posSide': 'short'})
         log.info(f"На бирже установлено плечо {leverage}x для {symbol} (long/short)")
         return True
@@ -207,6 +219,12 @@ async def monitor(app: Application):
     exchange = await initialize_exchange()
     if not exchange:
         await notify_all("Не удалось инициализировать биржу. Бот остановлен.", app.bot)
+        return
+    
+    # Принудительно устанавливаем режим позиции
+    if not await set_position_mode(exchange):
+        await notify_all("Не удалось установить режим позиции (хеджирование). Бот остановлен.", app.bot)
+        await exchange.close()
         return
 
     if not await set_leverage_on_exchange(exchange, PAIR_SYMBOL, state['leverage']):
@@ -343,7 +361,7 @@ async def set_leverage_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             save_state()
             await update.message.reply_text(f"✅ Кредитное плечо установлено: <b>{leverage}x</b>", parse_mode="HTML")
         else:
-            await update.message.reply_text("� Ошибка установки плеча на бирже. Проверьте логи.")
+            await update.message.reply_text("🔴 Ошибка установки плеча на бирже. Проверьте логи.")
 
     except (IndexError, ValueError):
         await update.message.reply_text("⚠️ Неверный формат. Используйте: /set_leverage <значение>")
