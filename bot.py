@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 # ============================================================================
-# Flat-Liner v7.4 • 15 Jul 2025
+# Flat-Liner v7.5 • 15 Jul 2025
 # ============================================================================
 # • СТРАТЕГИЯ: Флэтовая стратегия 'Flat_BB_Fade' с обязательным фильтром по ADX
 # • БИРЖА: OKX (Production)
 # • АВТОТРЕЙДИНГ: Полная интеграция с API для размещения ордеров
 # • УПРАВЛЕНИЕ: Команды для настройки депозита, плеча и тестовой торговли
-# • ИСПРАВЛЕНИЕ v7.4:
-#   - [ГЛАВНЫЙ ФИКС] Исправлено имя метода для pre-check на camelCase
-#     (privatePostTradeOrderPrecheck), как того требует ccxt.
+# • ИСПРАВЛЕНИЕ v7.5:
+#   - [НОВАЯ ФУНКЦИЯ] Добавлена команда /run_precheck_test для изолированной
+#     проверки эндпоинта pre-check прямо из Telegram.
 # ============================================================================
 
 import os
@@ -36,7 +36,7 @@ BOT_TOKEN     = os.getenv("BOT_TOKEN")
 CHAT_IDS_RAW  = os.getenv("CHAT_IDS", "")
 PAIR_SYMBOL   = os.getenv("PAIR_SYMBOL", "BTC-USDT-SWAP") # Формат OKX
 TIMEFRAME     = os.getenv("TIMEFRAME", "5m")
-STRAT_VERSION = "v7_4_flatliner_okx"
+STRAT_VERSION = "v7_5_flatliner_okx"
 SHEET_ID      = os.getenv("SHEET_ID")
 
 
@@ -159,7 +159,7 @@ async def initialize_exchange():
             'options': {'defaultType': 'swap'},
         })
         exchange.set_sandbox_mode(OKX_DEMO_MODE == '1')
-        await exchange.load_markets() # Загружаем данные о рынках
+        await exchange.load_markets()
         log.info(f"Биржа OKX инициализирована. Демо-режим: {'ВКЛЮЧЕН' if OKX_DEMO_MODE == '1' else 'ВЫКЛЮЧЕН'}.")
         return exchange
     except Exception as e:
@@ -215,7 +215,6 @@ async def execute_trade(exchange, signal: dict):
         }
         log.info(f"Выполнение предварительной проверки ордера: {pre_check_params}")
 
-        # [ГЛАВНЫЙ ФИКС] Исправлено имя метода на camelCase, как того требует ccxt
         pre_check_result = await exchange.privatePostTradeOrderPrecheck([pre_check_params])
         
         if pre_check_result.get('code') != '0' or (pre_check_result.get('data') and pre_check_result['data'][0].get('sCode') != '0'):
@@ -302,7 +301,7 @@ async def process_closed_trade(exchange, trade_details, bot):
 
     except Exception as e:
         log.error(f"Ошибка обработки закрытой сделки {trade_details['id']}: {e}")
-        await notify_all(f"� Ошибка обработки закрытой сделки {trade_details['id']}. Проверьте логи.", bot)
+        await notify_all(f"🔴 Ошибка обработки закрытой сделки {trade_details['id']}. Проверьте логи.", bot)
 
 async def recalculate_adx_threshold():
     try:
@@ -379,7 +378,6 @@ async def monitor(app: Application):
                 adx = last[f"ADX_{ADX_LEN}"]
                 
                 if adx >= state['dynamic_adx_threshold']:
-                    log.info(f"Рынок в тренде (ADX={adx:.2f} >= {state['dynamic_adx_threshold']:.2f}). Пропускаем поиск сигнала.")
                     await asyncio.sleep(60)
                     continue
 
@@ -465,7 +463,7 @@ async def daily_reporter(app: Application):
         pnl_percent = (total_pnl_usd / total_investment) * 100 if total_investment > 0 else 0
         
         report_msg = (
-            f"📊 <b>Суточный отчёт по стратегии {STRAT_VERSION}</b> 📊\n\n"
+            f"📊 <b>Суточный отчёт по стратегии {STRAT_VERSION}</b> �\n\n"
             f"<b>Период:</b> последние 24 часа\n"
             f"<b>Всего сделок:</b> {total_trades} (📈{wins} / 📉{losses})\n"
             f"<b>Винрейт:</b> {win_rate:.2f}%\n\n"
@@ -595,6 +593,39 @@ async def test_trade_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"⚠️ Ошибка формата команды.\n<b>Пример:</b> /test_trade deposit=30 leverage=80 tp=120000 sl=100000 side=LONG",
                                         parse_mode="HTML")
 
+# [НОВАЯ ФУНКЦИЯ] Команда для изолированной проверки pre-check
+async def run_precheck_test_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("⚙️ <b>Запускаю тест pre-check...</b>", parse_mode="HTML")
+    exchange = None
+    try:
+        exchange = await initialize_exchange()
+        if not exchange:
+            await update.message.reply_text("🔴 Ошибка: не удалось подключиться к бирже для теста."); return
+
+        test_params = {
+            'instId': PAIR_SYMBOL, 'tdMode': 'isolated', 'side': 'buy',
+            'posSide': 'long', 'ordType': 'market', 'sz': '1'
+        }
+        
+        await update.message.reply_text(f"<b>Параметры для теста:</b>\n<pre>{json.dumps(test_params, indent=2)}</pre>", parse_mode="HTML")
+        
+        pre_check_result = await exchange.privatePostTradeOrderPrecheck([test_params])
+
+        result_text = f"<b>Результат от API:</b>\n<pre>{json.dumps(pre_check_result, indent=2)}</pre>"
+        
+        if pre_check_result.get('code') == '0' and pre_check_result['data'][0].get('sCode') == '0':
+            await update.message.reply_text(f"✅ <b>УСПЕХ!</b>\nПредварительная проверка пройдена.\n\n{result_text}", parse_mode="HTML")
+        else:
+            error_msg = pre_check_result['data'][0]['sMsg']
+            await update.message.reply_text(f"❌ <b>ОШИБКА API!</b>\nПричина: {error_msg}\n\n{result_text}", parse_mode="HTML")
+
+    except Exception as e:
+        log.error(f"Критическая ошибка в /run_precheck_test: {e}")
+        await update.message.reply_text(f"🔴 <b>Критическая ошибка Python:</b>\n<code>{e}</code>", parse_mode="HTML")
+    finally:
+        if exchange:
+            await exchange.close()
+
 # ── ЗАПУСК БОТА ──────────────────────────────────────────────────────────────
 async def post_init(app: Application):
     load_state()
@@ -613,12 +644,16 @@ if __name__ == "__main__":
            .post_init(post_init)
            .build())
 
+    # --- Основные команды ---
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("stop", stop_command))
     app.add_handler(CommandHandler("status", status_command))
     app.add_handler(CommandHandler("set_deposit", set_deposit_command))
     app.add_handler(CommandHandler("set_leverage", set_leverage_command))
     app.add_handler(CommandHandler("test_trade", test_trade_command))
+    
+    # --- Новая тестовая команда ---
+    app.add_handler(CommandHandler("run_precheck_test", run_precheck_test_command))
     
     log.info("Запуск бота...")
     app.run_polling()
