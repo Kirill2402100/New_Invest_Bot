@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 # ============================================================================
-# Flat-Liner v6.2 • 15 Jul 2025
+# Flat-Liner v6.3 • 15 Jul 2025
 # ============================================================================
 # • СТРАТЕГИЯ: Только флэтовая стратегия 'Flat_BB_Fade'
 # • БИРЖА: OKX (Production)
 # • АВТОТРЕЙДИНГ: Полная интеграция с API для размещения ордеров
 # • УПРАВЛЕНИЕ: Команды для настройки депозита, плеча и тестовой торговли
-# • ИСПРАВЛЕНИЕ v6.2: Принудительная установка режима позиции (long/short)
+# • ИСПРАВЛЕНИЕ v6.3: Детальное логирование ошибок размещения ордера
 # ============================================================================
 
 import os
@@ -32,7 +32,7 @@ BOT_TOKEN     = os.getenv("BOT_TOKEN")
 CHAT_IDS_RAW  = os.getenv("CHAT_IDS", "")
 PAIR_SYMBOL   = os.getenv("PAIR_SYMBOL", "BTC-USDT-SWAP") # Формат OKX
 TIMEFRAME     = os.getenv("TIMEFRAME", "5m")
-STRAT_VERSION = "v6_2_flatliner_okx"
+STRAT_VERSION = "v6_3_flatliner_okx"
 
 # --- OKX API ---
 OKX_API_KEY      = os.getenv("OKX_API_KEY")
@@ -140,8 +140,7 @@ async def set_position_mode(exchange):
         log.info("Режим позиции на бирже успешно установлен: 'long_short_mode' (хеджирование).")
         return True
     except Exception as e:
-        # Игнорируем ошибку, если режим уже установлен
-        if '51033' in str(e): # 51033: The position mode is the same as before
+        if '51033' in str(e):
              log.info("Режим позиции уже был установлен в 'long_short_mode'.")
              return True
         log.error(f"Ошибка установки режима позиции: {e}")
@@ -168,16 +167,24 @@ async def execute_trade(exchange, signal: dict):
     leverage = signal['leverage']
 
     try:
-        markets = await exchange.load_markets()
-        market = markets[PAIR_SYMBOL]
-        contract_val = float(market['contractVal'])
+        await exchange.load_markets()
+        market = exchange.market(PAIR_SYMBOL)
+        
+        contract_val = float(market.get('contractVal', 1))
+        min_order_size = float(market['limits']['amount']['min'])
         
         position_value_usd = deposit * leverage
         amount_in_base_currency = position_value_usd / entry_price
         order_size_contracts = round(amount_in_base_currency / contract_val)
 
-        if order_size_contracts == 0:
-            log.warning("Рассчитанный размер ордера равен 0. Сделка отменена.")
+        log.info(f"Расчет размера ордера: Депозит={deposit}$, Плечо={leverage}x, Цена={entry_price}$")
+        log.info(f"Стоимость позиции={position_value_usd}$, Объем в BTC={amount_in_base_currency:.6f}")
+        log.info(f"Стоимость контракта={contract_val}, Мин. размер ордера={min_order_size} контрактов")
+        log.info(f"Рассчитанный размер ордера: {order_size_contracts} контрактов.")
+
+        if order_size_contracts < min_order_size:
+            log.warning(f"Ошибка: рассчитанный размер ордера ({order_size_contracts}) меньше минимально допустимого ({min_order_size}). Сделка отменена.")
+            await notify_all(f"🔴 ОШИБКА РАЗМЕЩЕНИЯ ОРДЕРА\n\nРассчитанный размер ({order_size_contracts}) меньше минимального ({min_order_size}).")
             return None
 
         params = {
@@ -189,7 +196,7 @@ async def execute_trade(exchange, signal: dict):
             ]
         }
         
-        log.info(f"Попытка разместить ордер: {side} {order_size_contracts} контрактов {PAIR_SYMBOL} по рынку. SL={sl_price}, TP={tp_price}")
+        log.info(f"Попытка разместить ордер: {side} {order_size_contracts} контрактов {PAIR_SYMBOL} по рынку.")
         
         order = await exchange.create_order(
             symbol=PAIR_SYMBOL, type='market',
@@ -202,7 +209,7 @@ async def execute_trade(exchange, signal: dict):
 
     except Exception as e:
         log.error(f"Ошибка размещения ордера: {e}")
-        await notify_all(f"🔴 ОШИБКА РАЗМЕЩЕНИЯ ОРДЕРА\n\nИнструмент: {PAIR_SYMBOL}\nТип: {side}\nОшибка: {e}")
+        await notify_all(f"🔴 ОШИБКА РАЗМЕЩЕНИЯ ОРДЕРА\n\n<b>Инструмент:</b> {PAIR_SYMBOL}\n<b>Тип:</b> {side}\n<b>Ошибка:</b> <code>{e}</code>", parse_mode="HTML")
         return None
 
 # ── УВЕДОМЛЕНИЯ ───────────────────────────────────────────────
@@ -221,7 +228,6 @@ async def monitor(app: Application):
         await notify_all("Не удалось инициализировать биржу. Бот остановлен.", app.bot)
         return
     
-    # Принудительно устанавливаем режим позиции
     if not await set_position_mode(exchange):
         await notify_all("Не удалось установить режим позиции (хеджирование). Бот остановлен.", app.bot)
         await exchange.close()
@@ -350,7 +356,7 @@ async def set_leverage_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         
         exchange = await initialize_exchange()
         if not exchange:
-            await update.message.reply_text("🔴 Ошибка: не удалось подключиться к бирже.")
+            await update.message.reply_text("� Ошибка: не удалось подключиться к бирже.")
             return
             
         success = await set_leverage_on_exchange(exchange, PAIR_SYMBOL, leverage)
