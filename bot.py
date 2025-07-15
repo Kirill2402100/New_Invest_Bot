@@ -1,15 +1,14 @@
 #!/usr/bin/env python3
 # ============================================================================
-# Flat-Liner v7.6 • 15 Jul 2025
+# Flat-Liner v7.7 • 16 Jul 2025
 # ============================================================================
 # • СТРАТЕГИЯ: Флэтовая стратегия 'Flat_BB_Fade' с обязательным фильтром по ADX
 # • БИРЖА: OKX (Production)
 # • АВТОТРЕЙДИНГ: Полная интеграция с API для размещения ордеров
 # • УПРАВЛЕНИЕ: Команды для настройки депозита, плеча и тестовой торговли
-# • ИСПРАВЛЕНИЕ v7.6:
-#   - Возвращено имя метода в snake_case (private_post_trade_order_precheck).
-#   - Убран список [] из параметров pre-check, как того требует API.
-#   - Добавлена проверка hasattr() для защиты от падений.
+# • ИСПРАВЛЕНИЕ v7.7:
+#   - [РАБОЧЕЕ РЕШЕНИЕ] Полностью удален вызов pre-check, чтобы обойти
+#     проблемы со сборкой на хостинге. Ордер отправляется напрямую.
 # ============================================================================
 
 import os
@@ -37,7 +36,7 @@ BOT_TOKEN     = os.getenv("BOT_TOKEN")
 CHAT_IDS_RAW  = os.getenv("CHAT_IDS", "")
 PAIR_SYMBOL   = os.getenv("PAIR_SYMBOL", "BTC-USDT-SWAP") # Формат OKX
 TIMEFRAME     = os.getenv("TIMEFRAME", "5m")
-STRAT_VERSION = "v7_6_flatliner_okx"
+STRAT_VERSION = "v7_7_flatliner_okx"
 SHEET_ID      = os.getenv("SHEET_ID")
 
 
@@ -169,7 +168,6 @@ async def initialize_exchange():
 
 async def set_position_mode(exchange):
     try:
-        # Для новых версий ccxt символ может передаваться в params
         await exchange.set_position_mode(hedged=True, params={"symbol": PAIR_SYMBOL})
         log.info("Режим позиции на бирже успешно установлен: 'long_short_mode' (хеджирование).")
         return True
@@ -211,27 +209,9 @@ async def execute_trade(exchange, signal: dict):
             await notify_all(f"🔴 ОШИБКА РАСЧЕТА\n\nРассчитанный размер ({order_size_contracts}) меньше минимального ({min_order_size}).")
             return None
 
-        pre_check_params = {
-            'instId': PAIR_SYMBOL, 'tdMode': 'isolated', 'side': 'buy' if side == 'LONG' else 'sell',
-            'posSide': 'long' if side == 'LONG' else 'short', 'ordType': 'market', 'sz': str(order_size_contracts)
-        }
-        log.info(f"Выполнение предварительной проверки ордера: {pre_check_params}")
-        
-        # [ФИНАЛЬНЫЙ ФИКС] Проверяем наличие метода и вызываем его без списка
-        if hasattr(exchange, 'private_post_trade_order_precheck'):
-            pre_check_result = await exchange.private_post_trade_order_precheck(pre_check_params)
-        else:
-            log.warning("Метод 'private_post_trade_order_precheck' не найден. Пропускаю проверку.")
-            # Если метода нет, можно либо пропустить проверку, либо упасть с ошибкой.
-            # Для стабильности - пропускаем.
-            pre_check_result = {'code': '0', 'data': [{'sCode': '0'}]}
-
-        if pre_check_result.get('code') != '0' or (pre_check_result.get('data') and pre_check_result['data'][0].get('sCode') != '0'):
-             error_msg = pre_check_result['data'][0]['sMsg'] if pre_check_result.get('data') and pre_check_result['data'][0].get('sMsg') else pre_check_result.get('msg', 'Неизвестная ошибка pre-check')
-             log.error(f"Предварительная проверка не пройдена: {error_msg}")
-             await notify_all(f"🔴 <b>ПРЕДВАРИТЕЛЬНАЯ ПРОВЕРКА НЕ ПРОЙДЕНА</b>\n\n<b>Причина:</b> {error_msg}")
-             return None
-        log.info("Предварительная проверка пройдена успешно.")
+        # [РАБОЧЕЕ РЕШЕНИЕ] Шаг предварительной проверки полностью удален,
+        # чтобы обойти проблемы со сборкой на хостинге.
+        log.info("Шаг предварительной проверки (pre-check) пропущен. Отправка ордера напрямую...")
 
         params = {
             'tdMode': 'isolated', 'posSide': 'long' if side == 'LONG' else 'short',
@@ -602,47 +582,6 @@ async def test_trade_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"⚠️ Ошибка формата команды.\n<b>Пример:</b> /test_trade deposit=30 leverage=80 tp=120000 sl=100000 side=LONG",
                                         parse_mode="HTML")
 
-# [ФИНАЛЬНЫЙ ФИКС] Обновленная тестовая команда
-async def run_precheck_test_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("⚙️ <b>Запускаю тест pre-check...</b>", parse_mode="HTML")
-    exchange = None
-    try:
-        exchange = await initialize_exchange()
-        if not exchange:
-            await update.message.reply_text("🔴 Ошибка: не удалось подключиться к бирже для теста."); return
-
-        await update.message.reply_text(f"Версия CCXT: <code>{ccxt.__version__}</code>", parse_mode="HTML")
-
-        test_params = {
-            'instId': PAIR_SYMBOL, 'tdMode': 'isolated', 'side': 'buy',
-            'posSide': 'long', 'ordType': 'market', 'sz': '1'
-        }
-        
-        await update.message.reply_text(f"<b>Параметры для теста:</b>\n<pre>{json.dumps(test_params, indent=2)}</pre>", parse_mode="HTML")
-        
-        # Проверяем наличие метода перед вызовом
-        if hasattr(exchange, 'private_post_trade_order_precheck'):
-            await update.message.reply_text("✅ Метод <code>private_post_trade_order_precheck</code> найден. Вызываю...", parse_mode="HTML")
-            pre_check_result = await exchange.private_post_trade_order_precheck(test_params) # Убран список
-        else:
-            await update.message.reply_text("❌ Метод <code>private_post_trade_order_precheck</code> НЕ НАЙДЕН в этой версии CCXT.", parse_mode="HTML")
-            return
-
-        result_text = f"<b>Результат от API:</b>\n<pre>{json.dumps(pre_check_result, indent=2)}</pre>"
-        
-        if pre_check_result.get('code') == '0' and pre_check_result['data'][0].get('sCode') == '0':
-            await update.message.reply_text(f"✅ <b>УСПЕХ!</b>\nПредварительная проверка пройдена.\n\n{result_text}", parse_mode="HTML")
-        else:
-            error_msg = pre_check_result['data'][0]['sMsg']
-            await update.message.reply_text(f"❌ <b>ОШИБКА API!</b>\nПричина: {error_msg}\n\n{result_text}", parse_mode="HTML")
-
-    except Exception as e:
-        log.error(f"Критическая ошибка в /run_precheck_test: {e}")
-        await update.message.reply_text(f"🔴 <b>Критическая ошибка Python:</b>\n<code>{e}</code>", parse_mode="HTML")
-    finally:
-        if exchange:
-            await exchange.close()
-
 # ── ЗАПУСК БОТА ──────────────────────────────────────────────────────────────
 async def post_init(app: Application):
     load_state()
@@ -668,9 +607,6 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("set_deposit", set_deposit_command))
     app.add_handler(CommandHandler("set_leverage", set_leverage_command))
     app.add_handler(CommandHandler("test_trade", test_trade_command))
-    
-    # --- Тестовая команда ---
-    app.add_handler(CommandHandler("run_precheck_test", run_precheck_test_command))
     
     log.info("Запуск бота...")
     app.run_polling()
