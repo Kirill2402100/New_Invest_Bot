@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 # ============================================================================
-# Flat-Liner v6.4 • 15 Jul 2025
+# Flat-Liner v6.7 • 15 Jul 2025
 # ============================================================================
 # • СТРАТЕГИЯ: Только флэтовая стратегия 'Flat_BB_Fade'
 # • БИРЖА: OKX (Production)
 # • АВТОТРЕЙДИНГ: Полная интеграция с API для размещения ордеров
 # • УПРАВЛЕНИЕ: Команды для настройки депозита, плеча и тестовой торговли
-# • ИСПРАВЛЕНИЕ v6.4: Корректное получение данных о контракте (ctVal, minSz)
+# • ИСПРАВЛЕНИЕ v6.7: Добавлена полноценная обработка и отчетность по закрытым сделкам
 # ============================================================================
 
 import os
@@ -21,6 +21,8 @@ import numpy as np
 import pandas as pd
 import ccxt.async_support as ccxt
 import pandas_ta as ta
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
 from telegram import Bot, Update
 from telegram.ext import (
     Application, ApplicationBuilder, CommandHandler, ContextTypes
@@ -32,7 +34,9 @@ BOT_TOKEN     = os.getenv("BOT_TOKEN")
 CHAT_IDS_RAW  = os.getenv("CHAT_IDS", "")
 PAIR_SYMBOL   = os.getenv("PAIR_SYMBOL", "BTC-USDT-SWAP") # Формат OKX
 TIMEFRAME     = os.getenv("TIMEFRAME", "5m")
-STRAT_VERSION = "v6_4_flatliner_okx"
+STRAT_VERSION = "v6_7_flatliner_okx"
+SHEET_ID      = os.getenv("SHEET_ID")
+
 
 # --- OKX API ---
 OKX_API_KEY      = os.getenv("OKX_API_KEY")
@@ -65,11 +69,49 @@ if not all([BOT_TOKEN, CHAT_IDS_RAW, OKX_API_KEY, OKX_API_SECRET, OKX_API_PASSPH
 
 CHAT_IDS = {int(cid) for cid in CHAT_IDS_RAW.split(",") if cid.strip()}
 
+# ── GOOGLE SHEETS ────────────────────────────────────────────────────────────
+TRADE_LOG_WS = None
+def setup_google_sheets() -> None:
+    global TRADE_LOG_WS
+    if not SHEET_ID or not os.getenv("GOOGLE_CREDENTIALS"):
+        log.warning("ID таблицы или учетные данные Google не установлены. Логирование в Google Sheets отключено.")
+        return
+    try:
+        creds = ServiceAccountCredentials.from_json_keyfile_dict(
+            json.loads(os.getenv("GOOGLE_CREDENTIALS")),
+            ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+        )
+        gs = gspread.authorize(creds)
+        ss = gs.open_by_key(SHEET_ID)
+
+        headers = [
+            "Signal_ID", "Version", "Strategy_Used", "Status", "Side",
+            "Entry_Time_UTC", "Exit_Time_UTC",
+            "Entry_Price", "Exit_Price", "SL_Price", "TP_Price",
+            "Gross_P&L_USD", "Fee_USD", "Net_P&L_USD", "Entry_Deposit_USD"
+        ]
+
+        ws_name = f"OKX_Trades_{PAIR_SYMBOL.replace('-','')}"
+        try:
+            ws = ss.worksheet(ws_name)
+        except gspread.WorksheetNotFound:
+            ws = ss.add_worksheet(ws_name, rows="1000", cols=len(headers))
+
+        if ws.row_values(1) != headers:
+            ws.clear(); ws.update("A1", [headers])
+            ws.format(f"A1:{chr(ord('A')+len(headers)-1)}1", {"textFormat": {"bold": True}})
+
+        TRADE_LOG_WS = ws
+        log.info(f"Логирование в Google Sheet включено ➜ {ws_name}")
+    except Exception as e:
+        log.error(f"Ошибка инициализации Google Sheets: {e}")
+        TRADE_LOG_WS = None
+
 # ── УПРАВЛЕНИЕ СОСТОЯНИЕМ ───────────────────────────────────────────────────
 STATE_FILE = f"state_{STRAT_VERSION}_{PAIR_SYMBOL.replace('-','')}.json"
 state = {
     "monitoring": False,
-    "active_trade_id": None,
+    "active_trade": None, # Будет хранить словарь с деталями сделки
     "leverage": DEFAULT_LEVERAGE,
     "deposit_usd": DEFAULT_DEPOSIT_USD
 }
@@ -96,9 +138,7 @@ def load_state():
         log.info("Файл состояния не найден, создан новый.")
 
 # ── ИНДИКАТОРЫ ───────────────────────────────────────────────────
-RSI_LEN = 14
-BBANDS_LEN = 20
-ATR_LEN = 14
+RSI_LEN, BBANDS_LEN, ATR_LEN = 14, 20, 14
 
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df.ta.rsi(length=RSI_LEN, append=True, col_names=(f"RSI_{RSI_LEN}",))
@@ -116,15 +156,10 @@ def get_sl_pct_by_atr(atr: float) -> float:
 
 # ── ВЗАИМОДЕЙСТВИЕ С БИРЖЕЙ (OKX) ──────────────────────────────────────────
 async def initialize_exchange():
-    """Инициализирует и настраивает объект биржи OKX."""
     try:
         exchange = ccxt.okx({
-            'apiKey': OKX_API_KEY,
-            'secret': OKX_API_SECRET,
-            'password': OKX_API_PASSPHRASE,
-            'options': {
-                'defaultType': 'swap',
-            },
+            'apiKey': OKX_API_KEY, 'secret': OKX_API_SECRET, 'password': OKX_API_PASSPHRASE,
+            'options': {'defaultType': 'swap'},
         })
         exchange.set_sandbox_mode(OKX_DEMO_MODE == '1')
         log.info(f"Биржа OKX инициализирована. Демо-режим: {'ВКЛЮЧЕН' if OKX_DEMO_MODE == '1' else 'ВЫКЛЮЧЕН'}.")
@@ -134,9 +169,8 @@ async def initialize_exchange():
         return None
 
 async def set_position_mode(exchange):
-    """Принудительно устанавливает режим 'long_short_mode' (хеджирование)."""
     try:
-        await exchange.set_position_mode(hedged=True)
+        await exchange.set_position_mode(hedged=True, symbol=PAIR_SYMBOL)
         log.info("Режим позиции на бирже успешно установлен: 'long_short_mode' (хеджирование).")
         return True
     except Exception as e:
@@ -147,7 +181,6 @@ async def set_position_mode(exchange):
         return False
 
 async def set_leverage_on_exchange(exchange, symbol, leverage):
-    """Устанавливает кредитное плечо для long и short позиций."""
     try:
         await exchange.set_leverage(leverage, symbol, {'mgnMode': 'isolated', 'posSide': 'long'})
         await exchange.set_leverage(leverage, symbol, {'mgnMode': 'isolated', 'posSide': 'short'})
@@ -158,50 +191,40 @@ async def set_leverage_on_exchange(exchange, symbol, leverage):
         return False
 
 async def execute_trade(exchange, signal: dict):
-    """Размещает ордер на бирже OKX с прикрепленными TP/SL."""
     side = signal['side']
+    deposit = signal['deposit_usd']
+    leverage = signal['leverage']
     entry_price = signal['entry_price']
     sl_price = signal['sl_price']
     tp_price = signal['tp_price']
-    deposit = signal['deposit_usd']
-    leverage = signal['leverage']
 
     try:
-        await exchange.load_markets()
-        market = exchange.market(PAIR_SYMBOL)
-        
-        # ИСПРАВЛЕНИЕ: Получаем данные из 'info' для надежности
-        contract_val = float(market['info']['ctVal'])
-        min_order_size = float(market['info']['minSz'])
+        balance = await exchange.fetch_balance()
+        available_balance = balance.get('USDT', {}).get('free', 0)
+        log.info(f"Проверка баланса: Доступно {available_balance:.2f} USDT, Требуется {deposit:.2f} USDT")
+        if available_balance < deposit:
+            await notify_all(f"🔴 <b>ОШИБКА: НЕДОСТАТОЧНО СРЕДСТВ</b>\n<b>Доступно:</b> {available_balance:.2f} USDT | <b>Требуется:</b> {deposit:.2f} USDT")
+            return None
+
+        contract_val = 0.0001
+        min_order_size = 1.0
         
         position_value_usd = deposit * leverage
         amount_in_base_currency = position_value_usd / entry_price
         order_size_contracts = round(amount_in_base_currency / contract_val)
 
-        log.info(f"Расчет размера ордера: Депозит={deposit}$, Плечо={leverage}x, Цена={entry_price}$")
-        log.info(f"Стоимость позиции={position_value_usd}$, Объем в BTC={amount_in_base_currency:.6f}")
-        log.info(f"Стоимость контракта={contract_val}, Мин. размер ордера={min_order_size} контрактов")
-        log.info(f"Рассчитанный размер ордера: {order_size_contracts} контрактов.")
-
         if order_size_contracts < min_order_size:
-            log.warning(f"Ошибка: рассчитанный размер ордера ({order_size_contracts}) меньше минимально допустимого ({min_order_size}). Сделка отменена.")
             await notify_all(f"🔴 ОШИБКА РАЗМЕЩЕНИЯ ОРДЕРА\n\nРассчитанный размер ({order_size_contracts}) меньше минимального ({min_order_size}).")
             return None
 
         params = {
-            'tdMode': 'isolated',
-            'posSide': 'long' if side == 'LONG' else 'short',
-            'attachAlgoOrds': [
-                {'slTriggerPx': str(sl_price), 'slOrdPx': '-1'},
-                {'tpTriggerPx': str(tp_price), 'tpOrdPx': '-1'}
-            ]
+            'tdMode': 'isolated', 'posSide': 'long' if side == 'LONG' else 'short',
+            'attachAlgoOrds': [{'slTriggerPx': str(sl_price), 'slOrdPx': '-1'}, {'tpTriggerPx': str(tp_price), 'tpOrdPx': '-1'}]
         }
         
         log.info(f"Попытка разместить ордер: {side} {order_size_contracts} контрактов {PAIR_SYMBOL} по рынку.")
-        
         order = await exchange.create_order(
-            symbol=PAIR_SYMBOL, type='market',
-            side='buy' if side == 'LONG' else 'sell',
+            symbol=PAIR_SYMBOL, type='market', side='buy' if side == 'LONG' else 'sell',
             amount=order_size_contracts, params=params
         )
         
@@ -210,8 +233,67 @@ async def execute_trade(exchange, signal: dict):
 
     except Exception as e:
         log.error(f"Ошибка размещения ордера: {e}")
-        await notify_all(f"🔴 ОШИБКА РАЗМЕЩЕНИЯ ОРДЕРА\n\n<b>Инструмент:</b> {PAIR_SYMBOL}\n<b>Тип:</b> {side}\n<b>Ошибка:</b> <code>{e}</code>", parse_mode="HTML")
+        await notify_all(f"🔴 ОШИБКА РАЗМЕЩЕНИЯ ОРДЕРА\n\n<b>Инструмент:</b> {PAIR_SYMBOL}\n<b>Тип:</b> {side}\n<b>Ошибка:</b> <code>{e}</code>")
         return None
+
+async def process_closed_trade(exchange, trade_details, bot):
+    """Обрабатывает закрытую сделку, рассчитывает P&L и отправляет отчет."""
+    try:
+        log.info(f"Обработка закрытой сделки. ID ордера: {trade_details['id']}")
+        order_id = trade_details['id']
+        
+        # Запрашиваем историю ордера, чтобы получить детали исполнения
+        closed_order = await exchange.fetch_order(order_id, PAIR_SYMBOL)
+        
+        exit_price = float(closed_order.get('average', trade_details['sl_price'])) # Используем SL/TP как запасной вариант
+        fee = float(closed_order.get('fee', {}).get('cost', 0))
+        realized_pnl = float(closed_order['info'].get('pnl', 0)) # P&L, который сообщает биржа
+        
+        # Если биржа не вернула PnL, считаем его сами (менее точно)
+        if realized_pnl == 0:
+            pnl_pct = (exit_price / trade_details['entry_price'] - 1) if trade_details['side'] == "LONG" else (trade_details['entry_price'] / exit_price - 1)
+            gross_pnl = pnl_pct * trade_details['deposit_usd'] * trade_details['leverage']
+        else:
+            gross_pnl = realized_pnl
+
+        net_pnl = gross_pnl - fee
+        status = "WIN" if net_pnl > 0 else "LOSS"
+
+        report = {
+            "id": order_id, "strategy_name": "Flat_BB_Fade", "status": status,
+            "side": trade_details['side'], "entry_time_utc": trade_details['entry_time_utc'],
+            "entry_price": trade_details['entry_price'], "exit_price": exit_price,
+            "sl_price": trade_details['sl_price'], "tp_price": trade_details['tp_price'],
+            "gross_pnl_usd": round(gross_pnl, 2), "fee_usd": round(fee, 2),
+            "net_pnl_usd": round(net_pnl, 2), "entry_deposit_usd": trade_details['deposit_usd']
+        }
+
+        pnl_text = f"💰 <b>Net P&L: {report['net_pnl_usd']:.2f}$</b> (Fee: {report['fee_usd']:.2f}$)"
+        msg_icon = "✅" if status == "WIN" else "❌"
+        
+        await notify_all(
+            f"{msg_icon} <b>СДЕЛКА ЗАКРЫТА</b> {msg_icon}\n\n"
+            f"<b>ID:</b> {report['id']}\n"
+            f"<b>Тип:</b> {report['side']}\n"
+            f"<b>Вход:</b> {report['entry_price']:.2f}\n"
+            f"<b>Выход:</b> {report['exit_price']:.2f}\n"
+            f"{pnl_text}", bot
+        )
+        
+        # Логирование в Google Sheets
+        if TRADE_LOG_WS:
+            row = [
+                report["id"], STRAT_VERSION, report["strategy_name"], report["status"], report["side"],
+                report["entry_time_utc"], datetime.now(timezone.utc).isoformat(),
+                report["entry_price"], report["exit_price"], report["sl_price"], report["tp_price"],
+                report["gross_pnl_usd"], report["fee_usd"], report["net_pnl_usd"], report["entry_deposit_usd"]
+            ]
+            await asyncio.to_thread(TRADE_LOG_WS.append_row, row, value_input_option="USER_ENTERED")
+            log.info(f"Сделка {report['id']} залогирована в Google Sheets.")
+
+    except Exception as e:
+        log.error(f"Ошибка обработки закрытой сделки {trade_details['id']}: {e}")
+        await notify_all(f"� Ошибка обработки закрытой сделки {trade_details['id']}. Проверьте логи.", bot)
 
 # ── УВЕДОМЛЕНИЯ ───────────────────────────────────────────────
 async def notify_all(text: str, bot: Bot = None):
@@ -226,18 +308,13 @@ async def notify_all(text: str, bot: Bot = None):
 async def monitor(app: Application):
     exchange = await initialize_exchange()
     if not exchange:
-        await notify_all("Не удалось инициализировать биржу. Бот остановлен.", app.bot)
-        return
+        await notify_all("Не удалось инициализировать биржу. Бот остановлен.", app.bot); return
     
     if not await set_position_mode(exchange):
-        await notify_all("Не удалось установить режим позиции (хеджирование). Бот остановлен.", app.bot)
-        await exchange.close()
-        return
+        await notify_all("Не удалось установить режим позиции. Бот остановлен.", app.bot); await exchange.close(); return
 
     if not await set_leverage_on_exchange(exchange, PAIR_SYMBOL, state['leverage']):
-        await notify_all("Не удалось установить плечо. Бот остановлен.", app.bot)
-        await exchange.close()
-        return
+        await notify_all("Не удалось установить плечо. Бот остановлен.", app.bot); await exchange.close(); return
 
     log.info("🚀 Основной цикл запущен: %s %s (%s)", PAIR_SYMBOL, TIMEFRAME, STRAT_VERSION)
     
@@ -247,19 +324,18 @@ async def monitor(app: Application):
             active_position = next((p for p in positions if float(p.get('notionalUsd', 0)) > 0), None)
 
             if active_position:
-                if not state.get("active_trade_id"):
+                if not state.get("active_trade"):
                     log.info(f"Обнаружена активная позиция, не отслеживаемая ботом. ID: {active_position['id']}. Пропускаем цикл.")
             else:
-                if state.get("active_trade_id"):
-                    log.info(f"Отслеживаемая позиция {state['active_trade_id']} была закрыта.")
-                    await notify_all(f"✅ Позиция {state['active_trade_id']} была закрыта.", app.bot)
-                    state["active_trade_id"] = None
+                if active_trade_details := state.get("active_trade"):
+                    log.info(f"Отслеживаемая позиция {active_trade_details['id']} была закрыта. Запускаю обработку...")
+                    state["active_trade"] = None
                     save_state()
+                    asyncio.create_task(process_closed_trade(exchange, active_trade_details, app.bot))
 
                 ohlcv = await exchange.fetch_ohlcv(PAIR_SYMBOL, timeframe=TIMEFRAME, limit=100)
                 df = add_indicators(pd.DataFrame(ohlcv, columns=["ts", "open", "high", "low", "close", "volume"]))
-                if len(df) < 2:
-                    await asyncio.sleep(30); continue
+                if len(df) < 2: await asyncio.sleep(30); continue
 
                 last = df.iloc[-1]
                 price = last["close"]
@@ -281,7 +357,8 @@ async def monitor(app: Application):
                     
                     signal = {
                         "side": side, "entry_price": price, "sl_price": sl_price,
-                        "tp_price": tp_price, "deposit_usd": state['deposit_usd'], "leverage": state['leverage']
+                        "tp_price": tp_price, "deposit_usd": state['deposit_usd'], "leverage": state['leverage'],
+                        "entry_time_utc": datetime.now(timezone.utc).isoformat()
                     }
                     
                     await notify_all(f"🔔 <b>ПОЛУЧЕН СИГНАЛ: {side}</b>\n\n"
@@ -292,7 +369,8 @@ async def monitor(app: Application):
 
                     order_id = await execute_trade(exchange, signal)
                     if order_id:
-                        state["active_trade_id"] = order_id
+                        signal['id'] = order_id
+                        state["active_trade"] = signal
                         save_state()
                         await notify_all(f"✅ <b>ОРДЕР УСПЕШНО РАЗМЕЩЕН</b>\n\n<b>ID ордера:</b> {order_id}", app.bot)
         
@@ -329,8 +407,9 @@ async def status_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     status_msg += f"<b>Депозит на сделку:</b> {state['deposit_usd']:.2f}$\n"
     status_msg += f"<b>Кредитное плечо:</b> {state['leverage']}x\n\n"
     
-    if state.get("active_trade_id"):
-        status_msg += f"<b>Активная сделка (ID):</b> {state['active_trade_id']}\n"
+    if trade := state.get("active_trade"):
+        status_msg += f"<b>Активная сделка (ID):</b> {trade['id']}\n"
+        status_msg += f"<b>Вход:</b> {trade['entry_price']:.2f}"
     else:
         status_msg += "<i>Нет активных сделок.</i>"
         
@@ -357,8 +436,7 @@ async def set_leverage_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         
         exchange = await initialize_exchange()
         if not exchange:
-            await update.message.reply_text("🔴 Ошибка: не удалось подключиться к бирже.")
-            return
+            await update.message.reply_text("🔴 Ошибка: не удалось подключиться к бирже."); return
             
         success = await set_leverage_on_exchange(exchange, PAIR_SYMBOL, leverage)
         await exchange.close()
@@ -383,18 +461,13 @@ async def test_trade_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         side = args_dict.get('side', 'LONG').upper()
 
         if side not in ['LONG', 'SHORT']:
-            await update.message.reply_text("❌ Ошибка: 'side' должен быть LONG или SHORT.")
-            return
+            await update.message.reply_text("❌ Ошибка: 'side' должен быть LONG или SHORT."); return
 
-        await update.message.reply_text(f"🛠 <b>ЗАПУСК ТЕСТОВОЙ СДЕЛКИ</b>\n\n"
-                                        f"<b>Тип:</b> {side}\n<b>Депозит:</b> {deposit}$\n<b>Плечо:</b> {leverage}x\n"
-                                        f"<b>TP:</b> {tp_price}\n<b>SL:</b> {sl_price}\n\n"
-                                        f"Подключаюсь к бирже и отправляю ордер...", parse_mode="HTML")
+        await update.message.reply_text(f"🛠 <b>ЗАПУСК ТЕСТОВОЙ СДЕЛКИ</b>...", parse_mode="HTML")
 
         exchange = await initialize_exchange()
         if not exchange:
-            await update.message.reply_text("🔴 Ошибка: не удалось подключиться к бирже.")
-            return
+            await update.message.reply_text("🔴 Ошибка: не удалось подключиться к бирже."); return
 
         await set_leverage_on_exchange(exchange, PAIR_SYMBOL, leverage)
         
@@ -412,21 +485,18 @@ async def test_trade_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await exchange.close()
 
         if order_id:
-            await update.message.reply_text(f"✅ <b>ТЕСТОВЫЙ ОРДЕР РАЗМЕЩЕН</b>\n\n"
-                                            f"<b>ID ордера:</b> {order_id}\n"
-                                            f"Не забудьте закрыть позицию вручную!", parse_mode="HTML")
+            await update.message.reply_text(f"✅ <b>ТЕСТОВЫЙ ОРДЕР РАЗМЕЩЕН</b>\n\n<b>ID ордера:</b> {order_id}\nНе забудьте закрыть позицию вручную!", parse_mode="HTML")
         else:
             await update.message.reply_text("🔴 Ошибка размещения тестового ордера. Проверьте логи.", parse_mode="HTML")
 
     except Exception as e:
         log.error(f"Ошибка в команде test_trade: {e}")
-        await update.message.reply_text(f"⚠️ Ошибка формата команды.\n"
-                                        f"<b>Пример:</b> /test_trade deposit=30 leverage=80 tp=120000 sl=100000 side=LONG",
-                                        parse_mode="HTML")
+        await update.message.reply_text(f"⚠️ Ошибка формата команды.\n<b>Пример:</b> /test_trade deposit=30 leverage=80 tp=120000 sl=100000 side=LONG", parse_mode="HTML")
 
 # ── ЗАПУСК БОТА ──────────────────────────────────────────────────────────────
 async def post_init(app: Application):
     load_state()
+    setup_google_sheets()
     log.info("Бот инициализирован. Состояние загружено.")
     await notify_all(f"✅ Бот <b>{STRAT_VERSION}</b> перезапущен.", bot=app.bot)
     if state.get("monitoring"):
