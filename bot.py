@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 # ============================================================================
-# Flat-Liner v6.3 • 15 Jul 2025
+# Flat-Liner v6.4 • 15 Jul 2025
 # ============================================================================
 # • СТРАТЕГИЯ: Только флэтовая стратегия 'Flat_BB_Fade'
 # • БИРЖА: OKX (Production)
 # • АВТОТРЕЙДИНГ: Полная интеграция с API для размещения ордеров
 # • УПРАВЛЕНИЕ: Команды для настройки депозита, плеча и тестовой торговли
-# • ИСПРАВЛЕНИЕ v6.3: Детальное логирование ошибок размещения ордера
+# • ИСПРАВЛЕНИЕ v6.4: Корректное получение данных о контракте (ctVal, minSz)
 # ============================================================================
 
 import os
@@ -32,7 +32,7 @@ BOT_TOKEN     = os.getenv("BOT_TOKEN")
 CHAT_IDS_RAW  = os.getenv("CHAT_IDS", "")
 PAIR_SYMBOL   = os.getenv("PAIR_SYMBOL", "BTC-USDT-SWAP") # Формат OKX
 TIMEFRAME     = os.getenv("TIMEFRAME", "5m")
-STRAT_VERSION = "v6_3_flatliner_okx"
+STRAT_VERSION = "v6_4_flatliner_okx"
 
 # --- OKX API ---
 OKX_API_KEY      = os.getenv("OKX_API_KEY")
@@ -170,8 +170,9 @@ async def execute_trade(exchange, signal: dict):
         await exchange.load_markets()
         market = exchange.market(PAIR_SYMBOL)
         
-        contract_val = float(market.get('contractVal', 1))
-        min_order_size = float(market['limits']['amount']['min'])
+        # ИСПРАВЛЕНИЕ: Получаем данные из 'info' для надежности
+        contract_val = float(market['info']['ctVal'])
+        min_order_size = float(market['info']['minSz'])
         
         position_value_usd = deposit * leverage
         amount_in_base_currency = position_value_usd / entry_price
@@ -356,7 +357,7 @@ async def set_leverage_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         
         exchange = await initialize_exchange()
         if not exchange:
-            await update.message.reply_text("� Ошибка: не удалось подключиться к бирже.")
+            await update.message.reply_text("🔴 Ошибка: не удалось подключиться к бирже.")
             return
             
         success = await set_leverage_on_exchange(exchange, PAIR_SYMBOL, leverage)
