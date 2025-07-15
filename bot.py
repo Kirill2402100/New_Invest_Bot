@@ -1,15 +1,12 @@
 #!/usr/bin/env python3
 # ============================================================================
-# Flat-Liner v6.8 • 15 Jul 2025
+# Flat-Liner v7.0 • 15 Jul 2025
 # ============================================================================
-# • СТРАТЕГИЯ: Только флэтовая стратегия 'Flat_BB_Fade'
+# • СТРАТЕГИЯ: Флэтовая стратегия 'Flat_BB_Fade' с обязательным фильтром по ADX
 # • БИРЖА: OKX (Production)
 # • АВТОТРЕЙДИНГ: Полная интеграция с API для размещения ордеров
 # • УПРАВЛЕНИЕ: Команды для настройки депозита, плеча и тестовой торговли
-# • ИСПРАВЛЕНИЕ v6.8:
-#   - Исправлена логика основного цикла (1 сделка за раз)
-#   - Восстановлен строгий RR 1:1 для флэт-стратегии
-#   - Увеличен лимит плеча до 500x
+# • ИСПРАВЛЕНИЕ v7.0: Возвращен фильтр по ADX для определения флэта
 # ============================================================================
 
 import os
@@ -37,7 +34,7 @@ BOT_TOKEN     = os.getenv("BOT_TOKEN")
 CHAT_IDS_RAW  = os.getenv("CHAT_IDS", "")
 PAIR_SYMBOL   = os.getenv("PAIR_SYMBOL", "BTC-USDT-SWAP") # Формат OKX
 TIMEFRAME     = os.getenv("TIMEFRAME", "5m")
-STRAT_VERSION = "v6_8_flatliner_okx"
+STRAT_VERSION = "v7_0_flatliner_pro"
 SHEET_ID      = os.getenv("SHEET_ID")
 
 
@@ -85,7 +82,8 @@ def setup_google_sheets() -> None:
             "Signal_ID", "Version", "Strategy_Used", "Status", "Side",
             "Entry_Time_UTC", "Exit_Time_UTC",
             "Entry_Price", "Exit_Price", "SL_Price", "TP_Price",
-            "Gross_P&L_USD", "Fee_USD", "Net_P&L_USD", "Entry_Deposit_USD"
+            "Gross_P&L_USD", "Fee_USD", "Net_P&L_USD", "Entry_Deposit_USD",
+            "Entry_ADX", "ADX_Threshold"
         ]
 
         ws_name = f"OKX_Trades_{PAIR_SYMBOL.replace('-','')}"
@@ -108,9 +106,11 @@ def setup_google_sheets() -> None:
 STATE_FILE = f"state_{STRAT_VERSION}_{PAIR_SYMBOL.replace('-','')}.json"
 state = {
     "monitoring": False,
-    "active_trade": None, # Будет хранить словарь с деталями сделки
+    "active_trade": None,
     "leverage": DEFAULT_LEVERAGE,
-    "deposit_usd": DEFAULT_DEPOSIT_USD
+    "deposit_usd": DEFAULT_DEPOSIT_USD,
+    "dynamic_adx_threshold": 25.0,
+    "last_adx_recalc_time": None
 }
 
 def save_state():
@@ -135,10 +135,11 @@ def load_state():
         log.info("Файл состояния не найден, создан новый.")
 
 # ── ИНДИКАТОРЫ ───────────────────────────────────────────────────
-RSI_LEN, BBANDS_LEN = 14, 20
+RSI_LEN, BBANDS_LEN, ADX_LEN = 14, 20, 14
 
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df.ta.rsi(length=RSI_LEN, append=True, col_names=(f"RSI_{RSI_LEN}",))
+    df.ta.adx(length=ADX_LEN, append=True, col_names=(f"ADX_{ADX_LEN}", "DMP", "DMN"))
     df.ta.bbands(length=BBANDS_LEN, std=2, append=True,
                 col_names=(f"BBL_{BBANDS_LEN}_2.0", f"BBM_{BBANDS_LEN}_2.0",
                            f"BBU_{BBANDS_LEN}_2.0", f"BBB_{BBANDS_LEN}_2.0",
@@ -228,16 +229,14 @@ async def execute_trade(exchange, signal: dict):
         return None
 
 async def process_closed_trade(exchange, trade_details, bot):
-    """Обрабатывает закрытую сделку, рассчитывает P&L и отправляет отчет."""
     try:
         log.info(f"Обработка закрытой сделки. ID ордера: {trade_details['id']}")
         order_id = trade_details['id']
         
-        # Запрашиваем историю ордера, чтобы получить детали исполнения
         closed_order = await exchange.fetch_order(order_id, PAIR_SYMBOL)
         
         exit_price = float(closed_order.get('average', trade_details['sl_price']))
-        fee = abs(float(closed_order.get('fee', {}).get('cost', 0))) # Комиссия всегда положительна
+        fee = abs(float(closed_order.get('fee', {}).get('cost', 0)))
         realized_pnl = float(closed_order['info'].get('pnl', 0))
         
         gross_pnl = realized_pnl
@@ -250,7 +249,8 @@ async def process_closed_trade(exchange, trade_details, bot):
             "entry_price": trade_details['entry_price'], "exit_price": exit_price,
             "sl_price": trade_details['sl_price'], "tp_price": trade_details['tp_price'],
             "gross_pnl_usd": round(gross_pnl, 2), "fee_usd": round(fee, 2),
-            "net_pnl_usd": round(net_pnl, 2), "entry_deposit_usd": trade_details['deposit_usd']
+            "net_pnl_usd": round(net_pnl, 2), "entry_deposit_usd": trade_details['deposit_usd'],
+            "entry_adx": trade_details['entry_adx'], "adx_threshold": trade_details['adx_threshold']
         }
 
         pnl_text = f"💰 <b>Net P&L: {report['net_pnl_usd']:.2f}$</b> (Fee: {report['fee_usd']:.2f}$)"
@@ -268,7 +268,8 @@ async def process_closed_trade(exchange, trade_details, bot):
                 report["id"], STRAT_VERSION, report["strategy_name"], report["status"], report["side"],
                 report["entry_time_utc"], datetime.now(timezone.utc).isoformat(),
                 report["entry_price"], report["exit_price"], report["sl_price"], report["tp_price"],
-                report["gross_pnl_usd"], report["fee_usd"], report["net_pnl_usd"], report["entry_deposit_usd"]
+                report["gross_pnl_usd"], report["fee_usd"], report["net_pnl_usd"], report["entry_deposit_usd"],
+                report["entry_adx"], report["adx_threshold"]
             ]
             await asyncio.to_thread(TRADE_LOG_WS.append_row, row, value_input_option="USER_ENTERED")
             log.info(f"Сделка {report['id']} залогирована в Google Sheets.")
@@ -276,6 +277,29 @@ async def process_closed_trade(exchange, trade_details, bot):
     except Exception as e:
         log.error(f"Ошибка обработки закрытой сделки {trade_details['id']}: {e}")
         await notify_all(f"🔴 Ошибка обработки закрытой сделки {trade_details['id']}. Проверьте логи.", bot)
+
+async def recalculate_adx_threshold():
+    try:
+        log.info("Пересчет динамического порога ADX...")
+        exchange = await initialize_exchange()
+        if not exchange: return
+        ohlcv = await exchange.fetch_ohlcv(PAIR_SYMBOL, timeframe=TIMEFRAME, limit=2000)
+        await exchange.close()
+        df = pd.DataFrame(ohlcv, columns=["ts","open","high","low","close","volume"])
+        df.ta.adx(length=ADX_LEN, append=True, col_names=(f"ADX_{ADX_LEN}", "DMP", "DMN"))
+        df.dropna(inplace=True)
+
+        if not df.empty:
+            adx_values = df[f"ADX_{ADX_LEN}"]
+            p20 = np.percentile(adx_values, 20)
+            p30 = np.percentile(adx_values, 30)
+            new_threshold = (p20 + p30) / 2
+            state["dynamic_adx_threshold"] = new_threshold
+            state["last_adx_recalc_time"] = datetime.now(timezone.utc).isoformat()
+            save_state()
+            log.info(f"Новый порог ADX: {new_threshold:.2f} (p20={p20:.2f}, p30={p30:.2f})")
+    except Exception as e:
+        log.error(f"Ошибка при пересчете порога ADX: {e}")
 
 # ── УВЕДОМЛЕНИЯ ───────────────────────────────────────────────
 async def notify_all(text: str, bot: Bot = None):
@@ -298,30 +322,40 @@ async def monitor(app: Application):
     if not await set_leverage_on_exchange(exchange, PAIR_SYMBOL, state['leverage']):
         await notify_all("Не удалось установить плечо. Бот остановлен.", app.bot); await exchange.close(); return
 
+    await recalculate_adx_threshold()
+
     log.info("🚀 Основной цикл запущен: %s %s (%s)", PAIR_SYMBOL, TIMEFRAME, STRAT_VERSION)
     
     while state.get("monitoring", False):
         try:
-            # Если есть активная сделка в состоянии, проверяем ее статус
+            now_utc = datetime.now(timezone.utc)
+            last_recalc_str = state.get("last_adx_recalc_time")
+            if not last_recalc_str or (now_utc - datetime.fromisoformat(last_recalc_str)).total_seconds() > 3600:
+                 await recalculate_adx_threshold()
+
             if active_trade_details := state.get("active_trade"):
                 positions = await exchange.fetch_positions([PAIR_SYMBOL])
                 active_position_on_exchange = next((p for p in positions if float(p.get('notionalUsd', 0)) > 0), None)
                 
-                # Если позиции на бирже нет, а в state есть - значит она закрылась
                 if not active_position_on_exchange:
                     log.info(f"Отслеживаемая позиция {active_trade_details['id']} была закрыта. Запускаю обработку...")
                     state["active_trade"] = None
                     save_state()
                     asyncio.create_task(process_closed_trade(exchange, active_trade_details, app.bot))
-                # Если позиция есть и в state и на бирже, ничего не делаем, ждем
             
-            # Если активной сделки в состоянии нет, ищем новую
             else:
                 ohlcv = await exchange.fetch_ohlcv(PAIR_SYMBOL, timeframe=TIMEFRAME, limit=100)
                 df = add_indicators(pd.DataFrame(ohlcv, columns=["ts", "open", "high", "low", "close", "volume"]))
-                if len(df) < 2: await asyncio.sleep(30); continue
+                if len(df) < 2: await asyncio.sleep(60); continue
 
                 last = df.iloc[-1]
+                adx = last[f"ADX_{ADX_LEN}"]
+                
+                if adx >= state['dynamic_adx_threshold']:
+                    log.info(f"Рынок в тренде (ADX={adx:.2f} >= {state['dynamic_adx_threshold']:.2f}). Пропускаем поиск сигнала.")
+                    await asyncio.sleep(60)
+                    continue
+
                 price = last["close"]
                 rsi = last[f"RSI_{RSI_LEN}"]
                 bb_lower = last[f"BBL_{BBANDS_LEN}_2.0"]
@@ -341,13 +375,15 @@ async def monitor(app: Application):
                     signal = {
                         "side": side, "entry_price": price, "sl_price": sl_price,
                         "tp_price": tp_price, "deposit_usd": state['deposit_usd'], "leverage": state['leverage'],
-                        "entry_time_utc": datetime.now(timezone.utc).isoformat()
+                        "entry_time_utc": datetime.now(timezone.utc).isoformat(),
+                        "entry_adx": round(adx, 2), "adx_threshold": round(state['dynamic_adx_threshold'], 2)
                     }
                     
                     await notify_all(f"🔔 <b>ПОЛУЧЕН СИГНАЛ: {side}</b>\n\n"
                                      f"<b>Инструмент:</b> {PAIR_SYMBOL}\n<b>Цена:</b> {price:.2f}\n"
                                      f"<b>TP:</b> {tp_price:.2f} | <b>SL:</b> {sl_price:.2f}\n"
-                                     f"<b>Депозит:</b> {state['deposit_usd']}$ | <b>Плечо:</b> {state['leverage']}x\n\n"
+                                     f"<b>Депозит:</b> {state['deposit_usd']}$ | <b>Плечо:</b> {state['leverage']}x\n"
+                                     f"<i>ADX: {signal['entry_adx']} (Порог: {signal['adx_threshold']})</i>\n\n"
                                      f"Отправка ордера на биржу...", app.bot)
 
                     order_id = await execute_trade(exchange, signal)
@@ -388,8 +424,9 @@ async def status_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     status_msg += f"<b>Мониторинг:</b> {'АКТИВЕН' if state.get('monitoring') else 'ОСТАНОВЛЕН'}\n"
     status_msg += f"<b>Инструмент:</b> {PAIR_SYMBOL}\n"
     status_msg += f"<b>Депозит на сделку:</b> {state['deposit_usd']:.2f}$\n"
-    status_msg += f"<b>Кредитное плечо:</b> {state['leverage']}x\n\n"
-    
+    status_msg += f"<b>Кредитное плечо:</b> {state['leverage']}x\n"
+    status_msg += f"<b>Порог ADX:</b> {state['dynamic_adx_threshold']:.2f}\n\n"
+
     if trade := state.get("active_trade"):
         status_msg += f"<b>Активная сделка (ID):</b> {trade['id']}\n"
         status_msg += f"<b>Вход:</b> {trade['entry_price']:.2f}"
@@ -413,8 +450,8 @@ async def set_deposit_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def set_leverage_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     try:
         leverage = int(ctx.args[0])
-        if not 1 <= leverage <= 500: # Увеличен лимит
-            await update.message.reply_text("❌ Ошибка: плечо должно быть в диапазоне от 1 до 500.")
+        if not 1 <= leverage <= 125:
+            await update.message.reply_text("❌ Ошибка: для этого инструмента плечо должно быть в диапазоне от 1 до 125.")
             return
         
         exchange = await initialize_exchange()
@@ -459,7 +496,9 @@ async def test_trade_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         signal = {
             "side": side, "entry_price": entry_price, "sl_price": sl_price,
-            "tp_price": tp_price, "deposit_usd": deposit, "leverage": leverage
+            "tp_price": tp_price, "deposit_usd": deposit, "leverage": leverage,
+            "entry_time_utc": datetime.now(timezone.utc).isoformat(),
+            "entry_adx": 0, "adx_threshold": 0 # Для тестовой сделки не имеет значения
         }
 
         order_id = await execute_trade(exchange, signal)
@@ -468,13 +507,17 @@ async def test_trade_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await exchange.close()
 
         if order_id:
+            signal['id'] = order_id
+            state["active_trade"] = signal
+            save_state()
             await update.message.reply_text(f"✅ <b>ТЕСТОВЫЙ ОРДЕР РАЗМЕЩЕН</b>\n\n<b>ID ордера:</b> {order_id}\nНе забудьте закрыть позицию вручную!", parse_mode="HTML")
         else:
             await update.message.reply_text("🔴 Ошибка размещения тестового ордера. Проверьте логи.", parse_mode="HTML")
 
     except Exception as e:
         log.error(f"Ошибка в команде test_trade: {e}")
-        await update.message.reply_text(f"⚠️ Ошибка формата команды.\n<b>Пример:</b> /test_trade deposit=30 leverage=80 tp=120000 sl=100000 side=LONG", parse_mode="HTML")
+        await update.message.reply_text(f"⚠️ Ошибка формата команды.\n<b>Пример:</b> /test_trade deposit=30 leverage=80 tp=120000 sl=100000 side=LONG",
+                                        parse_mode="HTML")
 
 # ── ЗАПУСК БОТА ──────────────────────────────────────────────────────────────
 async def post_init(app: Application):
