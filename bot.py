@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 # ============================================================================
-# Flat-Liner v6.10 • 15 Jul 2025
+# Flat-Liner v6.11 • 15 Jul 2025
 # ============================================================================
 # • СТРАТЕГИЯ: Только флэтовая стратегия 'Flat_BB_Fade'
 # • БИРЖА: OKX (Production)
 # • АВТОТРЕЙДИНГ: Полная интеграция с API для размещения ордеров
 # • УПРАВЛЕНИЕ: Команды для настройки депозита, плеча и тестовой торговли
-# • ИСПРАВЛЕНИЕ v6.10: Добавлена предварительная проверка ордера (pre-check)
+# • ИСПРАВЛЕНИЕ v6.11: Исправлен вызов pre-check эндпоинта для OKX
 # ============================================================================
 
 import os
@@ -34,7 +34,7 @@ BOT_TOKEN     = os.getenv("BOT_TOKEN")
 CHAT_IDS_RAW  = os.getenv("CHAT_IDS", "")
 PAIR_SYMBOL   = os.getenv("PAIR_SYMBOL", "BTC-USDT-SWAP") # Формат OKX
 TIMEFRAME     = os.getenv("TIMEFRAME", "5m")
-STRAT_VERSION = "v6_10_flatliner_okx"
+STRAT_VERSION = "v6_11_flatliner_okx"
 SHEET_ID      = os.getenv("SHEET_ID")
 
 
@@ -204,7 +204,8 @@ async def execute_trade(exchange, signal: dict):
             'posSide': 'long' if side == 'LONG' else 'short', 'ordType': 'market', 'sz': str(order_size_contracts)
         }
         log.info(f"Выполнение предварительной проверки ордера: {pre_check_params}")
-        pre_check_result = await exchange.private_post_trade_order_precheck(pre_check_params)
+        # ИСПРАВЛЕНИЕ: Используем универсальный метод вызова API
+        pre_check_result = await exchange.privatePostTradeOrderPrecheck(pre_check_params)
         
         if pre_check_result.get('code') != '0' or (pre_check_result.get('data') and pre_check_result['data'][0].get('sCode') != '0'):
              error_msg = pre_check_result['data'][0]['sMsg'] if pre_check_result.get('data') else pre_check_result.get('msg', 'Неизвестная ошибка pre-check')
@@ -311,7 +312,8 @@ async def monitor(app: Application):
         try:
             if active_trade_details := state.get("active_trade"):
                 positions = await exchange.fetch_positions([PAIR_SYMBOL])
-                active_position_on_exchange = next((p for p in positions if float(p.get('notionalUsd', 0)) > 0 and p.get('ordId') == active_trade_details.get('id')), None)
+                # Проверяем, есть ли позиция с нашим ID
+                active_position_on_exchange = next((p for p in positions if p.get('id') == active_trade_details.get('id')), None)
                 
                 if not active_position_on_exchange:
                     log.info(f"Отслеживаемая позиция {active_trade_details['id']} была закрыта. Запускаю обработку...")
