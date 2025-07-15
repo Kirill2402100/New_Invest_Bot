@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 # ============================================================================
-# Flat-Liner v6.0 • 15 Jul 2025
+# Flat-Liner v6.1 • 15 Jul 2025
 # ============================================================================
 # • СТРАТЕГИЯ: Только флэтовая стратегия 'Flat_BB_Fade'
 # • БИРЖА: OKX (Production)
 # • АВТОТРЕЙДИНГ: Полная интеграция с API для размещения ордеров
 # • УПРАВЛЕНИЕ: Команды для настройки депозита, плеча и тестовой торговли
+# • ИСПРАВЛЕНИЕ v6.1: Корректная установка плеча (posSide) для OKX
 # ============================================================================
 
 import os
@@ -31,7 +32,7 @@ BOT_TOKEN     = os.getenv("BOT_TOKEN")
 CHAT_IDS_RAW  = os.getenv("CHAT_IDS", "")
 PAIR_SYMBOL   = os.getenv("PAIR_SYMBOL", "BTC-USDT-SWAP") # Формат OKX
 TIMEFRAME     = os.getenv("TIMEFRAME", "5m")
-STRAT_VERSION = "v6_0_flatliner_okx"
+STRAT_VERSION = "v6_1_flatliner_okx"
 
 # --- OKX API ---
 OKX_API_KEY      = os.getenv("OKX_API_KEY")
@@ -82,7 +83,6 @@ def load_state():
         try:
             with open(STATE_FILE, 'r') as f:
                 loaded_state = json.load(f)
-                # Убедимся, что все ключи из state по умолчанию присутствуют
                 for key, default_value in state.items():
                     if key not in loaded_state:
                         loaded_state[key] = default_value
@@ -90,7 +90,7 @@ def load_state():
             log.info("Файл состояния успешно загружен.")
         except (json.JSONDecodeError, TypeError):
             log.error("Не удалось прочитать файл состояния, будет создан новый.")
-            save_state() # Сохраняем дефолтное состояние
+            save_state()
     else:
         save_state()
         log.info("Файл состояния не найден, создан новый.")
@@ -126,7 +126,6 @@ async def initialize_exchange():
                 'defaultType': 'swap',
             },
         })
-        # Установка режима демо/реальной торговли
         exchange.set_sandbox_mode(OKX_DEMO_MODE == '1')
         log.info(f"Биржа OKX инициализирована. Демо-режим: {'ВКЛЮЧЕН' if OKX_DEMO_MODE == '1' else 'ВЫКЛЮЧЕН'}.")
         return exchange
@@ -135,10 +134,13 @@ async def initialize_exchange():
         return None
 
 async def set_leverage_on_exchange(exchange, symbol, leverage):
-    """Устанавливает кредитное плечо для инструмента на бирже."""
+    """Устанавливает кредитное плечо для long и short позиций."""
     try:
-        await exchange.set_leverage(leverage, symbol, {'mgnMode': 'isolated'})
-        log.info(f"На бирже установлено плечо {leverage}x для {symbol}")
+        # Установка плеча для LONG
+        await exchange.set_leverage(leverage, symbol, {'mgnMode': 'isolated', 'posSide': 'long'})
+        # Установка плеча для SHORT
+        await exchange.set_leverage(leverage, symbol, {'mgnMode': 'isolated', 'posSide': 'short'})
+        log.info(f"На бирже установлено плечо {leverage}x для {symbol} (long/short)")
         return True
     except Exception as e:
         log.error(f"Ошибка установки плеча на бирже: {e}")
@@ -154,12 +156,10 @@ async def execute_trade(exchange, signal: dict):
     leverage = signal['leverage']
 
     try:
-        # 1. Получаем информацию об инструменте для расчета размера контракта
         markets = await exchange.load_markets()
         market = markets[PAIR_SYMBOL]
         contract_val = float(market['contractVal'])
         
-        # 2. Рассчитываем размер ордера в контрактах
         position_value_usd = deposit * leverage
         amount_in_base_currency = position_value_usd / entry_price
         order_size_contracts = round(amount_in_base_currency / contract_val)
@@ -168,25 +168,21 @@ async def execute_trade(exchange, signal: dict):
             log.warning("Рассчитанный размер ордера равен 0. Сделка отменена.")
             return None
 
-        # 3. Формируем параметры для ордера
         params = {
             'tdMode': 'isolated',
             'posSide': 'long' if side == 'LONG' else 'short',
             'attachAlgoOrds': [
-                {'slTriggerPx': str(sl_price), 'slOrdPx': '-1'}, # -1 для исполнения по рынку
+                {'slTriggerPx': str(sl_price), 'slOrdPx': '-1'},
                 {'tpTriggerPx': str(tp_price), 'tpOrdPx': '-1'}
             ]
         }
         
         log.info(f"Попытка разместить ордер: {side} {order_size_contracts} контрактов {PAIR_SYMBOL} по рынку. SL={sl_price}, TP={tp_price}")
         
-        # 4. Размещаем ордер
         order = await exchange.create_order(
-            symbol=PAIR_SYMBOL,
-            type='market',
+            symbol=PAIR_SYMBOL, type='market',
             side='buy' if side == 'LONG' else 'sell',
-            amount=order_size_contracts,
-            params=params
+            amount=order_size_contracts, params=params
         )
         
         log.info(f"Ордер успешно размещен! ID: {order['id']}")
@@ -199,7 +195,6 @@ async def execute_trade(exchange, signal: dict):
 
 # ── УВЕДОМЛЕНИЯ ───────────────────────────────────────────────
 async def notify_all(text: str, bot: Bot = None):
-    # Если bot не передан, создаем временный экземпляр
     temp_bot = bot if bot else Bot(token=BOT_TOKEN)
     for cid in CHAT_IDS:
         try:
@@ -214,32 +209,28 @@ async def monitor(app: Application):
         await notify_all("Не удалось инициализировать биржу. Бот остановлен.", app.bot)
         return
 
-    # Устанавливаем плечо при старте
-    await set_leverage_on_exchange(exchange, PAIR_SYMBOL, state['leverage'])
+    if not await set_leverage_on_exchange(exchange, PAIR_SYMBOL, state['leverage']):
+        await notify_all("Не удалось установить плечо. Бот остановлен.", app.bot)
+        await exchange.close()
+        return
 
     log.info("🚀 Основной цикл запущен: %s %s (%s)", PAIR_SYMBOL, TIMEFRAME, STRAT_VERSION)
     
     while state.get("monitoring", False):
         try:
-            # Проверяем, есть ли активная позиция
             positions = await exchange.fetch_positions([PAIR_SYMBOL])
             active_position = next((p for p in positions if float(p.get('notionalUsd', 0)) > 0), None)
 
             if active_position:
                 if not state.get("active_trade_id"):
-                    # Позиция есть, но у нас нет ее ID - возможно, открыта вручную или после перезапуска
                     log.info(f"Обнаружена активная позиция, не отслеживаемая ботом. ID: {active_position['id']}. Пропускаем цикл.")
-                # Если позиция отслеживается, просто ждем ее закрытия биржей (по TP/SL)
-                # Логика обработки закрытых позиций и P&L будет в следующих версиях
             else:
-                 # Если в состоянии есть ID, но позиции нет - значит она закрылась
                 if state.get("active_trade_id"):
                     log.info(f"Отслеживаемая позиция {state['active_trade_id']} была закрыта.")
                     await notify_all(f"✅ Позиция {state['active_trade_id']} была закрыта.", app.bot)
                     state["active_trade_id"] = None
                     save_state()
 
-                # Позиции нет - ищем новый сигнал
                 ohlcv = await exchange.fetch_ohlcv(PAIR_SYMBOL, timeframe=TIMEFRAME, limit=100)
                 df = add_indicators(pd.DataFrame(ohlcv, columns=["ts", "open", "high", "low", "close", "volume"]))
                 if len(df) < 2:
@@ -264,17 +255,12 @@ async def monitor(app: Application):
                     tp_price = price * (1 + tp_pct / 100) if side == "LONG" else price * (1 - tp_pct / 100)
                     
                     signal = {
-                        "side": side,
-                        "entry_price": price,
-                        "sl_price": sl_price,
-                        "tp_price": tp_price,
-                        "deposit_usd": state['deposit_usd'],
-                        "leverage": state['leverage']
+                        "side": side, "entry_price": price, "sl_price": sl_price,
+                        "tp_price": tp_price, "deposit_usd": state['deposit_usd'], "leverage": state['leverage']
                     }
                     
                     await notify_all(f"🔔 <b>ПОЛУЧЕН СИГНАЛ: {side}</b>\n\n"
-                                     f"<b>Инструмент:</b> {PAIR_SYMBOL}\n"
-                                     f"<b>Цена:</b> {price:.2f}\n"
+                                     f"<b>Инструмент:</b> {PAIR_SYMBOL}\n<b>Цена:</b> {price:.2f}\n"
                                      f"<b>TP:</b> {tp_price:.2f} | <b>SL:</b> {sl_price:.2f}\n"
                                      f"<b>Депозит:</b> {state['deposit_usd']}$ | <b>Плечо:</b> {state['leverage']}x\n\n"
                                      f"Отправка ордера на биржу...", app.bot)
@@ -283,8 +269,7 @@ async def monitor(app: Application):
                     if order_id:
                         state["active_trade_id"] = order_id
                         save_state()
-                        await notify_all(f"✅ <b>ОРДЕР УСПЕШНО РАЗМЕЩЕН</b>\n\n"
-                                         f"<b>ID ордера:</b> {order_id}", app.bot)
+                        await notify_all(f"✅ <b>ОРДЕР УСПЕШНО РАЗМЕЩЕН</b>\n\n<b>ID ордера:</b> {order_id}", app.bot)
         
         except ccxt.NetworkError as e:
             log.warning("CCXT ошибка сети: %s", e)
@@ -341,7 +326,7 @@ async def set_deposit_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def set_leverage_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     try:
         leverage = int(ctx.args[0])
-        if not 1 <= leverage <= 125: # OKX max leverage
+        if not 1 <= leverage <= 125:
             await update.message.reply_text("❌ Ошибка: плечо должно быть в диапазоне от 1 до 125.")
             return
         
@@ -358,7 +343,7 @@ async def set_leverage_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             save_state()
             await update.message.reply_text(f"✅ Кредитное плечо установлено: <b>{leverage}x</b>", parse_mode="HTML")
         else:
-            await update.message.reply_text("🔴 Ошибка установки плеча на бирже. Проверьте логи.")
+            await update.message.reply_text("� Ошибка установки плеча на бирже. Проверьте логи.")
 
     except (IndexError, ValueError):
         await update.message.reply_text("⚠️ Неверный формат. Используйте: /set_leverage <значение>")
@@ -386,10 +371,8 @@ async def test_trade_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("🔴 Ошибка: не удалось подключиться к бирже.")
             return
 
-        # Установка временного плеча для теста
         await set_leverage_on_exchange(exchange, PAIR_SYMBOL, leverage)
         
-        # Получаем текущую цену для входа
         ticker = await exchange.fetch_ticker(PAIR_SYMBOL)
         entry_price = ticker['last']
 
@@ -400,7 +383,6 @@ async def test_trade_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         order_id = await execute_trade(exchange, signal)
         
-        # Возвращаем плечо к значению из state
         await set_leverage_on_exchange(exchange, PAIR_SYMBOL, state['leverage'])
         await exchange.close()
 
@@ -419,7 +401,6 @@ async def test_trade_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 # ── ЗАПУСК БОТА ──────────────────────────────────────────────────────────────
 async def post_init(app: Application):
-    """Выполняется после инициализации приложения."""
     load_state()
     log.info("Бот инициализирован. Состояние загружено.")
     await notify_all(f"✅ Бот <b>{STRAT_VERSION}</b> перезапущен.", bot=app.bot)
