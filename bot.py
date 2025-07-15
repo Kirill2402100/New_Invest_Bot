@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 # ============================================================================
-# Flat-Liner v7.0 • 15 Jul 2025
+# Flat-Liner v7.1 • 15 Jul 2025
 # ============================================================================
 # • СТРАТЕГИЯ: Флэтовая стратегия 'Flat_BB_Fade' с обязательным фильтром по ADX
 # • БИРЖА: OKX (Production)
 # • АВТОТРЕЙДИНГ: Полная интеграция с API для размещения ордеров
 # • УПРАВЛЕНИЕ: Команды для настройки депозита, плеча и тестовой торговли
-# • ИСПРАВЛЕНИЕ v7.0: Возвращен фильтр по ADX для определения флэта
+# • ИСПРАВЛЕНИЕ v7.1: Восстановлена функция суточной отчетности
 # ============================================================================
 
 import os
@@ -15,7 +15,7 @@ import logging
 import re
 import uuid
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 import numpy as np
 import pandas as pd
@@ -34,7 +34,7 @@ BOT_TOKEN     = os.getenv("BOT_TOKEN")
 CHAT_IDS_RAW  = os.getenv("CHAT_IDS", "")
 PAIR_SYMBOL   = os.getenv("PAIR_SYMBOL", "BTC-USDT-SWAP") # Формат OKX
 TIMEFRAME     = os.getenv("TIMEFRAME", "5m")
-STRAT_VERSION = "v7_0_flatliner_pro"
+STRAT_VERSION = "v7_1_flatliner_pro"
 SHEET_ID      = os.getenv("SHEET_ID")
 
 
@@ -52,6 +52,8 @@ FLAT_RR_RATIO       = float(os.getenv("FLAT_RR_RATIO", "1.0"))
 FLAT_SL_PCT         = float(os.getenv("FLAT_SL_PCT", "0.10")) # Фиксированный SL 0.10%
 FLAT_RSI_OVERSOLD   = float(os.getenv("FLAT_RSI_OVERSOLD", "35"))
 FLAT_RSI_OVERBOUGHT = float(os.getenv("FLAT_RSI_OVERBOUGHT", "65"))
+REPORT_TIME_UTC     = os.getenv("REPORT_TIME_UTC", "21:00")
+
 
 # ── НАСТРОЙКА ЛОГИРОВАНИЯ ────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)-8s  %(message)s")
@@ -110,7 +112,8 @@ state = {
     "leverage": DEFAULT_LEVERAGE,
     "deposit_usd": DEFAULT_DEPOSIT_USD,
     "dynamic_adx_threshold": 25.0,
-    "last_adx_recalc_time": None
+    "last_adx_recalc_time": None,
+    "daily_report_data": [] # Восстановлено
 }
 
 def save_state():
@@ -252,6 +255,12 @@ async def process_closed_trade(exchange, trade_details, bot):
             "net_pnl_usd": round(net_pnl, 2), "entry_deposit_usd": trade_details['deposit_usd'],
             "entry_adx": trade_details['entry_adx'], "adx_threshold": trade_details['adx_threshold']
         }
+
+        # Добавляем данные в статистику для суточного отчета
+        state["daily_report_data"].append({
+            "pnl_usd": report["net_pnl_usd"], "entry_usd": report["entry_deposit_usd"]
+        })
+        save_state()
 
         pnl_text = f"💰 <b>Net P&L: {report['net_pnl_usd']:.2f}$</b> (Fee: {report['fee_usd']:.2f}$)"
         msg_icon = "✅" if status == "WIN" else "❌"
@@ -403,6 +412,55 @@ async def monitor(app: Application):
     await exchange.close()
     log.info("⛔️ Основной цикл остановлен. Соединение с биржей закрыто.")
 
+# ── ЕЖЕДНЕВНЫЙ ОТЧЁТ ────────────────────────────────────────────────────────
+async def daily_reporter(app: Application):
+    log.info("📈 Сервис ежедневных отчётов запущен.")
+    while True:
+        now_utc = datetime.now(timezone.utc)
+        try:
+            report_h, report_m = map(int, REPORT_TIME_UTC.split(':'))
+            report_time = now_utc.replace(hour=report_h, minute=report_m, second=0, microsecond=0)
+        except ValueError:
+            log.error("Неверный формат REPORT_TIME_UTC. Используйте HH:MM. Отчеты отключены.")
+            return
+
+        if now_utc > report_time:
+            report_time += timedelta(days=1)
+
+        wait_seconds = (report_time - now_utc).total_seconds()
+        log.info(f"Следующий суточный отчёт будет отправлен в {REPORT_TIME_UTC} UTC (через {wait_seconds/3600:.2f} ч).")
+        await asyncio.sleep(wait_seconds)
+
+        report_data = state.get("daily_report_data", [])
+        if not report_data:
+            await notify_all(f"📊 <b>Суточный отчёт ({STRAT_VERSION})</b> 📊\n\nЗа последние 24 часа сделок не было.", app.bot)
+            await asyncio.sleep(60)
+            continue
+
+        total_pnl_usd = sum(item['pnl_usd'] for item in report_data)
+        total_trades = len(report_data)
+        wins = sum(1 for item in report_data if item['pnl_usd'] > 0)
+        losses = total_trades - wins
+        win_rate = (wins / total_trades) * 100 if total_trades > 0 else 0
+        
+        total_investment = sum(item['entry_usd'] for item in report_data)
+        pnl_percent = (total_pnl_usd / total_investment) * 100 if total_investment > 0 else 0
+        
+        report_msg = (
+            f"📊 <b>Суточный отчёт по стратегии {STRAT_VERSION}</b> 📊\n\n"
+            f"<b>Период:</b> последние 24 часа\n"
+            f"<b>Всего сделок:</b> {total_trades} (📈{wins} / 📉{losses})\n"
+            f"<b>Винрейт:</b> {win_rate:.2f}%\n\n"
+            f"<b>Финансовый результат:</b>\n"
+            f"💵 <b>Net P&L ($): {total_pnl_usd:+.2f}$</b>\n"
+            f"💹 <b>ROI (%): {pnl_percent:+.2f}%</b>"
+        )
+        await notify_all(report_msg, app.bot)
+
+        state["daily_report_data"] = []
+        save_state()
+        await asyncio.sleep(60)
+
 # ── КОМАНДЫ TELEGRAM ────────────────────────────────────────────────
 async def start_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     CHAT_IDS.add(update.effective_chat.id)
@@ -498,7 +556,7 @@ async def test_trade_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "side": side, "entry_price": entry_price, "sl_price": sl_price,
             "tp_price": tp_price, "deposit_usd": deposit, "leverage": leverage,
             "entry_time_utc": datetime.now(timezone.utc).isoformat(),
-            "entry_adx": 0, "adx_threshold": 0 # Для тестовой сделки не имеет значения
+            "entry_adx": 0, "adx_threshold": 0
         }
 
         order_id = await execute_trade(exchange, signal)
@@ -528,6 +586,9 @@ async def post_init(app: Application):
     if state.get("monitoring"):
         log.info("Обнаружен активный статус мониторинга, запускаю основной цикл...")
         asyncio.create_task(monitor(app))
+    
+    # Запускаем сервис суточных отчетов
+    asyncio.create_task(daily_reporter(app))
 
 if __name__ == "__main__":
     app = (ApplicationBuilder()
