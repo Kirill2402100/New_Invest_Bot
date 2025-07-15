@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 # ============================================================================
-# Flat-Liner v6.7 • 15 Jul 2025
+# Flat-Liner v6.8 • 15 Jul 2025
 # ============================================================================
 # • СТРАТЕГИЯ: Только флэтовая стратегия 'Flat_BB_Fade'
 # • БИРЖА: OKX (Production)
 # • АВТОТРЕЙДИНГ: Полная интеграция с API для размещения ордеров
 # • УПРАВЛЕНИЕ: Команды для настройки депозита, плеча и тестовой торговли
-# • ИСПРАВЛЕНИЕ v6.7: Добавлена полноценная обработка и отчетность по закрытым сделкам
+# • ИСПРАВЛЕНИЕ v6.8:
+#   - Исправлена логика основного цикла (1 сделка за раз)
+#   - Восстановлен строгий RR 1:1 для флэт-стратегии
+#   - Увеличен лимит плеча до 500x
 # ============================================================================
 
 import os
@@ -34,7 +37,7 @@ BOT_TOKEN     = os.getenv("BOT_TOKEN")
 CHAT_IDS_RAW  = os.getenv("CHAT_IDS", "")
 PAIR_SYMBOL   = os.getenv("PAIR_SYMBOL", "BTC-USDT-SWAP") # Формат OKX
 TIMEFRAME     = os.getenv("TIMEFRAME", "5m")
-STRAT_VERSION = "v6_7_flatliner_okx"
+STRAT_VERSION = "v6_8_flatliner_okx"
 SHEET_ID      = os.getenv("SHEET_ID")
 
 
@@ -49,15 +52,9 @@ OKX_DEMO_MODE    = os.getenv("OKX_DEMO_MODE", "1")
 DEFAULT_DEPOSIT_USD = float(os.getenv("DEFAULT_DEPOSIT_USD", "50.0"))
 DEFAULT_LEVERAGE    = float(os.getenv("DEFAULT_LEVERAGE", "100.0"))
 FLAT_RR_RATIO       = float(os.getenv("FLAT_RR_RATIO", "1.0"))
+FLAT_SL_PCT         = float(os.getenv("FLAT_SL_PCT", "0.10")) # Фиксированный SL 0.10%
 FLAT_RSI_OVERSOLD   = float(os.getenv("FLAT_RSI_OVERSOLD", "35"))
 FLAT_RSI_OVERBOUGHT = float(os.getenv("FLAT_RSI_OVERBOUGHT", "65"))
-
-# --- Настройки ATR для определения размера SL ---
-ATR_LOW_USD   = float(os.getenv("ATR_LOW_USD",  "80"))
-ATR_HIGH_USD  = float(os.getenv("ATR_HIGH_USD", "120"))
-SL_PCT_LOW    = float(os.getenv("SL_PCT_LOW",   "0.08"))
-SL_PCT_MID    = float(os.getenv("SL_PCT_MID",   "0.10"))
-SL_PCT_HIGH   = float(os.getenv("SL_PCT_HIGH",  "0.12"))
 
 # ── НАСТРОЙКА ЛОГИРОВАНИЯ ────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)-8s  %(message)s")
@@ -138,21 +135,15 @@ def load_state():
         log.info("Файл состояния не найден, создан новый.")
 
 # ── ИНДИКАТОРЫ ───────────────────────────────────────────────────
-RSI_LEN, BBANDS_LEN, ATR_LEN = 14, 20, 14
+RSI_LEN, BBANDS_LEN = 14, 20
 
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df.ta.rsi(length=RSI_LEN, append=True, col_names=(f"RSI_{RSI_LEN}",))
-    df.ta.atr(length=ATR_LEN, append=True, col_names=(f"ATR_{ATR_LEN}",))
     df.ta.bbands(length=BBANDS_LEN, std=2, append=True,
                 col_names=(f"BBL_{BBANDS_LEN}_2.0", f"BBM_{BBANDS_LEN}_2.0",
                            f"BBU_{BBANDS_LEN}_2.0", f"BBB_{BBANDS_LEN}_2.0",
                            f"BBP_{BBANDS_LEN}_2.0"))
     return df.dropna()
-
-def get_sl_pct_by_atr(atr: float) -> float:
-    if atr <= ATR_LOW_USD:  return SL_PCT_LOW
-    if atr >= ATR_HIGH_USD: return SL_PCT_HIGH
-    return SL_PCT_MID
 
 # ── ВЗАИМОДЕЙСТВИЕ С БИРЖЕЙ (OKX) ──────────────────────────────────────────
 async def initialize_exchange():
@@ -245,17 +236,11 @@ async def process_closed_trade(exchange, trade_details, bot):
         # Запрашиваем историю ордера, чтобы получить детали исполнения
         closed_order = await exchange.fetch_order(order_id, PAIR_SYMBOL)
         
-        exit_price = float(closed_order.get('average', trade_details['sl_price'])) # Используем SL/TP как запасной вариант
-        fee = float(closed_order.get('fee', {}).get('cost', 0))
-        realized_pnl = float(closed_order['info'].get('pnl', 0)) # P&L, который сообщает биржа
+        exit_price = float(closed_order.get('average', trade_details['sl_price']))
+        fee = abs(float(closed_order.get('fee', {}).get('cost', 0))) # Комиссия всегда положительна
+        realized_pnl = float(closed_order['info'].get('pnl', 0))
         
-        # Если биржа не вернула PnL, считаем его сами (менее точно)
-        if realized_pnl == 0:
-            pnl_pct = (exit_price / trade_details['entry_price'] - 1) if trade_details['side'] == "LONG" else (trade_details['entry_price'] / exit_price - 1)
-            gross_pnl = pnl_pct * trade_details['deposit_usd'] * trade_details['leverage']
-        else:
-            gross_pnl = realized_pnl
-
+        gross_pnl = realized_pnl
         net_pnl = gross_pnl - fee
         status = "WIN" if net_pnl > 0 else "LOSS"
 
@@ -273,14 +258,11 @@ async def process_closed_trade(exchange, trade_details, bot):
         
         await notify_all(
             f"{msg_icon} <b>СДЕЛКА ЗАКРЫТА</b> {msg_icon}\n\n"
-            f"<b>ID:</b> {report['id']}\n"
-            f"<b>Тип:</b> {report['side']}\n"
-            f"<b>Вход:</b> {report['entry_price']:.2f}\n"
-            f"<b>Выход:</b> {report['exit_price']:.2f}\n"
+            f"<b>ID:</b> {report['id']}\n<b>Тип:</b> {report['side']}\n"
+            f"<b>Вход:</b> {report['entry_price']:.2f}\n<b>Выход:</b> {report['exit_price']:.2f}\n"
             f"{pnl_text}", bot
         )
         
-        # Логирование в Google Sheets
         if TRADE_LOG_WS:
             row = [
                 report["id"], STRAT_VERSION, report["strategy_name"], report["status"], report["side"],
@@ -293,7 +275,7 @@ async def process_closed_trade(exchange, trade_details, bot):
 
     except Exception as e:
         log.error(f"Ошибка обработки закрытой сделки {trade_details['id']}: {e}")
-        await notify_all(f"� Ошибка обработки закрытой сделки {trade_details['id']}. Проверьте логи.", bot)
+        await notify_all(f"🔴 Ошибка обработки закрытой сделки {trade_details['id']}. Проверьте логи.", bot)
 
 # ── УВЕДОМЛЕНИЯ ───────────────────────────────────────────────
 async def notify_all(text: str, bot: Bot = None):
@@ -320,19 +302,21 @@ async def monitor(app: Application):
     
     while state.get("monitoring", False):
         try:
-            positions = await exchange.fetch_positions([PAIR_SYMBOL])
-            active_position = next((p for p in positions if float(p.get('notionalUsd', 0)) > 0), None)
-
-            if active_position:
-                if not state.get("active_trade"):
-                    log.info(f"Обнаружена активная позиция, не отслеживаемая ботом. ID: {active_position['id']}. Пропускаем цикл.")
-            else:
-                if active_trade_details := state.get("active_trade"):
+            # Если есть активная сделка в состоянии, проверяем ее статус
+            if active_trade_details := state.get("active_trade"):
+                positions = await exchange.fetch_positions([PAIR_SYMBOL])
+                active_position_on_exchange = next((p for p in positions if float(p.get('notionalUsd', 0)) > 0), None)
+                
+                # Если позиции на бирже нет, а в state есть - значит она закрылась
+                if not active_position_on_exchange:
                     log.info(f"Отслеживаемая позиция {active_trade_details['id']} была закрыта. Запускаю обработку...")
                     state["active_trade"] = None
                     save_state()
                     asyncio.create_task(process_closed_trade(exchange, active_trade_details, app.bot))
-
+                # Если позиция есть и в state и на бирже, ничего не делаем, ждем
+            
+            # Если активной сделки в состоянии нет, ищем новую
+            else:
                 ohlcv = await exchange.fetch_ohlcv(PAIR_SYMBOL, timeframe=TIMEFRAME, limit=100)
                 df = add_indicators(pd.DataFrame(ohlcv, columns=["ts", "open", "high", "low", "close", "volume"]))
                 if len(df) < 2: await asyncio.sleep(30); continue
@@ -348,8 +332,7 @@ async def monitor(app: Application):
                 elif price >= bb_upper and rsi > FLAT_RSI_OVERBOUGHT: side = "SHORT"
 
                 if side:
-                    atr = last[f"ATR_{ATR_LEN}"]
-                    sl_pct = get_sl_pct_by_atr(atr)
+                    sl_pct = FLAT_SL_PCT
                     tp_pct = sl_pct * FLAT_RR_RATIO
                     
                     sl_price = price * (1 - sl_pct / 100) if side == "LONG" else price * (1 + sl_pct / 100)
@@ -430,8 +413,8 @@ async def set_deposit_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def set_leverage_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     try:
         leverage = int(ctx.args[0])
-        if not 1 <= leverage <= 125:
-            await update.message.reply_text("❌ Ошибка: плечо должно быть в диапазоне от 1 до 125.")
+        if not 1 <= leverage <= 500: # Увеличен лимит
+            await update.message.reply_text("❌ Ошибка: плечо должно быть в диапазоне от 1 до 500.")
             return
         
         exchange = await initialize_exchange()
