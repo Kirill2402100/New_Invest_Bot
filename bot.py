@@ -1,15 +1,14 @@
 #!/usr/bin/env python3
 # ============================================================================
-# Flat-Liner v7.3 • 15 Jul 2025
+# Flat-Liner v7.4 • 15 Jul 2025
 # ============================================================================
 # • СТРАТЕГИЯ: Флэтовая стратегия 'Flat_BB_Fade' с обязательным фильтром по ADX
 # • БИРЖА: OKX (Production)
 # • АВТОТРЕЙДИНГ: Полная интеграция с API для размещения ордеров
 # • УПРАВЛЕНИЕ: Команды для настройки депозита, плеча и тестовой торговли
-# • ИСПРАВЛЕНИЕ v7.3:
-#   - [ГЛАВНЫЙ ФИКС] Исправлен формат запроса для pre-check (API требует массив).
-#   - [УЛУЧШЕНИЕ] Динамическое получение данных о контракте (ctVal, minSz).
-#   - [УЛУЧШЕНИЕ] Скорректирована логика отслеживания активной позиции.
+# • ИСПРАВЛЕНИЕ v7.4:
+#   - [ГЛАВНЫЙ ФИКС] Исправлено имя метода для pre-check на camelCase
+#     (privatePostTradeOrderPrecheck), как того требует ccxt.
 # ============================================================================
 
 import os
@@ -37,7 +36,7 @@ BOT_TOKEN     = os.getenv("BOT_TOKEN")
 CHAT_IDS_RAW  = os.getenv("CHAT_IDS", "")
 PAIR_SYMBOL   = os.getenv("PAIR_SYMBOL", "BTC-USDT-SWAP") # Формат OKX
 TIMEFRAME     = os.getenv("TIMEFRAME", "5m")
-STRAT_VERSION = "v7_3_flatliner_okx"
+STRAT_VERSION = "v7_4_flatliner_okx"
 SHEET_ID      = os.getenv("SHEET_ID")
 
 
@@ -198,7 +197,6 @@ async def execute_trade(exchange, signal: dict):
     tp_price = signal['tp_price']
 
     try:
-        # [УЛУЧШЕНИЕ] Динамическое получение данных о контракте
         market = exchange.markets[PAIR_SYMBOL]
         contract_val = float(market['contractSize'])
         min_order_size = float(market['limits']['amount']['min'])
@@ -217,11 +215,9 @@ async def execute_trade(exchange, signal: dict):
         }
         log.info(f"Выполнение предварительной проверки ордера: {pre_check_params}")
 
-        # [ГЛАВНЫЙ ФИКС] API OKX ожидает массив (list) ордеров, даже если он один.
-        # Оборачиваем pre_check_params в квадратные скобки [].
-        pre_check_result = await exchange.private_post_trade_order_precheck([pre_check_params])
+        # [ГЛАВНЫЙ ФИКС] Исправлено имя метода на camelCase, как того требует ccxt
+        pre_check_result = await exchange.privatePostTradeOrderPrecheck([pre_check_params])
         
-        # Проверяем ответ от API
         if pre_check_result.get('code') != '0' or (pre_check_result.get('data') and pre_check_result['data'][0].get('sCode') != '0'):
              error_msg = pre_check_result['data'][0]['sMsg'] if pre_check_result.get('data') and pre_check_result['data'][0].get('sMsg') else pre_check_result.get('msg', 'Неизвестная ошибка pre-check')
              log.error(f"Предварительная проверка не пройдена: {error_msg}")
@@ -253,18 +249,15 @@ async def process_closed_trade(exchange, trade_details, bot):
         log.info(f"Обработка закрытой сделки. ID ордера: {trade_details['id']}")
         order_id = trade_details['id']
         
-        # Используем fetch_my_trades для получения данных о сделке, это надежнее
         trades = await exchange.fetch_my_trades(symbol=PAIR_SYMBOL, params={'ordId': order_id})
         if not trades:
             log.warning(f"Не удалось получить данные о сделке для ордера {order_id}. Использую данные из сигнала.")
-            # Фоллбэк, если не удалось получить данные о сделке
             closed_order = await exchange.fetch_order(order_id, PAIR_SYMBOL)
             exit_price = float(closed_order.get('average', trade_details['sl_price']))
             fee = abs(float(closed_order.get('fee', {}).get('cost', 0)))
             realized_pnl = float(closed_order['info'].get('pnl', 0))
         else:
-            # Данные из реальной сделки
-            trade = trades[-1] # последняя сделка по ордеру
+            trade = trades[-1]
             exit_price = float(trade['price'])
             fee = abs(float(trade.get('fee', {}).get('cost', 0)))
             realized_pnl = float(trade['info'].get('pnl', 0))
@@ -309,7 +302,7 @@ async def process_closed_trade(exchange, trade_details, bot):
 
     except Exception as e:
         log.error(f"Ошибка обработки закрытой сделки {trade_details['id']}: {e}")
-        await notify_all(f"🔴 Ошибка обработки закрытой сделки {trade_details['id']}. Проверьте логи.", bot)
+        await notify_all(f"� Ошибка обработки закрытой сделки {trade_details['id']}. Проверьте логи.", bot)
 
 async def recalculate_adx_threshold():
     try:
@@ -368,7 +361,6 @@ async def monitor(app: Application):
 
             if active_trade_details := state.get("active_trade"):
                 positions = await exchange.fetch_positions([PAIR_SYMBOL])
-                # [УЛУЧШЕНИЕ] Более надежная проверка активной позиции
                 trade_side = 'long' if active_trade_details['side'] == 'LONG' else 'short'
                 active_position_on_exchange = next((p for p in positions if p['symbol'] == PAIR_SYMBOL and p.get('side') == trade_side and float(p.get('contracts', 0)) > 0), None)
 
