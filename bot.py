@@ -1,13 +1,26 @@
 #!/usr/bin/env python3
 # ============================================================================
-#  Flat‑Liner • Heroku edition — 16 Jul 2025 (fixed & updated)
+#  Flat‑Liner • Heroku edition — 16 Jul 2025 (fixed & updated)
 #  Стратегия  : Flat_BB_Fade  +  динамический ADX‑фильтр
 #  Биржа      : OKX (USDT‑Swap)
 #  Команды    : /start /stop /status /set_deposit /set_leverage /test_trade
 #  Автор      : Kirill2402100  |  MIT Licence
 # ============================================================================
 
-import os, json, logging, asyncio
+"""
+Основные исправления по сравнению с предыдущей ревизией
+------------------------------------------------------
+1.  Все обращения к рынку через `ex.market(PAIR_SYMBOL)` вместо прямого
+   индекса `ex.markets[...]` — работает и с alias‑ами OKX (`BTC-USDT-SWAP`,
+   `BTC/USDT:USDT`, etc.).
+2.  Расчёт размера позиции делает `floor` до шага‑минимума, чтобы не
+   получить ноль при маленьком депозите.
+3.  TP/SL ставятся одним **conditional**‑ордером (поддерживает `-1` для
+   рыночного выхода). Для хедж‑режима добавлены и `side`, и `posSide`.
+4.  Обработчик SIGTERM — dyno Heroku завершится без R12.
+"""
+
+import os, json, logging, asyncio, signal, sys, math
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Optional
@@ -59,7 +72,8 @@ state = {
     "daily_pnls": []
 }
 
-def save_state(): STATE_FILE.write_text(json.dumps(state, indent=2))
+def save_state():
+    STATE_FILE.write_text(json.dumps(state, indent=2))
 
 def load_state():
     if STATE_FILE.exists():
@@ -68,6 +82,19 @@ def load_state():
         except Exception:
             log.warning("STATE‑файл повреждён → создаю новый")
     save_state()
+
+# ───────────────────  SIGTERM graceful shutdown  ─────────────────────────
+
+def handle_sigterm(*_):
+    log.info("SIGTERM received, shutting down…")
+    for t in asyncio.all_tasks():
+        t.cancel()
+    try:
+        asyncio.get_event_loop().run_until_complete(asyncio.sleep(0))
+    finally:
+        sys.exit(0)
+
+signal.signal(signal.SIGTERM, handle_sigterm)
 
 # ─────────────────── HELPERS ─────────────────────────────────────────────
 async def notify(text: str, bot: Optional[Bot] = None):
@@ -122,39 +149,47 @@ async def recalc_adx_threshold():
     finally:
         await ex.close()
 
+async def calc_position_size(market, price):
+    step = float(market["limits"]["amount"]["min"])
+    raw  = (state["deposit"] * state["leverage"]) / price / float(market["contractSize"])
+    size = math.floor(raw/step) * step
+    return size, step
+
+async def place_tp_sl(ex, size, side, pos_side, price):
+    sl_price = price * (1 - SL_PCT / 100) if side == "LONG" else price * (1 + SL_PCT / 100)
+    tp_price = price * (1 + SL_PCT * RR_RATIO / 100) if side == "LONG" else price * (1 - SL_PCT * RR_RATIO / 100)
+    side_close = "sell" if side == "LONG" else "buy"
+
+    await ex.private_post_trade_order_algo({
+        "instId":       PAIR_SYMBOL,
+        "tdMode":       "isolated",
+        "side":         side_close,
+        "posSide":      pos_side,
+        "sz":           str(size),
+        "ordType":      "conditional",
+        "tpTriggerPx":  str(tp_price),
+        "tpOrdPx":      "-1",
+        "slTriggerPx":  str(sl_price),
+        "slOrdPx":      "-1",
+    })
+
 async def execute_trade(ex, side, price):
-    m = ex.markets[PAIR_SYMBOL]
-    size = round((state["deposit"] * state["leverage"]) / price / float(m["contractSize"]))
-    if size < float(m["limits"]["amount"]["min"]):
+    market = ex.market(PAIR_SYMBOL)
+    size, step = await calc_position_size(market, price)
+    if size < step:
         await notify("🔴 Размер сделки меньше минимального")
         return None
 
-    # Шаг 1: Создаем рыночный ордер
-    pos_side = "long" if side == "LONG" else "short"
-    order_side = "buy" if side == "LONG" else "sell"
+    pos_side   = "long" if side == "LONG" else "short"
+    order_side = "buy"  if side == "LONG" else "sell"
+
     order = await ex.create_order(
         PAIR_SYMBOL, "market", order_side, size,
         params={"tdMode": "isolated", "posSide": pos_side}
     )
-    await notify(f"✅ Открыта позиция {side} ID <code>{order['id']}</code>. Устанавливаю SL/TP...", parse_mode="HTML")
+    await notify(f"✅ Открыта позиция {side}  ID <code>{order['id']}</code>. Устанавливаю SL/TP…", parse_mode="HTML")
 
-    # Шаг 2: Устанавливаем SL/TP для открытой позиции через OCO ордер
-    sl_price = price * (1 - SL_PCT / 100) if side == "LONG" else price * (1 + SL_PCT / 100)
-    tp_price = price * (1 + SL_PCT * RR_RATIO / 100) if side == "LONG" else price * (1 - SL_PCT * RR_RATIO / 100)
-    side_for_close = "sell" if side == "LONG" else "buy"
-    
-    await ex.private_post_trade_order_algo({
-        "instId": PAIR_SYMBOL,
-        "tdMode": "isolated",
-        "side": side_for_close,
-        "posSide": pos_side, # <--- ИСПРАВЛЕНО
-        "sz": str(size),
-        "ordType": "oco",
-        "tpTriggerPx": str(tp_price),
-        "tpOrdPx": "-1",
-        "slTriggerPx": str(sl_price),
-        "slOrdPx": "-1",
-    })
+    await place_tp_sl(ex, size, side, pos_side, price)
     await notify(f"✅ SL/TP для ордера <code>{order['id']}</code> успешно установлены.", parse_mode="HTML")
     return order["id"]
 
@@ -214,7 +249,6 @@ async def reporter(app: Application):
 
 # ─────────────────── COMMANDS ───────────────────────────────────────────
 async def cmd_start(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    """Отправляет приветствие и статус при команде /start"""
     await notify("🚀 Flat-Liner запущен. Используйте /status для проверки состояния.", c.bot)
     await cmd_status(u, c)
 
@@ -233,55 +267,40 @@ async def cmd_test_trade(u: Update, c: ContextTypes.DEFAULT_TYPE):
         side = args.get('side', '').upper()
         sl_price = float(args.get('sl'))
         tp_price = float(args.get('tp'))
-        if side not in ['LONG', 'SHORT']: raise ValueError("Параметр 'side' обязателен (LONG или SHORT).")
-        deposit = float(args.get('deposit', state['deposit']))
-        leverage = int(args.get('leverage', state['leverage']))
-    except (ValueError, TypeError, KeyError):
+        if side not in ['LONG', 'SHORT']:
+            raise ValueError("Параметр 'side' обязателен (LONG или SHORT).")
+        deposit  = float(args.get('deposit', state['deposit']))
+        leverage = int  (args.get('leverage', state['leverage']))
+    except Exception:
         await u.message.reply_text(
             "❌ **Ошибка в параметрах.**\n\n"
-            "Убедитесь, что все значения указаны верно. Обязательные параметры: `side`, `sl`, `tp`.\n\n"
-            "<i>Пример: /test_trade side=LONG sl=119000 tp=120000</i>",
-            parse_mode="HTML"
-        )
+            "Обязательные: side, sl, tp. Пример: /test_trade side=LONG sl=119000 tp=120000",
+            parse_mode="HTML")
         return
 
-    await u.message.reply_text(f"🛠️ Открываю тестовую позицию {side}...")
+    await u.message.reply_text(f"🛠️ Открываю тестовую позицию {side}…")
     ex = None
     try:
         ex = await create_exchange()
         await set_leverage(ex, leverage)
-        market = ex.markets[PAIR_SYMBOL]
+        market = ex.market(PAIR_SYMBOL)
         ticker = await ex.fetch_ticker(PAIR_SYMBOL)
-        price = ticker['last']
-        size = round((deposit * leverage) / price / float(market["contractSize"]))
-        if size < float(market["limits"]["amount"]["min"]):
-            await u.message.reply_text(f"🔴 Размер сделки ({size}) меньше минимального.")
-            if ex: await ex.close()
+        price  = ticker['last']
+        step   = float(market['limits']['amount']['min'])
+        raw_sz = (deposit*leverage) / price / float(market['contractSize'])
+        size   = math.floor(raw_sz/step)*step
+        if size < step:
+            await u.message.reply_text(f"🔴 Размер сделки ({size}) меньше минимального ({step}).")
             return
 
-        # Шаг 1: Создаем рыночный ордер
-        pos_side = "long" if side == "LONG" else "short"
-        order_side = "buy" if side == "LONG" else "sell"
-        order = await ex.create_order(
-            PAIR_SYMBOL, "market", order_side, size,
-            params={"tdMode": "isolated", "posSide": pos_side}
-        )
-        await u.message.reply_text(f"✅ Ордер <code>{order['id']}</code> создан. Устанавливаю SL/TP...", parse_mode="HTML")
+        pos_side   = "long" if side == "LONG" else "short"
+        order_side = "buy"  if side == "LONG" else "sell"
+        order = await ex.create_order(PAIR_SYMBOL, "market", order_side, size,
+                                      params={"tdMode":"isolated", "posSide":pos_side})
+        await u.message.reply_text(f"✅ Ордер <code>{order['id']}</code> создан. Устанавливаю SL/TP…", parse_mode="HTML")
 
-        # Шаг 2: Устанавливаем SL/TP для открытой позиции через OCO ордер
-        side_for_close = "sell" if side == "LONG" else "buy"
-        await ex.private_post_trade_order_algo({
-            "instId": PAIR_SYMBOL,
-            "tdMode": "isolated",
-            "side": side_for_close,
-            "posSide": pos_side, # <--- ИСПРАВЛЕНО
-            "sz": str(size),
-            "ordType": "oco",
-            "tpTriggerPx": str(tp_price),
-            "tpOrdPx": "-1",
-            "slTriggerPx": str(sl_price),
-            "slOrdPx": "-1",
-        })
+        # Conditional TP/SL
+        await place_tp_sl(ex, size, side, pos_side, price)
         await u.message.reply_text(f"✅ SL/TP для ордера <code>{order['id']}</code> успешно установлены.", parse_mode="HTML")
 
     except Exception as e:
@@ -297,44 +316,41 @@ async def cmd_stop(u: Update, c: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_set_dep(u: Update, c: ContextTypes.DEFAULT_TYPE):
     try:
-        state["deposit"] = float(c.args[0]); save_state()
+        state['deposit'] = float(c.args[0]); save_state()
         await u.message.reply_text(f"Депозит = {state['deposit']}$")
-    except: await u.message.reply_text("Формат: /set_deposit 25")
+    except Exception:
+        await u.message.reply_text("Формат: /set_deposit 25")
 
 async def cmd_set_lev(u: Update, c: ContextTypes.DEFAULT_TYPE):
     try:
         lev = int(c.args[0]); assert 1<=lev<=125
         ex = await create_exchange(); await set_leverage(ex, lev); await ex.close()
-        state["leverage"] = lev; save_state()
+        state['leverage'] = lev; save_state()
         await u.message.reply_text(f"Плечо = {lev}x")
-    except: await u.message.reply_text("Формат: /set_leverage 50")
+    except Exception:
+        await u.message.reply_text("Формат: /set_leverage 50")
 
 # ─────────────────── MAIN ──────────────────────────────────────────────────
 async def post_init_tasks(app: Application):
-    """Запускает фоновые задачи после инициализации бота."""
     await notify("♻️ Бот перезапущен.", app.bot)
     if not state["monitoring"]:
-        state["monitoring"] = True
-        save_state()
+        state["monitoring"] = True; save_state()
     asyncio.create_task(monitor(app))
     asyncio.create_task(reporter(app))
 
+
 def main() -> None:
-    """Основная функция запуска бота."""
     load_state()
     app = (ApplicationBuilder()
            .token(BOT_TOKEN)
            .post_init(post_init_tasks)
            .build())
-
-    # Регистрация обработчиков команд
     app.add_handler(CommandHandler("start",        cmd_start))
     app.add_handler(CommandHandler("status",       cmd_status))
     app.add_handler(CommandHandler("stop",         cmd_stop))
     app.add_handler(CommandHandler("set_deposit",  cmd_set_dep))
     app.add_handler(CommandHandler("set_leverage", cmd_set_lev))
     app.add_handler(CommandHandler("test_trade",   cmd_test_trade))
-
     app.run_polling()
     log.info("Бот остановлен.")
 
