@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 # ============================================================================
-# Flat-Liner v9.2 • 16 Jul 2025
+# Flat-Liner v9.3 • 16 Jul 2025
 # ============================================================================
 # • СТРАТЕГИЯ: Флэтовая стратегия 'Flat_BB_Fade' с обязательным фильтром по ADX
 # • БИРЖА: Bybit
 # • АВТОТРЕЙДИНГ: Полная интеграция с API для размещения ордеров
-# • ИСПРАВЛЕНИЕ v9.2:
-#   - Исправлен регистр в именах переменных окружения для API ключей Bybit.
+# • ИСПРАВЛЕНИЕ v9.3:
+#   - Добавлена команда /apitest для проверки API ключей прямо из Telegram.
 # ============================================================================
 
 import os
@@ -33,7 +33,7 @@ CHAT_IDS_RAW  = os.getenv("CHAT_IDS", "")
 # ВАЖНО: Используйте формат Bybit для USDT-фьючерсов, например 'BTC/USDT:USDT'
 PAIR_SYMBOL   = os.getenv("PAIR_SYMBOL", "BTC/USDT:USDT")
 TIMEFRAME     = os.getenv("TIMEFRAME", "5m")
-STRAT_VERSION = "v9_2_flatliner_bybit"
+STRAT_VERSION = "v9_3_flatliner_bybit"
 SHEET_ID      = os.getenv("SHEET_ID")
 
 
@@ -194,8 +194,6 @@ async def execute_trade(exchange, signal: dict):
 async def process_closed_trade(exchange, trade_details, bot):
     try:
         log.info(f"Обработка закрытой сделки. ID ордера: {trade_details['id']}")
-        # Эта логика может потребовать адаптации под структуру ответа Bybit
-        # Для начала, простое уведомление
         await notify_all(f"✅ Сделка {trade_details['id']} ({trade_details['side']}) была закрыта.", bot)
     except Exception as e:
         log.error(f"Ошибка обработки закрытой сделки {trade_details['id']}: {e}")
@@ -336,16 +334,16 @@ async def daily_reporter(app: Application):
             await asyncio.sleep(60)
             continue
 
-        total_pnl_usd = sum(item['pnl_usd'] for item in report_data)
+        total_pnl_usd = sum(item.get('pnl_usd', 0) for item in report_data)
         total_trades = len(report_data)
-        wins = sum(1 for item in report_data if item['pnl_usd'] > 0)
+        wins = sum(1 for item in report_data if item.get('pnl_usd', 0) > 0)
         losses = total_trades - wins
         win_rate = (wins / total_trades) * 100 if total_trades > 0 else 0
         
-        total_investment = sum(item['entry_usd'] for item in report_data)
+        total_investment = sum(item.get('entry_usd', 0) for item in report_data)
         pnl_percent = (total_pnl_usd / total_investment) * 100 if total_investment > 0 else 0
         
-        report_msg = (f"📊 <b>Суточный отчёт по стратегии {STRAT_VERSION}</b> 📊\n\n"
+        report_msg = (f"📊 <b>Суточный отчёт по стратегии {STRAT_VERSION}</b> �\n\n"
                       f"<b>Период:</b> последние 24 часа\n"
                       f"<b>Всего сделок:</b> {total_trades} (📈{wins} / 📉{losses})\n"
                       f"<b>Винрейт:</b> {win_rate:.2f}%\n\n"
@@ -462,6 +460,43 @@ async def test_trade_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         log.error(f"Ошибка в команде test_trade: {e}")
         await update.message.reply_text(f"⚠️ Ошибка формата команды.\n<b>Пример:</b> /test_trade deposit=30 leverage=80 tp=120000 sl=100000 side=LONG", parse_mode="HTML")
 
+async def apitest_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("⚙️ <b>Запускаю тест API ключей...</b>", parse_mode="HTML")
+    exchange = None
+    try:
+        # Используем ключи из переменных окружения
+        if not BYBIT_API_KEY or not BYBIT_API_SECRET:
+            await update.message.reply_text("🔴 API ключи не найдены в переменных окружения.", parse_mode="HTML")
+            return
+
+        exchange = ccxt.bybit({
+            'apiKey': BYBIT_API_KEY,
+            'secret': BYBIT_API_SECRET,
+        })
+        exchange.set_sandbox_mode(DEMO_MODE == '1')
+
+        await update.message.reply_text("Попытка подключения и получения баланса...", parse_mode="HTML")
+        balance = await exchange.fetch_balance()
+        
+        await update.message.reply_text(f"✅ <b>УСПЕХ!</b>\nПодключение к Bybit прошло успешно.\n\n"
+                                        f"<b>Баланс USDT:</b> <code>{balance.get('USDT', {'total': 'Не найден'})['total']}</code>",
+                                        parse_mode="HTML")
+
+    except ccxt.AuthenticationError as e:
+        await update.message.reply_text(f"❌ <b>ОШИБКА АУТЕНТИФИКАЦИИ!</b>\n"
+                                        f"Биржа Bybit отклонила ваши ключи. Ошибка: <code>{e}</code>\n\n"
+                                        f"<b>ПРОВЕРЬТЕ:</b>\n"
+                                        f"1. Правильно ли скопированы ключи.\n"
+                                        f"2. Тип аккаунта (Стандартный/Единый).\n"
+                                        f"3. Разрешения у ключа (Ордера и Позиции для Контрактов).\n"
+                                        f"4. Привязку к IP (должна быть отключена).",
+                                        parse_mode="HTML")
+    except Exception as e:
+        log.error(f"Критическая ошибка в /apitest: {e}")
+        await update.message.reply_text(f"🔴 <b>Произошла другая ошибка:</b>\n<code>{e}</code>", parse_mode="HTML")
+    finally:
+        if exchange:
+            await exchange.close()
 
 async def post_init(app: Application):
     load_state()
@@ -482,5 +517,6 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("set_deposit", set_deposit_command))
     app.add_handler(CommandHandler("set_leverage", set_leverage_command))
     app.add_handler(CommandHandler("test_trade", test_trade_command))
+    app.add_handler(CommandHandler("apitest", apitest_command)) # Новая команда
     log.info("Запуск бота...")
     app.run_polling()
