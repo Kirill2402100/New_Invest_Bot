@@ -322,14 +322,21 @@ async def run() -> None:
     loop.add_signal_handler(signal.SIGTERM, stop_future.set_result, None)
     loop.add_signal_handler(signal.SIGINT , stop_future.set_result, None)
 
-    async with app:
-        await app.start()
-        await stop_future      # ждём сигнала от Heroku
-        log.info("Получен сигнал на остановку. Завершаю задачи...")
-        monitor_task.cancel(); report_task.cancel()
-        await asyncio.gather(monitor_task, report_task, return_exceptions=True)
-        await app.stop()
-        log.info("Бот остановлен.")
+   async with app:
+    await app.initialize()               # ← добавили
+    await app.start()                    # ← как было
+    await app.updater.start_polling()    # ← добавили
+
+    # ваши фоновые задачи уже созданы выше
+    await stop_future                    # ждём SIGTERM / Ctrl-C
+
+    # ─ graceful shutdown ─
+    monitor_task.cancel(); report_task.cancel()
+    await asyncio.gather(monitor_task, report_task, return_exceptions=True)
+
+    await app.updater.stop()             # ← добавили
+    await app.stop()
+       log.info("Бот остановлен.")
 
 if __name__ == "__main__":
     try:
