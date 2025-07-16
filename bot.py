@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
 # ============================================================================
-# Flat-Liner v11.8 • 16 Jul 2025
+# Flat-Liner v11.9 • 16 Jul 2025
 # ============================================================================
 # • СТРАТЕГИЯ: Флэтовая стратегия 'Flat_BB_Fade' с обязательным фильтром по ADX
 # • БИРЖА: OKX (финальная версия для нового хостинга)
 # • АВТОТРЕЙДИНГ: Полная интеграция с API для размещения ордеров
-# • ИСПРАВЛЕНИЕ v11.8:
-#   - Внедрен "хирургический" механизм грациозного завершения: бот теперь
-#     отслеживает и отменяет только собственные фоновые задачи, не трогая
-#     внутренние процессы библиотеки, что решает все ошибки при перезапуске.
+# • ИСПРАВЛЕНИЕ v11.9:
+#   - Восстановлены обработчики команд Telegram (/start, /stop и т.д.),
+#     которые были утеряны при рефакторинге. Бот снова интерактивен.
 # ============================================================================
 
 import os
@@ -35,7 +34,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_IDS_RAW = os.getenv("CHAT_IDS", "")
 PAIR_SYMBOL = os.getenv("PAIR_SYMBOL", "BTC-USDT-SWAP") # Формат OKX
 TIMEFRAME = os.getenv("TIMEFRAME", "5m")
-STRAT_VERSION = "v11_8_flatliner_okx_render"
+STRAT_VERSION = "v11_9_flatliner_okx_render"
 SHEET_ID = os.getenv("SHEET_ID")
 
 # --- OKX API ---
@@ -345,7 +344,7 @@ async def set_leverage_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         leverage = int(ctx.args[0])
         if not 1 <= leverage <= 125: raise ValueError
         exchange = await initialize_exchange()
-        if not exchange: await update.message.reply_text("� Ошибка подключения к бирже."); return
+        if not exchange: await update.message.reply_text("🔴 Ошибка подключения к бирже."); return
         if await set_leverage_on_exchange(exchange, PAIR_SYMBOL, leverage):
             state['leverage'] = leverage; save_state()
             await update.message.reply_text(f"✅ Плечо установлено: <b>{leverage}x</b>", parse_mode="HTML")
@@ -418,7 +417,7 @@ async def shutdown_handler(app: Application):
 
     if BACKGROUND_TASKS:
         log.info(f"Отменяю {len(BACKGROUND_TASKS)} пользовательских фоновых задач...")
-        for task in BACKGROUND_TASKS:
+        for task in list(BACKGROUND_TASKS):
             task.cancel()
         await asyncio.gather(*BACKGROUND_TASKS, return_exceptions=True)
         log.info("Все пользовательские фоновые задачи завершены.")
@@ -436,6 +435,15 @@ async def main() -> None:
         .post_init(post_init)
         .build()
     )
+
+    # <<< ВОССТАНОВЛЕННЫЕ ОБРАБОТЧИКИ >>>
+    app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler("stop", stop_command))
+    app.add_handler(CommandHandler("status", status_command))
+    app.add_handler(CommandHandler("set_deposit", set_deposit_command))
+    app.add_handler(CommandHandler("set_leverage", set_leverage_command))
+    app.add_handler(CommandHandler("test_trade", test_trade_command))
+    app.add_handler(CommandHandler("apitest", apitest_command))
 
     # Настраиваем обработку сигналов для грациозного завершения
     loop = asyncio.get_running_loop()
