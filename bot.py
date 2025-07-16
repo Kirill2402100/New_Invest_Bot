@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 # ============================================================================
-# Flat-Liner v11.5 • 16 Jul 2025
+# Flat-Liner v11.6 • 16 Jul 2025
 # ============================================================================
 # • СТРАТЕГИЯ: Флэтовая стратегия 'Flat_BB_Fade' с обязательным фильтром по ADX
 # • БИРЖА: OKX (финальная версия для нового хостинга)
 # • АВТОТРЕЙДИНГ: Полная интеграция с API для размещения ордеров
-# • ИСПРАВЛЕНИЕ v11.5:
-#   - Реализован надежный механизм грациозного завершения через shutdown_callback
-#     для принудительной отмены всех фоновых задач и предотвращения
-#     ошибки 'telegram.error.Conflict'.
+# • ИСПРАВЛЕНИЕ v11.6:
+#   - Исправлена ошибка 'AttributeError' путем замены 'shutdown_callback'
+#     на явный вызов асинхронной функции завершения после остановки
+#     основного цикла.
 # ============================================================================
 
 import os
@@ -35,7 +35,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_IDS_RAW = os.getenv("CHAT_IDS", "")
 PAIR_SYMBOL = os.getenv("PAIR_SYMBOL", "BTC-USDT-SWAP") # Формат OKX
 TIMEFRAME = os.getenv("TIMEFRAME", "5m")
-STRAT_VERSION = "v11_5_flatliner_okx_render"
+STRAT_VERSION = "v11_6_flatliner_okx_render"
 SHEET_ID = os.getenv("SHEET_ID")
 
 # --- OKX API ---
@@ -421,9 +421,15 @@ if __name__ == "__main__":
         ApplicationBuilder()
         .token(BOT_TOKEN)
         .post_init(post_init)
-        .shutdown_callback(shutdown_handler)
         .build()
     )
     
     log.info("Запуск бота...")
     app.run_polling(stop_signals=[signal.SIGINT, signal.SIGTERM])
+    
+    # Этот код выполнится после остановки run_polling сигналом
+    log.info("Polling остановлен. Запуск процедуры завершения...")
+    try:
+        asyncio.run(shutdown_handler(app))
+    except Exception as e:
+        log.error(f"Ошибка во время ручного завершения: {e}")
