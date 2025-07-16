@@ -124,16 +124,37 @@ async def recalc_adx_threshold():
 
 async def execute_trade(ex, side, price):
     m = ex.markets[PAIR_SYMBOL]
-    size = round((state["deposit"]*state["leverage"])/price/float(m["contractSize"]))
+    size = round((state["deposit"] * state["leverage"]) / price / float(m["contractSize"]))
     if size < float(m["limits"]["amount"]["min"]):
-        await notify("🔴 Размер сделки меньше минимального"); return None
+        await notify("🔴 Размер сделки меньше минимального")
+        return None
 
-    sl = price*(1-SL_PCT/100) if side=="LONG" else price*(1+SL_PCT/100)
-    tp = price*(1+SL_PCT*RR_RATIO/100) if side=="LONG" else price*(1-SL_PCT*RR_RATIO/100)
-    params = {"tdMode":"isolated","posSide":"long" if side=="LONG" else "short",
-              "slTriggerPx":str(sl),"slOrdPx":"-1","tpTriggerPx":str(tp),"tpOrdPx":"-1"}
-    order = await ex.create_order(PAIR_SYMBOL,"market","buy" if side=="LONG" else "sell",size,params=params)
-    await notify(f"✅ Открыта позиция {side}  ID <code>{order['id']}</code>")
+    # Шаг 1: Создаем рыночный ордер
+    pos_side = "long" if side == "LONG" else "short"
+    order_side = "buy" if side == "LONG" else "sell"
+    order = await ex.create_order(
+        PAIR_SYMBOL, "market", order_side, size,
+        params={"tdMode": "isolated", "posSide": pos_side}
+    )
+    await notify(f"✅ Открыта позиция {side} ID <code>{order['id']}</code>. Устанавливаю SL/TP...", parse_mode="HTML")
+
+    # Шаг 2: Устанавливаем SL/TP для открытой позиции через OCO ордер
+    sl_price = price * (1 - SL_PCT / 100) if side == "LONG" else price * (1 + SL_PCT / 100)
+    tp_price = price * (1 + SL_PCT * RR_RATIO / 100) if side == "LONG" else price * (1 - SL_PCT * RR_RATIO / 100)
+    side_for_close = "sell" if side == "LONG" else "buy"
+    
+    await ex.private_post_trade_order_algo({
+        "instId": PAIR_SYMBOL,
+        "tdMode": "isolated",
+        "side": side_for_close,
+        "sz": str(size),
+        "ordType": "oco", # OCO - One-Cancels-the-Other
+        "tpTriggerPx": str(tp_price),
+        "tpOrdPx": "-1",
+        "slTriggerPx": str(sl_price),
+        "slOrdPx": "-1",
+    })
+    await notify(f"✅ SL/TP для ордера <code>{order['id']}</code> успешно установлены.", parse_mode="HTML")
     return order["id"]
 
 # ─────────────────── MONITOR ─────────────────────────────────────────────
@@ -205,9 +226,7 @@ async def cmd_status(u: Update, c: ContextTypes.DEFAULT_TYPE):
     await u.message.reply_text(txt, parse_mode="HTML")
 
 async def cmd_test_trade(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    """
-    Открывает тестовую позицию с параметрами: deposit, leverage, sl, tp, side
-    """
+    """Открывает тестовую позицию с параметрами: deposit, leverage, sl, tp, side"""
     try:
         args = {k.lower(): v for k, v in (arg.split('=', 1) for arg in c.args)}
         side = args.get('side', '').upper()
@@ -239,31 +258,28 @@ async def cmd_test_trade(u: Update, c: ContextTypes.DEFAULT_TYPE):
             if ex: await ex.close()
             return
 
-        # Шаг 1: Создаем рыночный ордер без SL/TP
-        order_side = "buy" if side == "LONG" else "sell"
+        # Шаг 1: Создаем рыночный ордер
         pos_side = "long" if side == "LONG" else "short"
-        
+        order_side = "buy" if side == "LONG" else "sell"
         order = await ex.create_order(
-            PAIR_SYMBOL, 
-            "market", 
-            order_side, 
-            size, 
+            PAIR_SYMBOL, "market", order_side, size,
             params={"tdMode": "isolated", "posSide": pos_side}
         )
         await u.message.reply_text(f"✅ Ордер <code>{order['id']}</code> создан. Устанавливаю SL/TP...", parse_mode="HTML")
 
-        # Шаг 2: Устанавливаем SL/TP для открытой позиции
+        # Шаг 2: Устанавливаем SL/TP для открытой позиции через OCO ордер
+        side_for_close = "sell" if side == "LONG" else "buy"
         await ex.private_post_trade_order_algo({
-            'instId': PAIR_SYMBOL,
-            'tdMode': 'isolated',
-            'posSide': pos_side,
-            'ordType': 'conditional',
-            'slTriggerPx': str(sl_price),
-            'slOrdPx': '-1',
-            'tpTriggerPx': str(tp_price),
-            'tpOrdPx': '-1',
+            "instId": PAIR_SYMBOL,
+            "tdMode": "isolated",
+            "side": side_for_close,
+            "sz": str(size),
+            "ordType": "oco", # OCO - One-Cancels-the-Other
+            "tpTriggerPx": str(tp_price),
+            "tpOrdPx": "-1",
+            "slTriggerPx": str(sl_price),
+            "slOrdPx": "-1",
         })
-        
         await u.message.reply_text(f"✅ SL/TP для ордера <code>{order['id']}</code> успешно установлены.", parse_mode="HTML")
 
     except Exception as e:
