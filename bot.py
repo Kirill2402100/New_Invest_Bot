@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 # ============================================================================
-# Flat-Liner v11.1 • 16 Jul 2025
+# Flat-Liner v11.2 • 16 Jul 2025
 # ============================================================================
 # • СТРАТЕГИЯ: Флэтовая стратегия 'Flat_BB_Fade' с обязательным фильтром по ADX
 # • БИРЖА: OKX (финальная версия для нового хостинга)
 # • АВТОТРЕЙДИНГ: Полная интеграция с API для размещения ордеров
-# • ИСПРАВЛЕНИЕ v11.1:
-#   - [ПОЛНЫЙ ФУНКЦИОНАЛ] Восстановлены все функции: Google Sheets,
-#     ежедневные отчеты, динамический ADX и все команды Telegram.
+# • ИСПРАВЛЕНИЕ v11.2:
+#   - Улучшена команда /apitest. Теперь она выводит полную структуру баланса
+#     для отладки, не вызывая ошибок.
 # ============================================================================
 
 import os
@@ -32,14 +32,14 @@ BOT_TOKEN     = os.getenv("BOT_TOKEN")
 CHAT_IDS_RAW  = os.getenv("CHAT_IDS", "")
 PAIR_SYMBOL   = os.getenv("PAIR_SYMBOL", "BTC-USDT-SWAP") # Формат OKX
 TIMEFRAME     = os.getenv("TIMEFRAME", "5m")
-STRAT_VERSION = "v11_1_flatliner_okx_render"
+STRAT_VERSION = "v11_2_flatliner_okx_render"
 SHEET_ID      = os.getenv("SHEET_ID")
 
 # --- OKX API ---
 OKX_API_KEY      = os.getenv("OKX_API_KEY")
 OKX_API_SECRET   = os.getenv("OKX_API_SECRET")
 OKX_API_PASSPHRASE = os.getenv("OKX_API_PASSPHRASE")
-OKX_DEMO_MODE    = os.getenv("OKX_DEMO_MODE", "1") 
+OKX_DEMO_MODE    = os.getenv("OKX_DEMO_MODE", "0") 
 
 # --- Параметры стратегии ---
 DEFAULT_DEPOSIT_USD = float(os.getenv("DEFAULT_DEPOSIT_USD", "50.0"))
@@ -342,16 +342,34 @@ async def test_trade_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         log.error(f"Ошибка в /test_trade: {e}")
         await update.message.reply_text(f"⚠️ Ошибка формата. Пример: /test_trade deposit=20 leverage=10 tp=65000 sl=60000 side=LONG", parse_mode="HTML")
+
 async def apitest_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("⚙️ <b>Тест API ключей OKX...</b>", parse_mode="HTML")
+    await update.message.reply_text("⚙️ <b>Тест API ключей OKX... (v2)</b>", parse_mode="HTML")
     exchange = await initialize_exchange()
-    if not exchange: await update.message.reply_text("🔴 Не удалось инициализировать биржу."); return
+    if not exchange:
+        await update.message.reply_text("🔴 Не удалось инициализировать биржу."); return
     try:
+        await update.message.reply_text("Попытка получить баланс...", parse_mode="HTML")
         balance = await exchange.fetch_balance()
-        await update.message.reply_text(f"✅ <b>УСПЕХ!</b>\nПодключение к OKX прошло успешно.\n<b>Общий баланс:</b> <code>{balance['total']['USDT']:.2f} USDT</code>", parse_mode="HTML")
+        
+        # Безопасно форматируем ответ для отправки
+        balance_str = json.dumps(balance, indent=2, ensure_ascii=False)
+        
+        # Telegram имеет лимит на длину сообщения
+        if len(balance_str) > 4000:
+            balance_str = balance_str[:4000] + "\n... (ответ обрезан)"
+
+        await update.message.reply_text(
+            f"✅ <b>УСПЕХ!</b>\nПодключение к OKX прошло успешно.\n\n"
+            f"<b>Полная структура баланса:</b>\n<pre>{balance_str}</pre>",
+            parse_mode="HTML"
+        )
     except Exception as e:
+        log.error(f"Ошибка в /apitest: {e}")
         await update.message.reply_text(f"❌ <b>ОШИБКА:</b> <code>{e}</code>", parse_mode="HTML")
-    finally: await exchange.close()
+    finally:
+        if exchange:
+            await exchange.close()
 
 async def post_init(app: Application):
     load_state()
