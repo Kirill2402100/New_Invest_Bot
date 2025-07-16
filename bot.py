@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 # ============================================================================
-# Flat-Liner v11.7 • 16 Jul 2025
+# Flat-Liner v11.8 • 16 Jul 2025
 # ============================================================================
 # • СТРАТЕГИЯ: Флэтовая стратегия 'Flat_BB_Fade' с обязательным фильтром по ADX
 # • БИРЖА: OKX (финальная версия для нового хостинга)
 # • АВТОТРЕЙДИНГ: Полная интеграция с API для размещения ордеров
-# • ИСПРАВЛЕНИЕ v11.7:
-#   - Переработан механизм запуска/остановки с использованием asyncio.Event
-#     для полного контроля над жизненным циклом и надежного грациозного
-#     завершения, что решает ошибки 'Conflict' и 'RuntimeError'.
+# • ИСПРАВЛЕНИЕ v11.8:
+#   - Внедрен "хирургический" механизм грациозного завершения: бот теперь
+#     отслеживает и отменяет только собственные фоновые задачи, не трогая
+#     внутренние процессы библиотеки, что решает все ошибки при перезапуске.
 # ============================================================================
 
 import os
@@ -35,7 +35,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_IDS_RAW = os.getenv("CHAT_IDS", "")
 PAIR_SYMBOL = os.getenv("PAIR_SYMBOL", "BTC-USDT-SWAP") # Формат OKX
 TIMEFRAME = os.getenv("TIMEFRAME", "5m")
-STRAT_VERSION = "v11_7_flatliner_okx_render"
+STRAT_VERSION = "v11_8_flatliner_okx_render"
 SHEET_ID = os.getenv("SHEET_ID")
 
 # --- OKX API ---
@@ -61,6 +61,7 @@ if not all([BOT_TOKEN, CHAT_IDS_RAW, OKX_API_KEY, OKX_API_SECRET, OKX_API_PASSPH
     log.critical("КРИТИЧЕСКАЯ ОШИБКА: Одна или несколько переменных окружения не установлены!"); raise SystemExit
 
 CHAT_IDS = {int(cid) for cid in CHAT_IDS_RAW.split(",") if cid.strip()}
+BACKGROUND_TASKS = set()
 
 # ── GOOGLE SHEETS ────────────────────────────────────────────────────────────
 TRADE_LOG_WS = None
@@ -319,7 +320,11 @@ async def start_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     state["monitoring"] = True; save_state()
     await update.message.reply_text(f"✅ Бот <b>{STRAT_VERSION}</b> запущен.", parse_mode="HTML")
-    asyncio.create_task(monitor(ctx.application))
+    
+    task = asyncio.create_task(monitor(ctx.application))
+    BACKGROUND_TASKS.add(task)
+    task.add_done_callback(BACKGROUND_TASKS.discard)
+
 async def stop_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     state["monitoring"] = False; save_state()
     await update.message.reply_text("❌ Бот остановлен. Основной цикл завершится после текущей итерации.")
@@ -340,7 +345,7 @@ async def set_leverage_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         leverage = int(ctx.args[0])
         if not 1 <= leverage <= 125: raise ValueError
         exchange = await initialize_exchange()
-        if not exchange: await update.message.reply_text("🔴 Ошибка подключения к бирже."); return
+        if not exchange: await update.message.reply_text("� Ошибка подключения к бирже."); return
         if await set_leverage_on_exchange(exchange, PAIR_SYMBOL, leverage):
             state['leverage'] = leverage; save_state()
             await update.message.reply_text(f"✅ Плечо установлено: <b>{leverage}x</b>", parse_mode="HTML")
@@ -395,22 +400,28 @@ async def post_init(app: Application):
     setup_google_sheets()
     log.info("Бот инициализирован.")
     await notify_all(f"✅ Бот <b>{STRAT_VERSION}</b> перезапущен.", bot=app.bot)
+    
     if state.get("monitoring"):
-        asyncio.create_task(monitor(app))
-    asyncio.create_task(daily_reporter(app))
+        task = asyncio.create_task(monitor(app))
+        BACKGROUND_TASKS.add(task)
+        task.add_done_callback(BACKGROUND_TASKS.discard)
+
+    task = asyncio.create_task(daily_reporter(app))
+    BACKGROUND_TASKS.add(task)
+    task.add_done_callback(BACKGROUND_TASKS.discard)
+
 
 async def shutdown_handler(app: Application):
     """Handles graceful shutdown."""
     log.warning("Получен сигнал на остановку. Начинаю грациозное завершение...")
     await notify_all(f"⚠️ Бот <b>{STRAT_VERSION}</b> перезапускается/останавливается.", bot=app.bot)
 
-    tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
-    log.info(f"Отменяю {len(tasks)} фоновых задач...")
-    for task in tasks:
-        task.cancel()
-
-    await asyncio.gather(*tasks, return_exceptions=True)
-    log.info("Все фоновые задачи завершены.")
+    if BACKGROUND_TASKS:
+        log.info(f"Отменяю {len(BACKGROUND_TASKS)} пользовательских фоновых задач...")
+        for task in BACKGROUND_TASKS:
+            task.cancel()
+        await asyncio.gather(*BACKGROUND_TASKS, return_exceptions=True)
+        log.info("Все пользовательские фоновые задачи завершены.")
 
     state["monitoring"] = False
     save_state()
