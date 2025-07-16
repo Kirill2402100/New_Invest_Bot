@@ -143,25 +143,34 @@ def calc_size(market, price, deposit, leverage):
     return size, step
 
 async def place_tp_sl(ex, size, side, pos_side, entry_price):
-    sl_price = entry_price*(1-SL_PCT/100) if side=="LONG" else entry_price*(1+SL_PCT/100)
-    tp_price = entry_price*(1+SL_PCT*RR_RATIO/100) if side=="LONG" else entry_price*(1-SL_PCT*RR_RATIO/100)
-    side_close = "sell" if side=="LONG" else "buy"
+    """
+    Ставит TP/SL через POST /trade/order-algo (ordType = conditional).
+    Логирует фактический payload → строку вида 'ALGOREQ {...}'.
+    """
+    # расчёт цен
+    sl_price = entry_price * (1 - SL_PCT/100) if side == "LONG" else entry_price * (1 + SL_PCT/100)
+    tp_price = entry_price * (1 + SL_PCT*RR_RATIO/100) if side == "LONG" else entry_price * (1 - SL_PCT*RR_RATIO/100)
+    side_close = "sell" if side == "LONG" else "buy"
+
+    # берём именно биржевой id ('BTC-USDT-SWAP'), а не унифицированный символ
+    market   = ex.market(PAIR_SYMBOL)
+    inst_id  = market["id"]                      # ← главное исправление
 
     payload = {
-        "instId":   PAIR_SYMBOL,
+        "instId":   inst_id,
         "tdMode":   "isolated",
         "side":     side_close,
         "posSide":  pos_side,
         "sz":       str(size),
-        "ordType":  "conditional",
+        "ordType":  "conditional",               # разрешает -1 как рыночную цену
         "tpTriggerPx": str(tp_price),
         "tpOrdPx":     "-1",
         "slTriggerPx": str(sl_price),
         "slOrdPx":     "-1",
     }
-    log.info("ALGOREQ %s", payload)        # ← смотрим эту строку в Heroku-логах
+    log.info("ALGOREQ %s", payload)              # выводим, что реально уходит
     await ex.private_post_trade_order_algo(payload)
-
+  
 async def execute_trade(ex, side:str, price:float):
     m = ex.market(PAIR_SYMBOL)
     size, step = calc_size(m, price, state["deposit"], state["leverage"])
