@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 # ============================================================================
-#  Flat-Liner • Render edition – 16 Jul 2025
+#  Flat-Liner • Heroku edition – 16 Jul 2025
 #  Автор: Kirill2402100
 #  (c) MIT licence
 # ============================================================================
-#  Стратегия  : Flat_BB_Fade  +  ADX-filter
-#  Биржа      : OKX (USDT-Swap)
-#  Управление : /status /set_deposit /set_leverage /stop
+#  Стратегия   : Flat_BB_Fade  +  ADX-filter
+#  Биржа       : OKX (USDT-Swap)
+#  Управление  : /status /set_deposit /set_leverage /stop
 # ============================================================================
 
 import os, json, logging, asyncio, signal, traceback
@@ -39,8 +39,8 @@ OKX_SANDBOX        = os.getenv("OKX_DEMO_MODE", "0") == "1"
 DEFAULT_DEPOSIT    = float(os.getenv("DEFAULT_DEPOSIT_USD", 50))
 DEFAULT_LEVERAGE   = int  (os.getenv("DEFAULT_LEVERAGE"   , 100))
 
-SL_PCT, RR_RATIO   = 0.10, 1.0            # стоп-лосс 0.10 %,  RR 1:1
-RSI_OS, RSI_OB     = 35, 65               # oversold / overbought
+SL_PCT, RR_RATIO   = 0.10, 1.0             # стоп-лосс 0.10 %,  RR 1:1
+RSI_OS, RSI_OB     = 35, 65                # oversold / overbought
 REPORT_UTC_HOUR    = int(os.getenv("REPORT_HOUR_UTC", 21))
 
 STATE_FILE = Path("state_flatliner_okx.json")
@@ -56,12 +56,12 @@ log = logging.getLogger("flatliner")
 # ─────────────────── STATE ────────────────────────────────────────────────
 state = {
     "monitoring": False,
-    "active_trade": None,     # {"id", "side", "entry_price"}
+    "active_trade": None,      # {"id", "side", "entry_price"}
     "deposit": DEFAULT_DEPOSIT,
     "leverage": DEFAULT_LEVERAGE,
     "adx_threshold": 25.0,
     "last_adx_recalc": None,
-    "daily_pnls": [],         # [{"pnl_usd", "entry_usd"}, …]
+    "daily_pnls": [],          # [{"pnl_usd", "entry_usd"}, …]
 }
 def save_state() -> None:
     STATE_FILE.write_text(json.dumps(state, indent=2))
@@ -88,9 +88,9 @@ def df_from_ohlcv(ohlcv: list[list]) -> pd.DataFrame:
     )
 
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    df.ta.rsi(length=14, append=True)                    # 'RSI_14'
-    df.ta.adx(length=14, append=True)                    # 'ADX_14'
-    df.ta.bbands(length=20, std=2, append=True)          # 'BBL_20_2.0', …
+    df.ta.rsi(length=14, append=True)               # 'RSI_14'
+    df.ta.adx(length=14, append=True)               # 'ADX_14'
+    df.ta.bbands(length=20, std=2, append=True)     # 'BBL_20_2.0', …
     return df.dropna()
 
 # Имёна столбцов индикаторов
@@ -122,20 +122,21 @@ async def recalc_adx_threshold() -> None:
         ohlcv = await ex.fetch_ohlcv(PAIR_SYMBOL, timeframe=TIMEFRAME, limit=2000)
         df = df_from_ohlcv(ohlcv)
         df.ta.adx(length=14, append=True)
-        adx = df[ADX_COL]
-        t = (np.percentile(adx, 20) + np.percentile(adx, 30)) / 2
-        state["adx_threshold"] = t
-        state["last_adx_recalc"] = datetime.now(timezone.utc).isoformat()
-        save_state()
-        log.info("ADX-threshold обновлён: %.2f", t)
+        adx = df[ADX_COL].dropna() # Добавляем dropna() для надежности
+        if not adx.empty:
+            t = (np.percentile(adx, 20) + np.percentile(adx, 30)) / 2
+            state["adx_threshold"] = t
+            state["last_adx_recalc"] = datetime.now(timezone.utc).isoformat()
+            save_state()
+            log.info("ADX-threshold обновлён: %.2f", t)
     finally:
         await ex.close()
 
 async def execute_trade(ex: ccxt.okx, side: str, price: float) -> Optional[str]:
     market = ex.markets[PAIR_SYMBOL]
     size = round((state["deposit"] * state["leverage"])
-                 / price / market["contractSize"])
-    if size < market["limits"]["amount"]["min"]:
+                 / price / float(market["contractSize"]))
+    if size < float(market["limits"]["amount"]["min"]):
         await notify("🔴 Размер сделки меньше минимального — отмена."); return None
 
     sl = price * (1 - SL_PCT/100) if side=="LONG" else price * (1 + SL_PCT/100)
@@ -179,14 +180,14 @@ async def monitor(app: Application):
                 last = state["last_adx_recalc"]
                 if (not last or
                     (datetime.now(timezone.utc) -
-                     datetime.fromisoformat(last)).seconds > 3600):
+                     datetime.fromisoformat(last)).total_seconds() > 3600):
                     await recalc_adx_threshold()
 
                 # ── проверяем, закрыта ли уже позиция ────────────────────
                 if (tr := state.get("active_trade")):
                     poss = await ex.fetch_positions([PAIR_SYMBOL])
                     side = "long" if tr["side"] == "LONG" else "short"
-                    still_open = any(p["side"] == side and float(p["contracts"] or 0) > 0
+                    still_open = any(p["side"] == side and float(p.get("contracts", 0)) > 0
                                      for p in poss)
                     if not still_open:
                         state["active_trade"] = None
@@ -197,12 +198,12 @@ async def monitor(app: Application):
 
                 # ── ищем новый сигнал ────────────────────────────────────
                 ohlcv = await ex.fetch_ohlcv(PAIR_SYMBOL, TIMEFRAME, limit=100)
-                if not ohlcv:                       # биржа вернула пустой список
+                if not ohlcv:                           # биржа вернула пустой список
                     await asyncio.sleep(30)
                     continue
 
                 df = add_indicators(df_from_ohlcv(ohlcv))
-                if df.empty:                        # после dropna() ничего не осталось
+                if df.empty:                            # после dropna() ничего не осталось
                     await asyncio.sleep(30)
                     continue
 
@@ -230,11 +231,11 @@ async def monitor(app: Application):
 
                 await asyncio.sleep(60)
 
-            except ccxt.NetworkError as e:          # сеть / HTTP-коды от OKX
+            except ccxt.NetworkError as e:       # сеть / HTTP-коды от OKX
                 log.warning("CCXT network error: %s", e)
                 await asyncio.sleep(30)
 
-            except Exception as e:                 # любая непредвиденная ошибка
+            except Exception as e:               # любая непредвиденная ошибка
                 log.exception("Сбой внутри monitor-loop: %s", e)
                 await asyncio.sleep(30)
 
@@ -248,19 +249,25 @@ async def monitor(app: Application):
 # ─────────────────── REPORTER ──────────────────────────────────────────────
 async def reporter(app: Application):
     while True:
-        now = datetime.now(timezone.utc)
-        target = now.replace(hour=REPORT_UTC_HOUR, minute=0, second=0, microsecond=0)
-        if now > target: target += timedelta(days=1)
-        await asyncio.sleep((target - now).total_seconds())
+        try:
+            now = datetime.now(timezone.utc)
+            target = now.replace(hour=REPORT_UTC_HOUR, minute=0, second=0, microsecond=0)
+            if now > target: target += timedelta(days=1)
+            await asyncio.sleep((target - now).total_seconds())
 
-        data = state["daily_pnls"]; state["daily_pnls"] = []; save_state()
-        if not data:
-            await notify("📊 За сутки сделок не было."); continue
+            data = state["daily_pnls"]; state["daily_pnls"] = []; save_state()
+            if not data:
+                await notify("📊 За сутки сделок не было."); continue
 
-        pnl = sum(d["pnl_usd"] for d in data)
-        win = sum(1 for d in data if d["pnl_usd"] > 0)
-        wr  = win / len(data) * 100
-        await notify(f"📊 24-ч отчёт: {len(data)} сделок • win-rate {wr:.1f}% • P&L {pnl:+.2f}$")
+            pnl = sum(d["pnl_usd"] for d in data)
+            win = sum(1 for d in data if d["pnl_usd"] > 0)
+            wr  = win / len(data) * 100
+            await notify(f"📊 24-ч отчёт: {len(data)} сделок • win-rate {wr:.1f}% • P&L {pnl:+.2f}$")
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            log.error("Сбой в reporter: %s", e)
+
 
 # ─────────────────── COMMANDS ──────────────────────────────────────────────
 async def cmd_status(u: Update, c: ContextTypes.DEFAULT_TYPE):
@@ -317,10 +324,12 @@ async def run() -> None:
 
     async with app:
         await app.start()
-        await stop_future      # ждём сигнала от Render
+        await stop_future      # ждём сигнала от Heroku
+        log.info("Получен сигнал на остановку. Завершаю задачи...")
         monitor_task.cancel(); report_task.cancel()
         await asyncio.gather(monitor_task, report_task, return_exceptions=True)
         await app.stop()
+        log.info("Бот остановлен.")
 
 if __name__ == "__main__":
     try:
