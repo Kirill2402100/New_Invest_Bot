@@ -205,7 +205,9 @@ async def cmd_status(u: Update, c: ContextTypes.DEFAULT_TYPE):
     await u.message.reply_text(txt, parse_mode="HTML")
 
 async def cmd_test_trade(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    """Открывает тестовую позицию с параметрами: deposit, leverage, sl, tp, side"""
+    """
+    Открывает тестовую позицию с параметрами: deposit, leverage, sl, tp, side
+    """
     try:
         args = {k.lower(): v for k, v in (arg.split('=', 1) for arg in c.args)}
         side = args.get('side', '').upper()
@@ -218,12 +220,12 @@ async def cmd_test_trade(u: Update, c: ContextTypes.DEFAULT_TYPE):
         await u.message.reply_text(
             "❌ **Ошибка в параметрах.**\n\n"
             "Убедитесь, что все значения указаны верно. Обязательные параметры: `side`, `sl`, `tp`.\n\n"
-            "<i>Пример: /test_trade deposit=30 leverage=10 sl=65000 tp=68000 side=LONG</i>",
+            "<i>Пример: /test_trade side=LONG sl=119000 tp=120000</i>",
             parse_mode="HTML"
         )
         return
 
-    await u.message.reply_text(f"🛠️ Открываю тестовую позицию {side} с вашими параметрами...")
+    await u.message.reply_text(f"🛠️ Открываю тестовую позицию {side}...")
     ex = None
     try:
         ex = await create_exchange()
@@ -233,18 +235,43 @@ async def cmd_test_trade(u: Update, c: ContextTypes.DEFAULT_TYPE):
         price = ticker['last']
         size = round((deposit * leverage) / price / float(market["contractSize"]))
         if size < float(market["limits"]["amount"]["min"]):
-            await u.message.reply_text(f"🔴 Размер сделки ({size}) меньше минимального ({market['limits']['amount']['min']}).")
+            await u.message.reply_text(f"🔴 Размер сделки ({size}) меньше минимального.")
+            if ex: await ex.close()
             return
-        params = {"tdMode": "isolated", "posSide": "long" if side == "LONG" else "short",
-                  "slTriggerPx": str(sl_price), "slOrdPx": "-1",
-                  "tpTriggerPx": str(tp_price), "tpOrdPx": "-1"}
-        order = await ex.create_order(PAIR_SYMBOL, "market", "buy" if side == "LONG" else "sell", size, params=params)
-        await u.message.reply_text(f"✅ Тестовый ордер <code>{order['id']}</code> успешно создан.", parse_mode="HTML")
+
+        # Шаг 1: Создаем рыночный ордер без SL/TP
+        order_side = "buy" if side == "LONG" else "sell"
+        pos_side = "long" if side == "LONG" else "short"
+        
+        order = await ex.create_order(
+            PAIR_SYMBOL, 
+            "market", 
+            order_side, 
+            size, 
+            params={"tdMode": "isolated", "posSide": pos_side}
+        )
+        await u.message.reply_text(f"✅ Ордер <code>{order['id']}</code> создан. Устанавливаю SL/TP...", parse_mode="HTML")
+
+        # Шаг 2: Устанавливаем SL/TP для открытой позиции
+        await ex.private_post_trade_order_algo({
+            'instId': PAIR_SYMBOL,
+            'tdMode': 'isolated',
+            'posSide': pos_side,
+            'ordType': 'conditional',
+            'slTriggerPx': str(sl_price),
+            'slOrdPx': '-1',
+            'tpTriggerPx': str(tp_price),
+            'tpOrdPx': '-1',
+        })
+        
+        await u.message.reply_text(f"✅ SL/TP для ордера <code>{order['id']}</code> успешно установлены.", parse_mode="HTML")
+
     except Exception as e:
         log.error("Ошибка в cmd_test_trade: %s", e)
         await u.message.reply_text(f"🔥 **Произошла ошибка:**\n<code>{e}</code>", parse_mode="HTML")
     finally:
-        if ex: await ex.close()
+        if ex:
+            await ex.close()
 
 async def cmd_stop(u: Update, c: ContextTypes.DEFAULT_TYPE):
     state["monitoring"] = False; save_state()
