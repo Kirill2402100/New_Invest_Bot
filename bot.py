@@ -1,467 +1,271 @@
 #!/usr/bin/env python3
 # ============================================================================
-# Flat-Liner v11.9 • 16 Jul 2025
+#   Flat-Liner • Render edition – 16 Jul 2025
+#   Автор: Kirill2402100  |  Telegram: @…
 # ============================================================================
-# • СТРАТЕГИЯ: Флэтовая стратегия 'Flat_BB_Fade' с обязательным фильтром по ADX
-# • БИРЖА: OKX (финальная версия для нового хостинга)
-# • АВТОТРЕЙДИНГ: Полная интеграция с API для размещения ордеров
-# • ИСПРАВЛЕНИЕ v11.9:
-#   - Восстановлены обработчики команд Telegram (/start, /stop и т.д.),
-#     которые были утеряны при рефакторинге. Бот снова интерактивен.
+# Стратегия  : Flat_BB_Fade  +  ADX-filter
+# Биржа      : OKX (USDT-Swap); демо-режим включается переменной OKX_DEMO_MODE
+# Управление : /status /set_deposit /set_leverage /test_trade /stop
 # ============================================================================
 
-import os
-import json
-import logging
-import asyncio
-import traceback
-import signal
+import os, json, logging, asyncio, signal, traceback
 from datetime import datetime, timezone, timedelta
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
-import ccxt.async_support as ccxt
 import pandas_ta as ta
-import gspread
-from oauth2client.service_account import ServiceAccountCredentials
+import ccxt.async_support as ccxt
+
 from telegram import Bot, Update
 from telegram.ext import (
     Application, ApplicationBuilder, CommandHandler, ContextTypes
 )
 
-# ── ENV: КОНФИГУРАЦИЯ БОТА ───────────────────────────────────────────────────
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-CHAT_IDS_RAW = os.getenv("CHAT_IDS", "")
-PAIR_SYMBOL = os.getenv("PAIR_SYMBOL", "BTC-USDT-SWAP") # Формат OKX
-TIMEFRAME = os.getenv("TIMEFRAME", "5m")
-STRAT_VERSION = "v11_9_flatliner_okx_render"
-SHEET_ID = os.getenv("SHEET_ID")
+# ──────────────────── CONFIG ────────────────────────────────────────────────
+BOT_TOKEN          = os.getenv("BOT_TOKEN")
+CHAT_IDS           = {int(cid) for cid in os.getenv("CHAT_IDS", "").split(",") if cid}
+PAIR_SYMBOL        = os.getenv("PAIR_SYMBOL", "BTC-USDT-SWAP")
+TIMEFRAME          = os.getenv("TIMEFRAME", "5m")
 
-# --- OKX API ---
-OKX_API_KEY = os.getenv("OKX_API_KEY")
-OKX_API_SECRET = os.getenv("OKX_API_SECRET")
+OKX_API_KEY        = os.getenv("OKX_API_KEY")
+OKX_API_SECRET     = os.getenv("OKX_API_SECRET")
 OKX_API_PASSPHRASE = os.getenv("OKX_API_PASSPHRASE")
-OKX_DEMO_MODE = os.getenv("OKX_DEMO_MODE", "0")
+OKX_DEMO_MODE      = os.getenv("OKX_DEMO_MODE", "0") == "1"
 
-# --- Параметры стратегии ---
-DEFAULT_DEPOSIT_USD = float(os.getenv("DEFAULT_DEPOSIT_USD", "50.0"))
-DEFAULT_LEVERAGE = float(os.getenv("DEFAULT_LEVERAGE", "100.0"))
-FLAT_RR_RATIO = float(os.getenv("FLAT_RR_RATIO", "1.0"))
-FLAT_SL_PCT = float(os.getenv("FLAT_SL_PCT", "0.10"))
-FLAT_RSI_OVERSOLD = float(os.getenv("FLAT_RSI_OVERSOLD", "35"))
-FLAT_RSI_OVERBOUGHT = float(os.getenv("FLAT_RSI_OVERBOUGHT", "65"))
-REPORT_TIME_UTC = os.getenv("REPORT_TIME_UTC", "21:00")
+DEFAULT_DEPOSIT    = float(os.getenv("DEFAULT_DEPOSIT_USD" , 50))
+DEFAULT_LEVERAGE   = int  (os.getenv("DEFAULT_LEVERAGE"    , 100))
+SL_PCT             = float(os.getenv("FLAT_SL_PCT"         , 0.10))      # 0 - 100
+RR_RATIO           = float(os.getenv("FLAT_RR_RATIO"       , 1.0))
+RSI_OS, RSI_OB     = 35, 65
+REPORT_UTC_HOUR    = int(os.getenv("REPORT_HOUR_UTC", 21))
 
-# ── НАСТРОЙКА ЛОГИРОВАНИЯ ────────────────────────────────────────────────────
-logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)-8s  %(message)s")
-log = logging.getLogger(STRAT_VERSION)
+STATE_FILE = Path("state_flatliner_okx.json")
 
-if not all([BOT_TOKEN, CHAT_IDS_RAW, OKX_API_KEY, OKX_API_SECRET, OKX_API_PASSPHRASE]):
-    log.critical("КРИТИЧЕСКАЯ ОШИБКА: Одна или несколько переменных окружения не установлены!"); raise SystemExit
+# ──────────────────── LOGGING ───────────────────────────────────────────────
+logging.basicConfig(level=logging.INFO,
+                    format="%(asctime)s  %(levelname)-8s  %(message)s")
+log = logging.getLogger("flatliner")
 
-CHAT_IDS = {int(cid) for cid in CHAT_IDS_RAW.split(",") if cid.strip()}
-BACKGROUND_TASKS = set()
-
-# ── GOOGLE SHEETS ────────────────────────────────────────────────────────────
-TRADE_LOG_WS = None
-def setup_google_sheets() -> None:
-    global TRADE_LOG_WS
-    if not SHEET_ID or not os.getenv("GOOGLE_CREDENTIALS"):
-        log.warning("ID таблицы или учетные данные Google не установлены. Логирование в Google Sheets отключено.")
-        return
-    try:
-        creds_json = json.loads(os.getenv("GOOGLE_CREDENTIALS"))
-        creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_json, ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"])
-        gs = gspread.authorize(creds)
-        ss = gs.open_by_key(SHEET_ID)
-        headers = ["Signal_ID", "Version", "Strategy_Used", "Status", "Side", "Entry_Time_UTC", "Exit_Time_UTC", "Entry_Price", "Exit_Price", "SL_Price", "TP_Price", "Gross_P&L_USD", "Fee_USD", "Net_P&L_USD", "Entry_Deposit_USD", "Entry_ADX", "ADX_Threshold"]
-        ws_name = f"OKX_Trades_{PAIR_SYMBOL.replace('-','')}"
+# ──────────────────── STATE ─────────────────────────────────────────────────
+state = {
+    "monitoring": False,
+    "active_trade": None,
+    "deposit": DEFAULT_DEPOSIT,
+    "leverage": DEFAULT_LEVERAGE,
+    "adx_threshold": 25.0,
+    "last_adx_recalc": None,
+    "daily_pnls": []          # [{pnl_usd, entry_usd}, …]
+}
+def save_state() -> None:
+    STATE_FILE.write_text(json.dumps(state, indent=2))
+def load_state() -> None:
+    if STATE_FILE.exists():
         try:
-            ws = ss.worksheet(ws_name)
-        except gspread.WorksheetNotFound:
-            ws = ss.add_worksheet(ws_name, rows="1000", cols=len(headers))
-        if ws.row_values(1) != headers:
-            ws.clear(); ws.update("A1", [headers])
-            ws.format(f"A1:{chr(ord('A')+len(headers)-1)}1", {"textFormat": {"bold": True}})
-        TRADE_LOG_WS = ws
-        log.info(f"Логирование в Google Sheet включено ➜ {ws_name}")
-    except Exception as e:
-        log.error(f"Ошибка инициализации Google Sheets: {e}"); TRADE_LOG_WS = None
+            state.update(json.loads(STATE_FILE.read_text()))
+        except Exception:
+            log.warning("STATE файл повреждён - перезаписываю.")
+            save_state()
 
-# ── УПРАВЛЕНИЕ СОСТОЯНИЕМ ───────────────────────────────────────────────────
-STATE_FILE = f"state_{STRAT_VERSION}_{PAIR_SYMBOL.replace('-','')}.json"
-state = {"monitoring": False, "active_trade": None, "leverage": DEFAULT_LEVERAGE, "deposit_usd": DEFAULT_DEPOSIT_USD, "dynamic_adx_threshold": 25.0, "last_adx_recalc_time": None, "daily_report_data": []}
-def save_state():
-    with open(STATE_FILE, 'w') as f: json.dump(state, f, indent=2)
-def load_state():
-    global state
-    if os.path.exists(STATE_FILE):
+# ──────────────────── HELPERS ───────────────────────────────────────────────
+async def notify(text: str, bot: Bot | None = None) -> None:
+    bot = bot or Bot(BOT_TOKEN)
+    for cid in CHAT_IDS:
         try:
-            with open(STATE_FILE, 'r') as f: state.update(json.load(f))
-        except (json.JSONDecodeError, TypeError): save_state()
-    else: save_state()
+            await bot.send_message(cid, text, parse_mode="HTML")
+        except Exception as e:
+            log.error("Telegram-fail → %s : %s", cid, e)
 
-# ── ИНДИКАТОРЫ ───────────────────────────────────────────────────
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df.ta.rsi(length=14, append=True, col_names=("RSI",))
     df.ta.adx(length=14, append=True, col_names=("ADX", "DMP", "DMN"))
-    df.ta.bbands(length=20, std=2, append=True, col_names=("BBL", "BBM", "BBU", "BBB", "BBP"))
+    df.ta.bbands(length=20, std=2, append=True,
+                 col_names=("BBL", "BBM", "BBU", "BBB", "BBP"))
     return df.dropna()
 
-# ── УВЕДОМЛЕНИЯ ──────────────────────────────────────────────────────────────
-async def notify_all(text: str, bot: Bot = None):
-    temp_bot = bot if bot else Bot(token=BOT_TOKEN)
-    for cid in CHAT_IDS:
-        try: await temp_bot.send_message(cid, text, parse_mode="HTML")
-        except Exception as e: log.error(f"TG fail -> {cid}: {e}")
+# ──────────────────── EXCHANGE ──────────────────────────────────────────────
+async def okx() -> ccxt.okx:
+    ex = ccxt.okx({
+        "apiKey": OKX_API_KEY,
+        "secret": OKX_API_SECRET,
+        "password": OKX_API_PASSPHRASE,
+        "options": {"defaultType": "swap"},
+    })
+    ex.set_sandbox_mode(OKX_DEMO_MODE)
+    await ex.load_markets()
+    return ex
 
-# ── ВЗАИМОДЕЙСТВИЕ С БИРЖЕЙ (OKX) ───────────────────────────────────────────
-async def initialize_exchange():
-    try:
-        exchange = ccxt.okx({'apiKey': OKX_API_KEY, 'secret': OKX_API_SECRET, 'password': OKX_API_PASSPHRASE, 'options': {'defaultType': 'swap'}})
-        exchange.set_sandbox_mode(OKX_DEMO_MODE == '1')
-        await exchange.load_markets()
-        log.info(f"Биржа OKX инициализирована. Демо: {OKX_DEMO_MODE == '1'}. CCXT: {ccxt.__version__}")
-        return exchange
-    except Exception as e:
-        log.critical(f"Критическая ошибка инициализации биржи: {e}"); return None
+async def set_leverage(ex, lev: int) -> None:
+    await ex.set_leverage(lev, PAIR_SYMBOL, {"mgnMode": "isolated", "posSide": "long"})
+    await ex.set_leverage(lev, PAIR_SYMBOL, {"mgnMode": "isolated", "posSide": "short"})
 
-async def set_leverage_on_exchange(exchange, symbol, leverage):
-    try:
-        await exchange.set_leverage(leverage, symbol, {'mgnMode': 'isolated', 'posSide': 'long'})
-        await exchange.set_leverage(leverage, symbol, {'mgnMode': 'isolated', 'posSide': 'short'})
-        log.info(f"На бирже установлено плечо {leverage}x для {symbol}")
-        return True
-    except Exception as e:
-        log.error(f"Ошибка установки плеча: {e}"); return False
+# ──────────────────── CORE LOGIC ────────────────────────────────────────────
+async def recalc_adx_threshold() -> None:
+    ex = await okx()
+    ohlcv = await ex.fetch_ohlcv(PAIR_SYMBOL, timeframe=TIMEFRAME, limit=2000)
+    await ex.close()
+    df = pd.DataFrame(ohlcv, columns=["ts","o","h","l","c","v"])
+    df.ta.adx(length=14, append=True, col_names=("ADX", "DMP", "DMN"))
+    adx = df["ADX"].dropna()
+    t = (np.percentile(adx, 20) + np.percentile(adx, 30)) / 2
+    state["adx_threshold"] = t
+    state["last_adx_recalc"] = datetime.now(timezone.utc).isoformat()
+    save_state()
+    log.info("ADX-threshold обновлён: %.2f", t)
 
-async def execute_trade(exchange, signal: dict):
-    side = signal['side']
-    deposit = signal['deposit_usd']
-    leverage = signal['leverage']
-    entry_price = signal['entry_price']
-    sl_price = signal['sl_price']
-    tp_price = signal['tp_price']
-    try:
-        market = exchange.markets[PAIR_SYMBOL]
-        position_value_usd = deposit * leverage
-        amount_in_base_currency = position_value_usd / entry_price
-        order_size_contracts = round(amount_in_base_currency / float(market['contractSize']))
+async def execute_trade(ex, side: str, price: float) -> str | None:
+    market = ex.markets[PAIR_SYMBOL]
+    size = round((state["deposit"] * state["leverage"]) / price / market["contractSize"])
+    if size < market["limits"]["amount"]["min"]:
+        await notify("🔴 Размер сделки меньше минимального — торговля отменена."); return None
 
-        if order_size_contracts < float(market['limits']['amount']['min']):
-            await notify_all(f"🔴 ОШИБКА: Рассчитанный размер ({order_size_contracts}) меньше минимального."); return None
+    sl = price * (1 - SL_PCT/100) if side=="LONG" else price * (1 + SL_PCT/100)
+    tp = price * (1 + SL_PCT*RR_RATIO/100) if side=="LONG" else price * (1 - SL_PCT*RR_RATIO/100)
 
-        params = {
-            'tdMode': 'isolated',
-            'posSide': 'long' if side == 'LONG' else 'short',
-            'slTriggerPx': str(sl_price),
-            'slOrdPx': '-1',
-            'tpTriggerPx': str(tp_price),
-            'tpOrdPx': '-1'
-        }
-        
-        order = await exchange.create_order(
-            symbol=PAIR_SYMBOL, type='market', side='buy' if side == 'LONG' else 'sell',
-            amount=order_size_contracts, params=params
-        )
-        
-        log.info(f"Ордер успешно размещен! ID: {order['id']}")
-        await notify_all(f"✅ <b>ОРДЕР РАЗМЕЩЕН</b>\n\n<b>ID:</b> {order['id']}\n<b>Тип:</b> {side}\n<b>SL:</b> {sl_price:.2f}\n<b>TP:</b> {tp_price:.2f}")
-        return order['id']
-    except Exception as e:
-        error_details = traceback.format_exc()
-        log.error(f"Ошибка размещения ордера: {e}\n{error_details}")
-        await notify_all(f"🔴 ОШИБКА РАЗМЕЩЕНИЯ ОРДЕРА: <code>{e}</code>")
-        return None
+    params = {"tdMode":"isolated","posSide":"long" if side=="LONG" else "short",
+              "slTriggerPx":str(sl),"slOrdPx":"-1",
+              "tpTriggerPx":str(tp),"tpOrdPx":"-1"}
+    order = await ex.create_order(PAIR_SYMBOL, "market",
+                                  "buy" if side=="LONG" else "sell",
+                                  size, params=params)
+    await notify(f"✅ Открыта позиция {side} • ID <code>{order['id']}</code>")
+    return order["id"]
 
-async def process_closed_trade(exchange, trade_details, bot):
-    try:
-        log.info(f"Обработка закрытой сделки. ID ордера: {trade_details['id']}")
-        order_id = trade_details['id']
-        closed_order = await exchange.fetch_order(order_id, PAIR_SYMBOL)
-        exit_price = float(closed_order.get('average', trade_details['sl_price']))
-        fee = abs(float(closed_order.get('fee', {}).get('cost', 0)))
-        realized_pnl = float(closed_order['info'].get('pnl', 0))
-        net_pnl = realized_pnl - fee
-        status = "WIN" if net_pnl > 0 else "LOSS"
-        report = {"id": order_id, "status": status, "side": trade_details['side'], "entry_price": trade_details['entry_price'], "exit_price": exit_price, "net_pnl_usd": round(net_pnl, 2), "fee_usd": round(fee, 2)}
-        state["daily_report_data"].append({"pnl_usd": report["net_pnl_usd"], "entry_usd": trade_details['deposit_usd']})
-        save_state()
-        await notify_all(f"{'✅' if status == 'WIN' else '❌'} <b>СДЕЛКА ЗАКРЫТА</b>\n\n<b>ID:</b> {report['id']} | <b>Тип:</b> {report['side']}\n<b>Вход:</b> {report['entry_price']:.2f} | <b>Выход:</b> {report['exit_price']:.2f}\n💰 <b>Net P&L: {report['net_pnl_usd']:.2f}$</b> (Fee: {report['fee_usd']:.2f}$)", bot)
-        if TRADE_LOG_WS:
-            pass
-    except Exception as e:
-        log.error(f"Ошибка обработки закрытой сделки {trade_details['id']}: {e}")
-
-async def recalculate_adx_threshold():
-    try:
-        log.info("Пересчет динамического порога ADX...")
-        exchange = await initialize_exchange()
-        if not exchange: return
-        ohlcv = await exchange.fetch_ohlcv(PAIR_SYMBOL, timeframe=TIMEFRAME, limit=2000)
-        await exchange.close()
-        df = pd.DataFrame(ohlcv, columns=["ts","open","high","low","close","volume"])
-        df.ta.adx(length=14, append=True, col_names=("ADX", "DMP", "DMN"))
-        df.dropna(inplace=True)
-        if not df.empty:
-            adx_values = df["ADX"]
-            new_threshold = (np.percentile(adx_values, 20) + np.percentile(adx_values, 30)) / 2
-            state["dynamic_adx_threshold"] = new_threshold
-            state["last_adx_recalc_time"] = datetime.now(timezone.utc).isoformat()
-            save_state()
-            log.info(f"Новый порог ADX: {new_threshold:.2f}")
-    except Exception as e:
-        log.error(f"Ошибка при пересчете порога ADX: {e}")
-
-# ── ОСНОВНОЙ ЦИКЛ БОТА ───────────────────────────────────────────────────────
+# ──────────────────── MONITOR LOOP ──────────────────────────────────────────
 async def monitor(app: Application):
-    exchange = None
-    try:
-        exchange = await initialize_exchange()
-        if not exchange:
-            await notify_all("Не удалось инициализировать биржу. Мониторинг остановлен.", app.bot)
-            return
-        if not await set_leverage_on_exchange(exchange, PAIR_SYMBOL, state['leverage']):
-            await notify_all("Не удалось установить плечо. Мониторинг остановлен.", app.bot)
-            return
-        
-        await recalculate_adx_threshold()
-        log.info("🚀 Основной цикл запущен: %s %s", PAIR_SYMBOL, TIMEFRAME)
-        
-        while state.get("monitoring", False):
-            now_utc = datetime.now(timezone.utc)
-            last_recalc_str = state.get("last_adx_recalc_time")
-            if not last_recalc_str or (now_utc - datetime.fromisoformat(last_recalc_str)).total_seconds() > 3600:
-                 await recalculate_adx_threshold()
+    ex = await okx()
+    await set_leverage(ex, state["leverage"])
+    await recalc_adx_threshold()
+    log.info("🚀 Мониторинг запущен.")
 
-            if active_trade_details := state.get("active_trade"):
-                positions = await exchange.fetch_positions([PAIR_SYMBOL])
-                trade_side = 'long' if active_trade_details['side'] == 'LONG' else 'short'
-                active_position = next((p for p in positions if p.get('side') == trade_side and float(p.get('contracts', 0)) > 0), None)
-                if not active_position:
-                    log.info(f"Позиция {active_trade_details['id']} была закрыта.")
-                    asyncio.create_task(process_closed_trade(exchange, active_trade_details, app.bot))
-                    state["active_trade"] = None; save_state()
+    try:
+        while state["monitoring"]:
+            # пересчёт ADX раз в час
+            last = state["last_adx_recalc"]
+            if not last or (datetime.now(timezone.utc)
+                            - datetime.fromisoformat(last)).seconds > 3600:
+                await recalc_adx_threshold()
+
+            # если позиция есть — проверяем, осталась ли она на бирже
+            if tr := state.get("active_trade"):
+                poss = await ex.fetch_positions([PAIR_SYMBOL])
+                side = "long" if tr["side"]=="LONG" else "short"
+                still_open = any(p["side"]==side and float(p["contracts"] or 0)>0
+                                 for p in poss)
+                if not still_open:
+                    state["active_trade"] = None
+                    save_state()
+                    await notify("ℹ️ Позиция закрыта на бирже (факт).")
                 await asyncio.sleep(60); continue
 
-            ohlcv = await exchange.fetch_ohlcv(PAIR_SYMBOL, timeframe=TIMEFRAME, limit=100)
-            df = add_indicators(pd.DataFrame(ohlcv, columns=["ts", "open", "high", "low", "close", "volume"]))
-            if len(df) < 2: await asyncio.sleep(60); continue
+            # нет открытой позиции → ищем сигнал
+            ohlcv = await ex.fetch_ohlcv(PAIR_SYMBOL, timeframe=TIMEFRAME, limit=100)
+            df = add_indicators(pd.DataFrame(ohlcv, columns=["ts","o","h","l","c","v"]))
+            last = df.iloc[-1]
+            price = last["c"]
 
-            last, price = df.iloc[-1], df.iloc[-1]["close"]
-            if last["ADX"] >= state.get('dynamic_adx_threshold', 25):
+            if last["ADX"] >= state["adx_threshold"]:
                 await asyncio.sleep(60); continue
 
             side = None
-            if price <= last["BBL"] and last["RSI"] < FLAT_RSI_OVERSOLD: side = "LONG"
-            elif price >= last["BBU"] and last["RSI"] > FLAT_RSI_OVERBOUGHT: side = "SHORT"
+            if price <= last["BBL"] and last["RSI"] < RSI_OS:   side = "LONG"
+            if price >= last["BBU"] and last["RSI"] > RSI_OB:   side = "SHORT"
+            if not side:
+                await asyncio.sleep(60); continue
 
-            if side:
-                sl_price = price * (1 - FLAT_SL_PCT / 100) if side == "LONG" else price * (1 + FLAT_SL_PCT / 100)
-                tp_price = price * (1 + (FLAT_SL_PCT * FLAT_RR_RATIO) / 100) if side == "LONG" else price * (1 - (FLAT_SL_PCT * FLAT_RR_RATIO) / 100)
-                signal = {"side": side, "deposit_usd": state['deposit_usd'], "leverage": state['leverage'], "entry_price": price, "sl_price": sl_price, "tp_price": tp_price}
-                
-                await notify_all(f"🔔 <b>СИГНАЛ: {side}</b> {PAIR_SYMBOL} @ {price:.2f}", app.bot)
-                order_id = await execute_trade(exchange, signal)
-                if order_id:
-                    state["active_trade"] = {"id": order_id, **signal}; save_state()
-            
+            order_id = await execute_trade(ex, side, price)
+            if order_id:
+                state["active_trade"] = {"id": order_id, "side": side,
+                                         "entry_price": price}
+                save_state()
+
             await asyncio.sleep(60)
-    
+
     except asyncio.CancelledError:
-        log.info("Задача мониторинга отменяется...")
-    except Exception as e:
-        log.exception("Сбой в основном цикле мониторинга:")
+        pass
     finally:
-        if exchange:
-            await exchange.close()
-            log.info("Соединение с биржей в monitor закрыто.")
-        log.info("⛔️ Основной цикл мониторинга полностью остановлен.")
+        await ex.close()
+        log.info("Мониторинг остановлен.")
 
-# ── ЕЖЕДНЕВНЫЙ ОТЧЁТ ────────────────────────────────────────────────────────
-async def daily_reporter(app: Application):
-    log.info("📈 Сервис ежедневных отчётов запущен.")
+# ──────────────────── DAILY REPORT ──────────────────────────────────────────
+async def reporter(app: Application):
     while True:
-        try:
-            now_utc = datetime.now(timezone.utc)
-            report_h, report_m = map(int, REPORT_TIME_UTC.split(':'))
-            report_time = now_utc.replace(hour=report_h, minute=report_m, second=0, microsecond=0)
-            if now_utc > report_time: report_time += timedelta(days=1)
-            wait_seconds = (report_time - now_utc).total_seconds()
-            log.info(f"Следующий суточный отчёт будет отправлен в {REPORT_TIME_UTC} UTC (через {wait_seconds/3600:.2f} ч).")
-            await asyncio.sleep(wait_seconds)
+        now = datetime.now(timezone.utc)
+        target = now.replace(hour=REPORT_UTC_HOUR, minute=0, second=0, microsecond=0)
+        if now > target: target += timedelta(days=1)
+        await asyncio.sleep((target - now).total_seconds())
 
-            report_data = state.get("daily_report_data", [])
-            if not report_data:
-                await notify_all(f"📊 <b>Суточный отчёт ({STRAT_VERSION})</b>\n\nЗа последние 24 часа сделок не было.", app.bot)
-                continue
+        data = state["daily_pnls"]; state["daily_pnls"] = []; save_state()
+        if not data:
+            await notify("📊 За сутки сделок не было."); continue
 
-            total_pnl = sum(item['pnl_usd'] for item in report_data)
-            wins = sum(1 for item in report_data if item['pnl_usd'] > 0)
-            win_rate = (wins / len(report_data)) * 100
-            report_msg = (f"📊 <b>Суточный отчёт {STRAT_VERSION}</b>\n\n"
-                          f"<b>Всего сделок:</b> {len(report_data)} (📈{wins} / 📉{len(report_data) - wins})\n"
-                          f"<b>Винрейт:</b> {win_rate:.2f}%\n"
-                          f"💵 <b>Net P&L: {total_pnl:+.2f}$</b>")
-            await notify_all(report_msg, app.bot)
-            state["daily_report_data"] = []; save_state()
-        except asyncio.CancelledError:
-            log.info("Задача ежедневных отчетов отменена.")
-            break
-        except Exception as e:
-            log.error(f"Ошибка в daily_reporter: {e}")
-            await asyncio.sleep(3600)
+        pnl   = sum(x["pnl_usd"]   for x in data)
+        win   = sum(1 for x in data if x["pnl_usd"]>0)
+        total = len(data)
+        wr    = win/total*100
+        await notify(f"📊 Отчёт 24 ч → сделок {total}  |  win-rate {wr:.1f}%  |  P&L {pnl:+.2f}$")
 
-# ── КОМАНДЫ TELEGRAM ────────────────────────────────────────────────────────
-async def start_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if state.get("monitoring"):
-        await update.message.reply_text(f"Бот уже запущен.", parse_mode="HTML")
-        return
-    state["monitoring"] = True; save_state()
-    await update.message.reply_text(f"✅ Бот <b>{STRAT_VERSION}</b> запущен.", parse_mode="HTML")
-    
-    task = asyncio.create_task(monitor(ctx.application))
-    BACKGROUND_TASKS.add(task)
-    task.add_done_callback(BACKGROUND_TASKS.discard)
+# ──────────────────── BOT COMMANDS ──────────────────────────────────────────
+async def cmd_status(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    text = ("<b>Flat-Liner status</b>\n\n"
+            f"Мониторинг: {'🟢' if state['monitoring'] else '🔴'}\n"
+            f"Плечо: {state['leverage']}x   |   Депозит: {state['deposit']}$")
+    await u.message.reply_text(text, parse_mode="HTML")
 
-async def stop_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def cmd_stop(u: Update, c: ContextTypes.DEFAULT_TYPE):
     state["monitoring"] = False; save_state()
-    await update.message.reply_text("❌ Бот остановлен. Основной цикл завершится после текущей итерации.")
-async def status_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    status = 'АКТИВЕН' if state.get('monitoring') else 'ОСТАНОВЛЕН'
-    trade_info = f"<b>Активная сделка:</b> {state['active_trade']['id']}" if state.get('active_trade') else "<i>Нет активных сделок.</i>"
-    await update.message.reply_text(f"<b>СТАТУС ({STRAT_VERSION})</b>\n\n<b>Мониторинг:</b> {status}\n<b>Инструмент:</b> {PAIR_SYMBOL}\n{trade_info}", parse_mode="HTML")
-async def set_deposit_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await u.message.reply_text("⛔️ Мониторинг будет остановлен.")
+async def cmd_set_dep(u: Update, c: ContextTypes.DEFAULT_TYPE):
     try:
-        deposit = float(ctx.args[0])
-        if deposit <= 0: raise ValueError
-        state['deposit_usd'] = deposit; save_state()
-        await update.message.reply_text(f"✅ Депозит установлен: <b>{deposit:.2f}$</b>", parse_mode="HTML")
-    except (IndexError, ValueError):
-        await update.message.reply_text("⚠️ Формат: /set_deposit <сумма>")
-async def set_leverage_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        state["deposit"] = float(c.args[0]); save_state()
+        await u.message.reply_text(f"OK, депозит = {state['deposit']}$")
+    except: await u.message.reply_text("Формат: /set_deposit 25")
+async def cmd_set_lev(u: Update, c: ContextTypes.DEFAULT_TYPE):
     try:
-        leverage = int(ctx.args[0])
-        if not 1 <= leverage <= 125: raise ValueError
-        exchange = await initialize_exchange()
-        if not exchange: await update.message.reply_text("🔴 Ошибка подключения к бирже."); return
-        if await set_leverage_on_exchange(exchange, PAIR_SYMBOL, leverage):
-            state['leverage'] = leverage; save_state()
-            await update.message.reply_text(f"✅ Плечо установлено: <b>{leverage}x</b>", parse_mode="HTML")
-        else:
-            await update.message.reply_text("🔴 Ошибка установки плеча.")
-        await exchange.close()
-    except (IndexError, ValueError):
-        await update.message.reply_text("⚠️ Формат: /set_leverage <1-125>")
-async def test_trade_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    try:
-        args_dict = dict(arg.split('=') for arg in ctx.args)
-        deposit, leverage, tp_price, sl_price, side = float(args_dict['deposit']), int(args_dict['leverage']), float(args_dict['tp']), float(args_dict['sl']), args_dict.get('side', 'LONG').upper()
-        if side not in ['LONG', 'SHORT']: await update.message.reply_text("❌ 'side' должен быть LONG или SHORT."); return
-        await update.message.reply_text(f"🛠 <b>ЗАПУСК ТЕСТОВОЙ СДЕЛКИ</b>...", parse_mode="HTML")
-        exchange = await initialize_exchange()
-        if not exchange: await update.message.reply_text("🔴 Ошибка подключения к бирже."); return
-        await set_leverage_on_exchange(exchange, PAIR_SYMBOL, leverage)
-        ticker = await exchange.fetch_ticker(PAIR_SYMBOL)
-        signal = {"side": side, "deposit_usd": deposit, "leverage": leverage, "entry_price": ticker['last'], "sl_price": sl_price, "tp_price": tp_price}
-        order_id = await execute_trade(exchange, signal)
-        if order_id: state["active_trade"] = {"id": order_id, **signal}; save_state()
-        await exchange.close()
-    except Exception as e:
-        log.error(f"Ошибка в /test_trade: {e}")
-        await update.message.reply_text(f"⚠️ Ошибка формата. Пример: /test_trade deposit=20 leverage=10 tp=65000 sl=60000 side=LONG", parse_mode="HTML")
+        lev = int(c.args[0]); assert 1<=lev<=125
+        ex = await okx(); await set_leverage(ex, lev); await ex.close()
+        state["leverage"] = lev; save_state()
+        await u.message.reply_text(f"OK, плечо = {lev}x")
+    except: await u.message.reply_text("Формат: /set_leverage 50")
 
-async def apitest_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("⚙️ <b>Тест API ключей OKX...</b>", parse_mode="HTML")
-    exchange = await initialize_exchange()
-    if not exchange:
-        await update.message.reply_text("🔴 Не удалось инициализировать биржу."); return
-    try:
-        await update.message.reply_text("Попытка получить баланс...", parse_mode="HTML")
-        balance = await exchange.fetch_balance()
-        balance_str = json.dumps(balance, indent=2, ensure_ascii=False)
-        if len(balance_str) > 4000:
-            balance_str = balance_str[:4000] + "\n... (ответ обрезан)"
-        await update.message.reply_text(
-            f"✅ <b>УСПЕХ!</b>\nПодключение к OKX прошло успешно.\n\n"
-            f"<b>Полная структура баланса:</b>\n<pre>{balance_str}</pre>",
-            parse_mode="HTML"
-        )
-    except Exception as e:
-        log.error(f"Ошибка в /apitest: {e}")
-        await update.message.reply_text(f"❌ <b>ОШИБКА:</b> <code>{e}</code>", parse_mode="HTML")
-    finally:
-        if exchange:
-            await exchange.close()
-
-async def post_init(app: Application):
+# ──────────────────── MAIN ──────────────────────────────────────────────────
+async def run() -> None:
     load_state()
-    setup_google_sheets()
-    log.info("Бот инициализирован.")
-    await notify_all(f"✅ Бот <b>{STRAT_VERSION}</b> перезапущен.", bot=app.bot)
-    
-    if state.get("monitoring"):
-        task = asyncio.create_task(monitor(app))
-        BACKGROUND_TASKS.add(task)
-        task.add_done_callback(BACKGROUND_TASKS.discard)
 
-    task = asyncio.create_task(daily_reporter(app))
-    BACKGROUND_TASKS.add(task)
-    task.add_done_callback(BACKGROUND_TASKS.discard)
+    app = (ApplicationBuilder()
+           .token(BOT_TOKEN)
+           .post_init(lambda a: notify("♻️ Бот перезапущен.", a.bot))
+           .build())
 
+    for cmd, h in {
+        "status": cmd_status,
+        "stop":   cmd_stop,
+        "set_deposit":  cmd_set_dep,
+        "set_leverage": cmd_set_lev,
+    }.items():
+        app.add_handler(CommandHandler(cmd, h))
 
-async def shutdown_handler(app: Application):
-    """Handles graceful shutdown."""
-    log.warning("Получен сигнал на остановку. Начинаю грациозное завершение...")
-    await notify_all(f"⚠️ Бот <b>{STRAT_VERSION}</b> перезапускается/останавливается.", bot=app.bot)
+    # авто-запуск мониторинга при холодном старте
+    if not state["monitoring"]:
+        state["monitoring"] = True; save_state()
 
-    if BACKGROUND_TASKS:
-        log.info(f"Отменяю {len(BACKGROUND_TASKS)} пользовательских фоновых задач...")
-        for task in list(BACKGROUND_TASKS):
-            task.cancel()
-        await asyncio.gather(*BACKGROUND_TASKS, return_exceptions=True)
-        log.info("Все пользовательские фоновые задачи завершены.")
+    monitor_task  = asyncio.create_task(monitor(app))
+    report_task   = asyncio.create_task(reporter(app))
 
-    state["monitoring"] = False
-    save_state()
-    log.info("Финальное состояние сохранено. Бот выключен.")
-
-async def main() -> None:
-    """Запускает бота и управляет его жизненным циклом."""
-    
-    app = (
-        ApplicationBuilder()
-        .token(BOT_TOKEN)
-        .post_init(post_init)
-        .build()
-    )
-
-    # <<< ВОССТАНОВЛЕННЫЕ ОБРАБОТЧИКИ >>>
-    app.add_handler(CommandHandler("start", start_command))
-    app.add_handler(CommandHandler("stop", stop_command))
-    app.add_handler(CommandHandler("status", status_command))
-    app.add_handler(CommandHandler("set_deposit", set_deposit_command))
-    app.add_handler(CommandHandler("set_leverage", set_leverage_command))
-    app.add_handler(CommandHandler("test_trade", test_trade_command))
-    app.add_handler(CommandHandler("apitest", apitest_command))
-
-    # Настраиваем обработку сигналов для грациозного завершения
     loop = asyncio.get_running_loop()
     stop = loop.create_future()
     loop.add_signal_handler(signal.SIGTERM, stop.set_result, None)
-    loop.add_signal_handler(signal.SIGINT, stop.set_result, None)
+    loop.add_signal_handler(signal.SIGINT , stop.set_result, None)
 
     async with app:
-        log.info("Запуск бота...")
         await app.start()
-        await stop
-        log.info("Получен сигнал на остановку. Завершаю работу...")
-        await shutdown_handler(app)
+        await stop          # ждём сигнала от Render
+        monitor_task.cancel(); report_task.cancel()
+        await asyncio.gather(monitor_task, report_task, return_exceptions=True)
         await app.stop()
-        log.info("Бот полностью остановлен.")
 
 if __name__ == "__main__":
     try:
-        asyncio.run(main())
+        asyncio.run(run())
     except (KeyboardInterrupt, SystemExit):
-        log.info("Процесс прерван пользователем или системой.")
+        pass
