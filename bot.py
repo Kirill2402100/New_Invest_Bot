@@ -147,8 +147,9 @@ async def execute_trade(ex, side, price):
         "instId": PAIR_SYMBOL,
         "tdMode": "isolated",
         "side": side_for_close,
+        "posSide": pos_side, # <--- ИСПРАВЛЕНО
         "sz": str(size),
-        "ordType": "oco", # OCO - One-Cancels-the-Other
+        "ordType": "oco",
         "tpTriggerPx": str(tp_price),
         "tpOrdPx": "-1",
         "slTriggerPx": str(sl_price),
@@ -273,8 +274,9 @@ async def cmd_test_trade(u: Update, c: ContextTypes.DEFAULT_TYPE):
             "instId": PAIR_SYMBOL,
             "tdMode": "isolated",
             "side": side_for_close,
+            "posSide": pos_side, # <--- ИСПРАВЛЕНО
             "sz": str(size),
-            "ordType": "oco", # OCO - One-Cancels-the-Other
+            "ordType": "oco",
             "tpTriggerPx": str(tp_price),
             "tpOrdPx": "-1",
             "slTriggerPx": str(sl_price),
