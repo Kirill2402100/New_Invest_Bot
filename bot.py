@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 # ============================================================================
-# Flat-Liner v10.0 • 16 Jul 2025
+# Flat-Liner v10.1 • 16 Jul 2025
 # ============================================================================
 # • СТРАТЕГИЯ: Флэтовая стратегия 'Flat_BB_Fade' с обязательным фильтром по ADX
 # • БИРЖА: HTX (Huobi)
 # • АВТОТРЕЙДИНГ: Полная интеграция с API для размещения ордеров
-# • ИСПРАВЛЕНИЕ v10.0:
-#   - [ФИНАЛЬНОЕ РЕШЕНИЕ] Бот переписан для работы с HTX, чтобы гарантированно
-#     обойти проблемы со старой версией ccxt на хостинге.
+# • ИСПРАВЛЕНИЕ v10.1:
+#   - [ФИНАЛЬНЫЙ ФИКС] Восстановлены недостающие функции (notify_all,
+#     daily_reporter, и т.д.) для полной работоспособности.
 # ============================================================================
 
 import os
@@ -34,7 +34,7 @@ CHAT_IDS_RAW  = os.getenv("CHAT_IDS", "")
 # ВАЖНО: Используйте формат HTX для USDT-фьючерсов, например 'BTC/USDT:USDT'
 PAIR_SYMBOL   = os.getenv("PAIR_SYMBOL", "BTC/USDT:USDT")
 TIMEFRAME     = os.getenv("TIMEFRAME", "5m")
-STRAT_VERSION = "v10_0_flatliner_htx"
+STRAT_VERSION = "v10_1_flatliner_htx"
 SHEET_ID      = os.getenv("SHEET_ID")
 
 
@@ -67,13 +67,36 @@ CHAT_IDS = {int(cid) for cid in CHAT_IDS_RAW.split(",") if cid.strip()}
 # ── GOOGLE SHEETS ────────────────────────────────────────────────────────────
 TRADE_LOG_WS = None
 def setup_google_sheets() -> None:
-    # ... (Этот блок остается без изменений) ...
-    pass
+    global TRADE_LOG_WS
+    if not SHEET_ID or not os.getenv("GOOGLE_CREDENTIALS"):
+        log.warning("ID таблицы или учетные данные Google не установлены. Логирование в Google Sheets отключено.")
+        return
+    try:
+        creds = ServiceAccountCredentials.from_json_keyfile_dict(
+            json.loads(os.getenv("GOOGLE_CREDENTIALS")),
+            ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+        )
+        gs = gspread.authorize(creds)
+        ss = gs.open_by_key(SHEET_ID)
+        headers = ["Signal_ID", "Version", "Strategy_Used", "Status", "Side", "Entry_Time_UTC", "Exit_Time_UTC", "Entry_Price", "Exit_Price", "SL_Price", "TP_Price", "Gross_P&L_USD", "Fee_USD", "Net_P&L_USD", "Entry_Deposit_USD", "Entry_ADX", "ADX_Threshold"]
+        ws_name = f"HTX_Trades_{PAIR_SYMBOL.replace('/','').replace(':','')}"
+        try:
+            ws = ss.worksheet(ws_name)
+        except gspread.WorksheetNotFound:
+            ws = ss.add_worksheet(ws_name, rows="1000", cols=len(headers))
+        if ws.row_values(1) != headers:
+            ws.clear(); ws.update("A1", [headers])
+            ws.format(f"A1:{chr(ord('A')+len(headers)-1)}1", {"textFormat": {"bold": True}})
+        TRADE_LOG_WS = ws
+        log.info(f"Логирование в Google Sheet включено ➜ {ws_name}")
+    except Exception as e:
+        log.error(f"Ошибка инициализации Google Sheets: {e}")
+        TRADE_LOG_WS = None
 
 # ── УПРАВЛЕНИЕ СОСТОЯНИЕМ ───────────────────────────────────────────────────
 STATE_FILE = f"state_{STRAT_VERSION}_{PAIR_SYMBOL.replace('/','').replace(':','')}.json"
 state = {"monitoring": False, "active_trade": None, "leverage": DEFAULT_LEVERAGE, "deposit_usd": DEFAULT_DEPOSIT_USD, "dynamic_adx_threshold": 25.0, "last_adx_recalc_time": None, "daily_report_data": []}
-# ... (Этот блок остается без изменений) ...
+
 def save_state():
     with open(STATE_FILE, 'w') as f: json.dump(state, f, indent=2)
 
@@ -96,6 +119,15 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df.ta.bbands(length=BBANDS_LEN, std=2, append=True, col_names=(f"BBL_{BBANDS_LEN}_2.0", f"BBM_{BBANDS_LEN}_2.0", f"BBU_{BBANDS_LEN}_2.0", f"BBB_{BBANDS_LEN}_2.0", f"BBP_{BBANDS_LEN}_2.0"))
     return df.dropna()
 
+# ── УВЕДОМЛЕНИЯ ───────────────────────────────────────────────
+async def notify_all(text: str, bot: Bot = None):
+    temp_bot = bot if bot else Bot(token=BOT_TOKEN)
+    for cid in CHAT_IDS:
+        try:
+            await temp_bot.send_message(cid, text, parse_mode="HTML")
+        except Exception as e:
+            log.error(f"TG fail -> {cid}: {e}")
+
 # ── ВЗАИМОДЕЙСТВИЕ С БИРЖЕЙ (HTX) ──────────────────────────────────────
 async def initialize_exchange():
     try:
@@ -110,6 +142,7 @@ async def initialize_exchange():
         return exchange
     except Exception as e:
         log.critical(f"Критическая ошибка инициализации биржи: {e}")
+        await notify_all(f"🔴 Критическая ошибка инициализации биржи: {e}")
         return None
 
 async def set_leverage_on_exchange(exchange, symbol, leverage):
@@ -119,6 +152,7 @@ async def set_leverage_on_exchange(exchange, symbol, leverage):
         return True
     except Exception as e:
         log.error(f"Ошибка установки плеча на бирже: {e}")
+        await notify_all(f"🔴 Ошибка установки плеча: {e}")
         return False
 
 async def execute_trade(exchange, signal: dict):
@@ -132,6 +166,7 @@ async def execute_trade(exchange, signal: dict):
     try:
         market = exchange.markets[PAIR_SYMBOL]
         position_value_usd = deposit * leverage
+        # На HTX размер ордера указывается в контрактах
         amount_in_contracts = position_value_usd / float(market['contractSize'])
         amount = exchange.amount_to_precision(PAIR_SYMBOL, amount_in_contracts)
         log.info(f"Расчетный размер ордера: {amount} контрактов")
@@ -142,7 +177,9 @@ async def execute_trade(exchange, signal: dict):
         }
         
         log.info(f"Попытка разместить ордер: {side} {amount} {PAIR_SYMBOL} по рынку с SL/TP.")
-        order = await exchange.create_order(symbol=PAIR_SYMBOL, type='market', side=side.lower(), amount=amount, params=params)
+        # Для HTX side должен быть 'buy' или 'sell'
+        order_side = 'buy' if side == 'BUY' else 'sell'
+        order = await exchange.create_order(symbol=PAIR_SYMBOL, type='market', side=order_side, amount=amount, params=params)
         
         log.info(f"Ордер успешно размещен! ID: {order['id']}")
         await notify_all(f"✅ <b>ОРДЕР РАЗМЕЩЕН</b>\n\n<b>ID:</b> {order['id']}\n<b>SL:</b> {sl_price}\n<b>TP:</b> {tp_price}")
@@ -153,25 +190,60 @@ async def execute_trade(exchange, signal: dict):
         await notify_all(f"🔴 ОШИБКА РАЗМЕЩЕНИЯ ОРДЕРА\n\n<b>Инструмент:</b> {PAIR_SYMBOL}\n<b>Тип:</b> {side}\n<b>Ошибка:</b> <code>{e}</code>")
         return None
 
-# ... (Остальные функции, такие как monitor, daily_reporter, и команды Telegram, остаются в основном такими же) ...
+async def process_closed_trade(exchange, trade_details, bot):
+    try:
+        log.info(f"Обработка закрытой сделки. ID ордера: {trade_details['id']}")
+        await notify_all(f"✅ Сделка {trade_details['id']} ({trade_details['side']}) была закрыта.", bot)
+    except Exception as e:
+        log.error(f"Ошибка обработки закрытой сделки {trade_details['id']}: {e}")
+
+async def recalculate_adx_threshold():
+    try:
+        log.info("Пересчет динамического порога ADX...")
+        exchange = await initialize_exchange()
+        if not exchange: return
+        ohlcv = await exchange.fetch_ohlcv(PAIR_SYMBOL, timeframe=TIMEFRAME, limit=1000)
+        await exchange.close()
+        df = pd.DataFrame(ohlcv, columns=["ts","open","high","low","close","volume"])
+        df.ta.adx(length=ADX_LEN, append=True, col_names=(f"ADX_{ADX_LEN}", "DMP", "DMN"))
+        df.dropna(inplace=True)
+
+        if not df.empty:
+            adx_values = df[f"ADX_{ADX_LEN}"]
+            p20 = np.percentile(adx_values, 20)
+            p30 = np.percentile(adx_values, 30)
+            new_threshold = (p20 + p30) / 2
+            state["dynamic_adx_threshold"] = new_threshold
+            state["last_adx_recalc_time"] = datetime.now(timezone.utc).isoformat()
+            save_state()
+            log.info(f"Новый порог ADX: {new_threshold:.2f} (p20={p20:.2f}, p30={p30:.2f})")
+    except Exception as e:
+        log.error(f"Ошибка при пересчете порога ADX: {e}")
+
 async def monitor(app: Application):
     exchange = await initialize_exchange()
     if not exchange:
         await notify_all("Не удалось инициализировать биржу. Бот остановлен.", app.bot); return
     
-    # На HTX нет отдельной настройки режима хеджирования через API, он управляется на сайте
     if not await set_leverage_on_exchange(exchange, PAIR_SYMBOL, state['leverage']):
         await notify_all("Не удалось установить плечо. Бот остановлен.", app.bot); await exchange.close(); return
 
+    await recalculate_adx_threshold()
     log.info("🚀 Основной цикл запущен: %s %s (%s)", PAIR_SYMBOL, TIMEFRAME, STRAT_VERSION)
     
     while state.get("monitoring", False):
         try:
+            now_utc = datetime.now(timezone.utc)
+            last_recalc_str = state.get("last_adx_recalc_time")
+            if not last_recalc_str or (now_utc - datetime.fromisoformat(last_recalc_str)).total_seconds() > 3600:
+                 await recalculate_adx_threshold()
+
             if state.get("active_trade"):
                 positions = await exchange.fetch_positions([PAIR_SYMBOL])
                 active_position = next((p for p in positions if float(p.get('contracts', 0)) != 0), None)
                 if not active_position:
                     log.info("Активная сделка была закрыта.")
+                    asyncio.create_task(process_closed_trade(exchange, state["active_trade"], app.bot))
                     state["active_trade"] = None
                     save_state()
                 await asyncio.sleep(60)
@@ -182,10 +254,20 @@ async def monitor(app: Application):
             if len(df) < 2: await asyncio.sleep(60); continue
 
             last = df.iloc[-1]
+            adx = last[f"ADX_{ADX_LEN}"]
+            
+            if adx >= state.get('dynamic_adx_threshold', 25):
+                await asyncio.sleep(60)
+                continue
+
             price = last["close"]
+            rsi = last[f"RSI_{RSI_LEN}"]
+            bb_lower = last[f"BBL_{BBANDS_LEN}_2.0"]
+            bb_upper = last[f"BBU_{BBANDS_LEN}_2.0"]
+
             side = None
-            if price <= last[f"BBL_{BBANDS_LEN}_2.0"] and last[f"RSI_{RSI_LEN}"] < FLAT_RSI_OVERSOLD: side = "BUY"
-            elif price >= last[f"BBU_{BBANDS_LEN}_2.0"] and last[f"RSI_{RSI_LEN}"] > FLAT_RSI_OVERBOUGHT: side = "SELL"
+            if price <= bb_lower and rsi < FLAT_RSI_OVERSOLD: side = "BUY"
+            elif price >= bb_upper and rsi > FLAT_RSI_OVERBOUGHT: side = "SELL"
 
             if side:
                 sl_pct = FLAT_SL_PCT
@@ -213,6 +295,53 @@ async def monitor(app: Application):
 
     await exchange.close()
     log.info("⛔️ Основной цикл остановлен.")
+
+# ── ЕЖЕДНЕВНЫЙ ОТЧЁТ ────────────────────────────────────────────────────────
+async def daily_reporter(app: Application):
+    log.info("📈 Сервис ежедневных отчётов запущен.")
+    while True:
+        now_utc = datetime.now(timezone.utc)
+        try:
+            report_h, report_m = map(int, REPORT_TIME_UTC.split(':'))
+            report_time = now_utc.replace(hour=report_h, minute=report_m, second=0, microsecond=0)
+        except ValueError:
+            log.error("Неверный формат REPORT_TIME_UTC. Используйте HH:MM. Отчеты отключены.")
+            return
+
+        if now_utc > report_time:
+            report_time += timedelta(days=1)
+
+        wait_seconds = (report_time - now_utc).total_seconds()
+        log.info(f"Следующий суточный отчёт будет отправлен в {REPORT_TIME_UTC} UTC (через {wait_seconds/3600:.2f} ч).")
+        await asyncio.sleep(wait_seconds)
+
+        report_data = state.get("daily_report_data", [])
+        if not report_data:
+            await notify_all(f"📊 <b>Суточный отчёт ({STRAT_VERSION})</b> 📊\n\nЗа последние 24 часа сделок не было.", app.bot)
+            await asyncio.sleep(60)
+            continue
+
+        total_pnl_usd = sum(item.get('pnl_usd', 0) for item in report_data)
+        total_trades = len(report_data)
+        wins = sum(1 for item in report_data if item.get('pnl_usd', 0) > 0)
+        losses = total_trades - wins
+        win_rate = (wins / total_trades) * 100 if total_trades > 0 else 0
+        
+        total_investment = sum(item.get('entry_usd', 0) for item in report_data)
+        pnl_percent = (total_pnl_usd / total_investment) * 100 if total_investment > 0 else 0
+        
+        report_msg = (f"📊 <b>Суточный отчёт по стратегии {STRAT_VERSION}</b> 📊\n\n"
+                      f"<b>Период:</b> последние 24 часа\n"
+                      f"<b>Всего сделок:</b> {total_trades} (📈{wins} / 📉{losses})\n"
+                      f"<b>Винрейт:</b> {win_rate:.2f}%\n\n"
+                      f"<b>Финансовый результат:</b>\n"
+                      f"💵 <b>Net P&L ($): {total_pnl_usd:+.2f}$</b>\n"
+                      f"💹 <b>ROI (%): {pnl_percent:+.2f}%</b>")
+        await notify_all(report_msg, app.bot)
+
+        state["daily_report_data"] = []
+        save_state()
+        await asyncio.sleep(60)
 
 # ── КОМАНДЫ TELEGRAM ────────────────────────────────────────────────
 async def start_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -265,7 +394,48 @@ async def set_leverage_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ Формат: /set_leverage <1-75>")
 
 async def test_trade_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("ℹ️ Тестовая команда для HTX в разработке.")
+    try:
+        args_dict = dict(arg.split('=') for arg in ctx.args)
+        deposit = float(args_dict['deposit'])
+        leverage = int(args_dict['leverage'])
+        tp_price = float(args_dict['tp'])
+        sl_price = float(args_dict['sl'])
+        side = args_dict.get('side', 'BUY').upper()
+
+        if side not in ['BUY', 'SELL']:
+            await update.message.reply_text("❌ Ошибка: 'side' должен быть BUY или SELL."); return
+
+        await update.message.reply_text(f"🛠 <b>ЗАПУСК ТЕСТОВОЙ СДЕЛКИ</b>...", parse_mode="HTML")
+
+        exchange = await initialize_exchange()
+        if not exchange:
+            await update.message.reply_text("🔴 Ошибка: не удалось подключиться к бирже."); return
+
+        await set_leverage_on_exchange(exchange, PAIR_SYMBOL, leverage)
+        
+        ticker = await exchange.fetch_ticker(PAIR_SYMBOL)
+        entry_price = ticker['last']
+
+        signal = {
+            "side": side, "entry_price": entry_price, "sl_price": sl_price,
+            "tp_price": tp_price, "deposit_usd": deposit, "leverage": leverage,
+        }
+
+        order_id = await execute_trade(exchange, signal)
+        
+        await set_leverage_on_exchange(exchange, PAIR_SYMBOL, state['leverage'])
+        await exchange.close()
+
+        if order_id:
+            signal['id'] = order_id
+            state["active_trade"] = signal
+            save_state()
+        else:
+            await update.message.reply_text("🔴 Ошибка размещения тестового ордера. Проверьте логи.", parse_mode="HTML")
+
+    except Exception as e:
+        log.error(f"Ошибка в команде test_trade: {e}")
+        await update.message.reply_text(f"⚠️ Ошибка формата команды.\n<b>Пример:</b> /test_trade deposit=30 leverage=10 tp=65000 sl=60000 side=BUY", parse_mode="HTML")
 
 async def apitest_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("⚙️ <b>Запускаю тест API ключей HTX...</b>", parse_mode="HTML")
@@ -293,11 +463,13 @@ async def apitest_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def post_init(app: Application):
     load_state()
+    setup_google_sheets()
     log.info("Бот инициализирован.")
     await notify_all(f"✅ Бот <b>{STRAT_VERSION}</b> перезапущен.", bot=app.bot)
     if state.get("monitoring"):
         log.info("Обнаружен активный статус мониторинга, запускаю основной цикл...")
         asyncio.create_task(monitor(app))
+    asyncio.create_task(daily_reporter(app))
 
 if __name__ == "__main__":
     app = (ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build())
