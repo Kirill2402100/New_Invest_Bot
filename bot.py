@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 # ============================================================================
-# Flat-Liner v11.4 • 16 Jul 2025
+# Flat-Liner v11.5 • 16 Jul 2025
 # ============================================================================
 # • СТРАТЕГИЯ: Флэтовая стратегия 'Flat_BB_Fade' с обязательным фильтром по ADX
 # • БИРЖА: OKX (финальная версия для нового хостинга)
 # • АВТОТРЕЙДИНГ: Полная интеграция с API для размещения ордеров
-# • ИСПРАВЛЕНИЕ v11.4:
-#   - Добавлен механизм грациозного завершения работы для предотвращения
-#     ошибки 'telegram.error.Conflict' при перезапуске на хостинге.
+# • ИСПРАВЛЕНИЕ v11.5:
+#   - Реализован надежный механизм грациозного завершения через shutdown_callback
+#     для принудительной отмены всех фоновых задач и предотвращения
+#     ошибки 'telegram.error.Conflict'.
 # ============================================================================
 
 import os
@@ -34,7 +35,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_IDS_RAW = os.getenv("CHAT_IDS", "")
 PAIR_SYMBOL = os.getenv("PAIR_SYMBOL", "BTC-USDT-SWAP") # Формат OKX
 TIMEFRAME = os.getenv("TIMEFRAME", "5m")
-STRAT_VERSION = "v11_4_flatliner_okx_render"
+STRAT_VERSION = "v11_5_flatliner_okx_render"
 SHEET_ID = os.getenv("SHEET_ID")
 
 # --- OKX API ---
@@ -214,15 +215,20 @@ async def recalculate_adx_threshold():
 
 # ── ОСНОВНОЙ ЦИКЛ БОТА ───────────────────────────────────────────────────────
 async def monitor(app: Application):
-    exchange = await initialize_exchange()
-    if not exchange: await notify_all("Не удалось инициализировать биржу. Бот остановлен.", app.bot); return
-    if not await set_leverage_on_exchange(exchange, PAIR_SYMBOL, state['leverage']):
-        await notify_all("Не удалось установить плечо. Бот остановлен.", app.bot); await exchange.close(); return
-    await recalculate_adx_threshold()
-    log.info("🚀 Основной цикл запущен: %s %s", PAIR_SYMBOL, TIMEFRAME)
-    
-    while state.get("monitoring", False):
-        try:
+    exchange = None
+    try:
+        exchange = await initialize_exchange()
+        if not exchange:
+            await notify_all("Не удалось инициализировать биржу. Мониторинг остановлен.", app.bot)
+            return
+        if not await set_leverage_on_exchange(exchange, PAIR_SYMBOL, state['leverage']):
+            await notify_all("Не удалось установить плечо. Мониторинг остановлен.", app.bot)
+            return
+        
+        await recalculate_adx_threshold()
+        log.info("🚀 Основной цикл запущен: %s %s", PAIR_SYMBOL, TIMEFRAME)
+        
+        while state.get("monitoring", False):
             now_utc = datetime.now(timezone.utc)
             last_recalc_str = state.get("last_adx_recalc_time")
             if not last_recalc_str or (now_utc - datetime.fromisoformat(last_recalc_str)).total_seconds() > 3600:
@@ -259,20 +265,25 @@ async def monitor(app: Application):
                 order_id = await execute_trade(exchange, signal)
                 if order_id:
                     state["active_trade"] = {"id": order_id, **signal}; save_state()
-        
-        except Exception as e: log.exception("Сбой в основном цикле:")
-        await asyncio.sleep(60)
+            
+            await asyncio.sleep(60)
     
-    if exchange and exchange.session:
-        await exchange.close()
-    log.info("⛔️ Основной цикл остановлен.")
+    except asyncio.CancelledError:
+        log.info("Задача мониторинга отменяется...")
+    except Exception as e:
+        log.exception("Сбой в основном цикле мониторинга:")
+    finally:
+        if exchange:
+            await exchange.close()
+            log.info("Соединение с биржей в monitor закрыто.")
+        log.info("⛔️ Основной цикл мониторинга полностью остановлен.")
 
 # ── ЕЖЕДНЕВНЫЙ ОТЧЁТ ────────────────────────────────────────────────────────
 async def daily_reporter(app: Application):
     log.info("📈 Сервис ежедневных отчётов запущен.")
     while True:
-        now_utc = datetime.now(timezone.utc)
         try:
+            now_utc = datetime.now(timezone.utc)
             report_h, report_m = map(int, REPORT_TIME_UTC.split(':'))
             report_time = now_utc.replace(hour=report_h, minute=report_m, second=0, microsecond=0)
             if now_utc > report_time: report_time += timedelta(days=1)
@@ -295,7 +306,7 @@ async def daily_reporter(app: Application):
             await notify_all(report_msg, app.bot)
             state["daily_report_data"] = []; save_state()
         except asyncio.CancelledError:
-            log.info("Сервис отчетов остановлен.")
+            log.info("Задача ежедневных отчетов отменена.")
             break
         except Exception as e:
             log.error(f"Ошибка в daily_reporter: {e}")
@@ -303,12 +314,15 @@ async def daily_reporter(app: Application):
 
 # ── КОМАНДЫ TELEGRAM ────────────────────────────────────────────────────────
 async def start_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if state.get("monitoring"):
+        await update.message.reply_text(f"Бот уже запущен.", parse_mode="HTML")
+        return
     state["monitoring"] = True; save_state()
     await update.message.reply_text(f"✅ Бот <b>{STRAT_VERSION}</b> запущен.", parse_mode="HTML")
     asyncio.create_task(monitor(ctx.application))
 async def stop_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     state["monitoring"] = False; save_state()
-    await update.message.reply_text("❌ Бот остановлен.")
+    await update.message.reply_text("❌ Бот остановлен. Основной цикл завершится после текущей итерации.")
 async def status_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     status = 'АКТИВЕН' if state.get('monitoring') else 'ОСТАНОВЛЕН'
     trade_info = f"<b>Активная сделка:</b> {state['active_trade']['id']}" if state.get('active_trade') else "<i>Нет активных сделок.</i>"
@@ -381,20 +395,35 @@ async def post_init(app: Application):
     setup_google_sheets()
     log.info("Бот инициализирован.")
     await notify_all(f"✅ Бот <b>{STRAT_VERSION}</b> перезапущен.", bot=app.bot)
-    if state.get("monitoring"): asyncio.create_task(monitor(app))
+    if state.get("monitoring"):
+        asyncio.create_task(monitor(app))
     asyncio.create_task(daily_reporter(app))
 
-if __name__ == "__main__":
-    app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
-    
-    log.info("Запуск бота...")
-    # Указываем, какие сигналы системы должны грациозно останавливать бота
-    # Это решает проблему 'telegram.error.Conflict' при перезапуске
-    app.run_polling(stop_signals=[signal.SIGINT, signal.SIGTERM])
+async def shutdown_handler(app: Application):
+    """Handles graceful shutdown."""
+    log.warning("Получен сигнал на остановку. Начинаю грациозное завершение...")
+    await notify_all(f"⚠️ Бот <b>{STRAT_VERSION}</b> перезапускается/останавливается.", bot=app.bot)
 
-    # Код ниже выполнится после остановки бота
-    log.info("Бот остановлен. Сохранение состояния...")
-    # Принудительно выключаем мониторинг в состоянии перед сохранением
+    tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+    log.info(f"Отменяю {len(tasks)} фоновых задач...")
+    for task in tasks:
+        task.cancel()
+
+    await asyncio.gather(*tasks, return_exceptions=True)
+    log.info("Все фоновые задачи завершены.")
+
     state["monitoring"] = False
     save_state()
-    log.info("Состояние сохранено. Выход.")
+    log.info("Финальное состояние сохранено. Бот выключен.")
+
+if __name__ == "__main__":
+    app = (
+        ApplicationBuilder()
+        .token(BOT_TOKEN)
+        .post_init(post_init)
+        .shutdown_callback(shutdown_handler)
+        .build()
+    )
+    
+    log.info("Запуск бота...")
+    app.run_polling(stop_signals=[signal.SIGINT, signal.SIGTERM])
