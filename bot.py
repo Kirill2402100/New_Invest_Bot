@@ -1,26 +1,13 @@
 #!/usr/bin/env python3
 # ============================================================================
-#  Flat‑Liner • Heroku edition — 16 Jul 2025  (fixed runtime loop)
+#  Flat‑Liner • Heroku edition — 16 Jul 2025 (fixed & updated)
 #  Стратегия  : Flat_BB_Fade  +  динамический ADX‑фильтр
 #  Биржа      : OKX (USDT‑Swap)
-#  Команды    : /start /stop /status /set_deposit /set_leverage
-#  Автор      : Kirill2402100  |  MIT Licence
+#  Команды    : /start /stop /status /set_deposit /set_leverage /test_trade
+#  Автор      : Kirill2402100  |  MIT Licence
 # ============================================================================
 
-"""
-⛑  ЧТО ИСПРАВЛЕНО В ЭТОЙ ВЕРСИИ
-------------------------------------------------------------
-•  Добавлен   /start   — без него бот не реагировал в чате.
-•  Упрощён цикл run():  используем   app.run_polling()  —
-   это стартует long‑polling и держит процесс живым на Heroku.
-•  Фоновая логика (monitor / reporter) запускается в   post_init
-•  Все await‑exchange.close() завершаются try/except, чтобы
-   не возникало «Unclosed client session».
-•  state['monitoring'] автоматически поднимается при старте.
-•  Мелкие правки типографики и логирования.
-"""
-
-import os, json, logging, asyncio, signal
+import os, json, logging, asyncio
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Optional
@@ -49,7 +36,7 @@ OKX_SANDBOX        = os.getenv("OKX_DEMO_MODE", "0") == "1"
 DEFAULT_DEPOSIT  = float(os.getenv("DEFAULT_DEPOSIT_USD", 50))
 DEFAULT_LEVERAGE = int  (os.getenv("DEFAULT_LEVERAGE",    100))
 
-SL_PCT, RR_RATIO = 0.10, 1.0           # стоп‑лосс 0.10 %,  соотношение 1:1
+SL_PCT, RR_RATIO = 0.10, 1.0           # стоп‑лосс 0.10 %,  соотношение 1:1
 RSI_OS, RSI_OB   = 35, 65              # oversold / overbought
 REPORT_UTC_HOUR  = int(os.getenv("REPORT_HOUR_UTC", 21))
 
@@ -63,10 +50,10 @@ log = logging.getLogger("flatliner")
 
 # ─────────────────── STATE ───────────────────────────────────────────────
 state = {
-    "monitoring": True,               # ← сразу включён
+    "monitoring": True,
     "active_trade": None,
-    "deposit":   DEFAULT_DEPOSIT,
-    "leverage":  DEFAULT_LEVERAGE,
+    "deposit":  DEFAULT_DEPOSIT,
+    "leverage": DEFAULT_LEVERAGE,
     "adx_threshold": 25.0,
     "last_adx_recalc": None,
     "daily_pnls": []
@@ -119,7 +106,7 @@ async def set_leverage(ex, lev):
     for side in ("long", "short"):
         await ex.set_leverage(lev, PAIR_SYMBOL, {"mgnMode":"isolated", "posSide":side})
 
-# ─────────────────── CORE ────────────────────────────────────────────────
+# ─────────────────── CORE ────────────────────────────────────────────────
 async def recalc_adx_threshold():
     ex = await create_exchange()
     try:
@@ -157,12 +144,10 @@ async def monitor(app: Application):
 
     try:
         while state["monitoring"]:
-            # пересчёт ADX раз в час
             last = state["last_adx_recalc"]
             if not last or (datetime.now(timezone.utc)-datetime.fromisoformat(last)).total_seconds()>3600:
                 await recalc_adx_threshold()
 
-            # позиция ещё открыта?
             if (tr:=state.get("active_trade")):
                 poss = await ex.fetch_positions([PAIR_SYMBOL])
                 side = "long" if tr["side"]=="LONG" else "short"
@@ -171,7 +156,6 @@ async def monitor(app: Application):
                     state["active_trade"] = None; save_state(); await notify("ℹ️ Позиция закрыта")
                 await asyncio.sleep(60); continue
 
-            # поиск сигнала
             ohlcv = await ex.fetch_ohlcv(PAIR_SYMBOL, TIMEFRAME, limit=100)
             df = add_indicators(df_from_ohlcv(ohlcv)); last = df.iloc[-1]
             price = last["close"]
@@ -205,14 +189,62 @@ async def reporter(app: Application):
         pnl = sum(d["pnl_usd"] for d in data); wins = sum(d["pnl_usd"]>0 for d in data)
         wr = wins/len(data)*100
         await notify(f"📊 24‑ч отчёт: {len(data)} сделок • win‑rate {wr:.1f}% • P&L {pnl:+.2f}$")
-# ─────────────────── COMMANDS ──────────────────────────────────────────────
+
+# ─────────────────── COMMANDS ───────────────────────────────────────────
+async def cmd_start(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    """Отправляет приветствие и статус при команде /start"""
+    await notify("🚀 Flat-Liner запущен. Используйте /status для проверки состояния.", c.bot)
+    await cmd_status(u, c)
+
 async def cmd_status(u: Update, c: ContextTypes.DEFAULT_TYPE):
     status = '🟢' if state["monitoring"] else '🔴'
     trade  = f"\nАктивная позиция ID {state['active_trade']['id']}" if state["active_trade"] else ""
     txt = (f"<b>Flat-Liner status</b>\n\nМониторинг: {status}"
-           f"\nПлечо: {state['leverage']}x   |   Депозит: {state['deposit']}$"
+           f"\nПлечо: {state['leverage']}x  |  Депозит: {state['deposit']}$"
            f"{trade}")
     await u.message.reply_text(txt, parse_mode="HTML")
+
+async def cmd_test_trade(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    """Открывает тестовую позицию с параметрами: deposit, leverage, sl, tp, side"""
+    try:
+        args = {k.lower(): v for k, v in (arg.split('=', 1) for arg in c.args)}
+        side = args.get('side', '').upper()
+        sl_price = float(args.get('sl'))
+        tp_price = float(args.get('tp'))
+        if side not in ['LONG', 'SHORT']: raise ValueError("Параметр 'side' обязателен (LONG или SHORT).")
+        deposit = float(args.get('deposit', state['deposit']))
+        leverage = int(args.get('leverage', state['leverage']))
+    except (ValueError, TypeError, KeyError):
+        await u.message.reply_text(
+            "❌ **Ошибка в параметрах.**\n\n"
+            "Убедитесь, что все значения указаны верно. Обязательные параметры: `side`, `sl`, `tp`.\n\n"
+            "<i>Пример: /test_trade deposit=30 leverage=10 sl=65000 tp=68000 side=LONG</i>",
+            parse_mode="HTML"
+        )
+        return
+
+    await u.message.reply_text(f"🛠️ Открываю тестовую позицию {side} с вашими параметрами...")
+    ex = None
+    try:
+        ex = await create_exchange()
+        await set_leverage(ex, leverage)
+        market = ex.markets[PAIR_SYMBOL]
+        ticker = await ex.fetch_ticker(PAIR_SYMBOL)
+        price = ticker['last']
+        size = round((deposit * leverage) / price / float(market["contractSize"]))
+        if size < float(market["limits"]["amount"]["min"]):
+            await u.message.reply_text(f"🔴 Размер сделки ({size}) меньше минимального ({market['limits']['amount']['min']}).")
+            return
+        params = {"tdMode": "isolated", "posSide": "long" if side == "LONG" else "short",
+                  "slTriggerPx": str(sl_price), "slOrdPx": "-1",
+                  "tpTriggerPx": str(tp_price), "tpOrdPx": "-1"}
+        order = await ex.create_order(PAIR_SYMBOL, "market", "buy" if side == "LONG" else "sell", size, params=params)
+        await u.message.reply_text(f"✅ Тестовый ордер <code>{order['id']}</code> успешно создан.", parse_mode="HTML")
+    except Exception as e:
+        log.error("Ошибка в cmd_test_trade: %s", e)
+        await u.message.reply_text(f"🔥 **Произошла ошибка:**\n<code>{e}</code>", parse_mode="HTML")
+    finally:
+        if ex: await ex.close()
 
 async def cmd_stop(u: Update, c: ContextTypes.DEFAULT_TYPE):
     state["monitoring"] = False; save_state()
@@ -233,49 +265,36 @@ async def cmd_set_lev(u: Update, c: ContextTypes.DEFAULT_TYPE):
     except: await u.message.reply_text("Формат: /set_leverage 50")
 
 # ─────────────────── MAIN ──────────────────────────────────────────────────
-async def run() -> None:
-    load_state()
+async def post_init_tasks(app: Application):
+    """Запускает фоновые задачи после инициализации бота."""
+    await notify("♻️ Бот перезапущен.", app.bot)
+    if not state["monitoring"]:
+        state["monitoring"] = True
+        save_state()
+    asyncio.create_task(monitor(app))
+    asyncio.create_task(reporter(app))
 
+def main() -> None:
+    """Основная функция запуска бота."""
+    load_state()
     app = (ApplicationBuilder()
            .token(BOT_TOKEN)
-           .post_init(lambda a: notify("♻️ Бот перезапущен.", a.bot))
+           .post_init(post_init_tasks)
            .build())
 
+    # Регистрация обработчиков команд
+    app.add_handler(CommandHandler("start",        cmd_start))
     app.add_handler(CommandHandler("status",       cmd_status))
     app.add_handler(CommandHandler("stop",         cmd_stop))
     app.add_handler(CommandHandler("set_deposit",  cmd_set_dep))
     app.add_handler(CommandHandler("set_leverage", cmd_set_lev))
+    app.add_handler(CommandHandler("test_trade",   cmd_test_trade))
 
-    # авто-запуск мониторинга при старте
-    if not state["monitoring"]:
-        state["monitoring"] = True; save_state()
-
-    monitor_task = asyncio.create_task(monitor(app))
-    report_task  = asyncio.create_task(reporter(app))
-
-    loop = asyncio.get_running_loop()
-    stop_future = loop.create_future()
-    loop.add_signal_handler(signal.SIGTERM, stop_future.set_result, None)
-    loop.add_signal_handler(signal.SIGINT , stop_future.set_result, None)
-
-   async with app:
-    await app.initialize()               # ← добавили
-    await app.start()                    # ← как было
-    await app.updater.start_polling()    # ← добавили
-
-    # ваши фоновые задачи уже созданы выше
-    await stop_future                    # ждём SIGTERM / Ctrl-C
-
-    # ─ graceful shutdown ─
-    monitor_task.cancel(); report_task.cancel()
-    await asyncio.gather(monitor_task, report_task, return_exceptions=True)
-
-    await app.updater.stop()             # ← добавили
-    await app.stop()
-       log.info("Бот остановлен.")
+    app.run_polling()
+    log.info("Бот остановлен.")
 
 if __name__ == "__main__":
     try:
-        asyncio.run(run())
+        main()
     except (KeyboardInterrupt, SystemExit):
-        pass
+        log.info("Процесс прерван пользователем.")
