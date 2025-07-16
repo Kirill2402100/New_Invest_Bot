@@ -155,14 +155,26 @@ async def execute_trade(ex: ccxt.okx, side: str, price: float) -> Optional[str]:
 
 # ─────────────────── MONITOR ───────────────────────────────────────────────
 async def monitor(app: Application):
-    ex = await create_exchange()
+    """Главный цикл стратегии; никогда не выбрасывает исключений наружу."""
+    ex: Optional[ccxt.okx] = None
+
     try:
-        await set_leverage(ex, state["leverage"])
+        # пытаемся завести биржу, пока не получится
+        while ex is None:
+            try:
+                ex = await create_exchange()
+                await set_leverage(ex, state["leverage"])
+            except Exception as e:
+                log.warning("Не удалось инициализировать OKX (%s). Повтор через 30 с.", e)
+                if ex: await ex.close()
+                ex = None
+                await asyncio.sleep(30)
+
         await recalc_adx_threshold()
         log.info("🚀 Мониторинг запущен.")
 
         while state["monitoring"]:
-            try:                                         # ← новый защитный try/except
+            try:
                 # ── пересчёт ADX раз в час ────────────────────────────────
                 last = state["last_adx_recalc"]
                 if (not last or
@@ -174,8 +186,7 @@ async def monitor(app: Application):
                 if (tr := state.get("active_trade")):
                     poss = await ex.fetch_positions([PAIR_SYMBOL])
                     side = "long" if tr["side"] == "LONG" else "short"
-                    still_open = any(p["side"] == side and
-                                     float(p["contracts"] or 0) > 0
+                    still_open = any(p["side"] == side and float(p["contracts"] or 0) > 0
                                      for p in poss)
                     if not still_open:
                         state["active_trade"] = None
@@ -185,13 +196,21 @@ async def monitor(app: Application):
                     continue
 
                 # ── ищем новый сигнал ────────────────────────────────────
-                ohlcv = await ex.fetch_ohlcv(PAIR_SYMBOL,
-                                             timeframe=TIMEFRAME, limit=100)
+                ohlcv = await ex.fetch_ohlcv(PAIR_SYMBOL, TIMEFRAME, limit=100)
+                if not ohlcv:                       # биржа вернула пустой список
+                    await asyncio.sleep(30)
+                    continue
+
                 df = add_indicators(df_from_ohlcv(ohlcv))
+                if df.empty:                        # после dropna() ничего не осталось
+                    await asyncio.sleep(30)
+                    continue
+
                 last_candle = df.iloc[-1]
                 price = last_candle["close"]
 
-                if last_candle[ADX_COL] >= state["adx_threshold"]:
+                if (np.isnan(state["adx_threshold"]) or
+                    last_candle[ADX_COL] >= state["adx_threshold"]):
                     await asyncio.sleep(60)
                     continue
 
@@ -200,33 +219,30 @@ async def monitor(app: Application):
                     side = "LONG"
                 elif price >= last_candle[BBU_COL] and last_candle[RSI_COL] > RSI_OB:
                     side = "SHORT"
-                if not side:
+                if side is None:
                     await asyncio.sleep(60)
                     continue
 
                 order_id = await execute_trade(ex, side, price)
                 if order_id:
-                    state["active_trade"] = {
-                        "id": order_id,
-                        "side": side,
-                        "entry_price": price
-                    }
+                    state["active_trade"] = {"id": order_id, "side": side, "entry_price": price}
                     save_state()
 
                 await asyncio.sleep(60)
 
-            except ccxt.NetworkError as e:               # ← ловим сетевые проблемы
+            except ccxt.NetworkError as e:          # сеть / HTTP-коды от OKX
                 log.warning("CCXT network error: %s", e)
                 await asyncio.sleep(30)
 
-            except Exception as e:                       # ← и любые прочие сбои
+            except Exception as e:                 # любая непредвиденная ошибка
                 log.exception("Сбой внутри monitor-loop: %s", e)
                 await asyncio.sleep(30)
 
     except asyncio.CancelledError:
         pass
     finally:
-        await ex.close()
+        if ex:
+            await ex.close()
         log.info("Мониторинг остановлен.")
         
 # ─────────────────── REPORTER ──────────────────────────────────────────────
