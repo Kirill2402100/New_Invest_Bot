@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 # ============================================================================
-# Flat-Liner v11.3 • 16 Jul 2025
+# Flat-Liner v11.4 • 16 Jul 2025
 # ============================================================================
 # • СТРАТЕГИЯ: Флэтовая стратегия 'Flat_BB_Fade' с обязательным фильтром по ADX
 # • БИРЖА: OKX (финальная версия для нового хостинга)
 # • АВТОТРЕЙДИНГ: Полная интеграция с API для размещения ордеров
-# • ИСПРАВЛЕНИЕ v11.3:
-#   - Исправлена структура запроса для создания ордера с SL/TP на OKX.
-#   - Улучшено логирование ошибок при размещении ордера.
+# • ИСПРАВЛЕНИЕ v11.4:
+#   - Добавлен механизм грациозного завершения работы для предотвращения
+#     ошибки 'telegram.error.Conflict' при перезапуске на хостинге.
 # ============================================================================
 
 import os
@@ -15,6 +15,7 @@ import json
 import logging
 import asyncio
 import traceback
+import signal
 from datetime import datetime, timezone, timedelta
 
 import numpy as np
@@ -33,7 +34,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_IDS_RAW = os.getenv("CHAT_IDS", "")
 PAIR_SYMBOL = os.getenv("PAIR_SYMBOL", "BTC-USDT-SWAP") # Формат OKX
 TIMEFRAME = os.getenv("TIMEFRAME", "5m")
-STRAT_VERSION = "v11_3_flatliner_okx_render"
+STRAT_VERSION = "v11_4_flatliner_okx_render"
 SHEET_ID = os.getenv("SHEET_ID")
 
 # --- OKX API ---
@@ -149,29 +150,24 @@ async def execute_trade(exchange, signal: dict):
         if order_size_contracts < float(market['limits']['amount']['min']):
             await notify_all(f"🔴 ОШИБКА: Рассчитанный размер ({order_size_contracts}) меньше минимального."); return None
 
-        # Создаем параметры для ордера. Для OKX SL/TP передаются на верхнем уровне.
         params = {
             'tdMode': 'isolated',
             'posSide': 'long' if side == 'LONG' else 'short',
             'slTriggerPx': str(sl_price),
-            'slOrdPx': '-1',  # -1 означает исполнение по рынку
+            'slOrdPx': '-1',
             'tpTriggerPx': str(tp_price),
-            'tpOrdPx': '-1'   # -1 означает исполнение по рынку
+            'tpOrdPx': '-1'
         }
         
         order = await exchange.create_order(
-            symbol=PAIR_SYMBOL,
-            type='market',
-            side='buy' if side == 'LONG' else 'sell',
-            amount=order_size_contracts,
-            params=params
+            symbol=PAIR_SYMBOL, type='market', side='buy' if side == 'LONG' else 'sell',
+            amount=order_size_contracts, params=params
         )
         
         log.info(f"Ордер успешно размещен! ID: {order['id']}")
         await notify_all(f"✅ <b>ОРДЕР РАЗМЕЩЕН</b>\n\n<b>ID:</b> {order['id']}\n<b>Тип:</b> {side}\n<b>SL:</b> {sl_price:.2f}\n<b>TP:</b> {tp_price:.2f}")
         return order['id']
     except Exception as e:
-        # Улучшенное логирование для более детальной отладки
         error_details = traceback.format_exc()
         log.error(f"Ошибка размещения ордера: {e}\n{error_details}")
         await notify_all(f"🔴 ОШИБКА РАЗМЕЩЕНИЯ ОРДЕРА: <code>{e}</code>")
@@ -192,7 +188,6 @@ async def process_closed_trade(exchange, trade_details, bot):
         save_state()
         await notify_all(f"{'✅' if status == 'WIN' else '❌'} <b>СДЕЛКА ЗАКРЫТА</b>\n\n<b>ID:</b> {report['id']} | <b>Тип:</b> {report['side']}\n<b>Вход:</b> {report['entry_price']:.2f} | <b>Выход:</b> {report['exit_price']:.2f}\n💰 <b>Net P&L: {report['net_pnl_usd']:.2f}$</b> (Fee: {report['fee_usd']:.2f}$)", bot)
         if TRADE_LOG_WS:
-            # Логика записи в Google Sheets
             pass
     except Exception as e:
         log.error(f"Ошибка обработки закрытой сделки {trade_details['id']}: {e}")
@@ -267,7 +262,10 @@ async def monitor(app: Application):
         
         except Exception as e: log.exception("Сбой в основном цикле:")
         await asyncio.sleep(60)
-    await exchange.close(); log.info("⛔️ Основной цикл остановлен.")
+    
+    if exchange and exchange.session:
+        await exchange.close()
+    log.info("⛔️ Основной цикл остановлен.")
 
 # ── ЕЖЕДНЕВНЫЙ ОТЧЁТ ────────────────────────────────────────────────────────
 async def daily_reporter(app: Application):
@@ -296,9 +294,12 @@ async def daily_reporter(app: Application):
                           f"💵 <b>Net P&L: {total_pnl:+.2f}$</b>")
             await notify_all(report_msg, app.bot)
             state["daily_report_data"] = []; save_state()
+        except asyncio.CancelledError:
+            log.info("Сервис отчетов остановлен.")
+            break
         except Exception as e:
             log.error(f"Ошибка в daily_reporter: {e}")
-            await asyncio.sleep(3600) # Ждем час перед повторной попыткой
+            await asyncio.sleep(3600)
 
 # ── КОМАНДЫ TELEGRAM ────────────────────────────────────────────────────────
 async def start_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -360,14 +361,9 @@ async def apitest_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     try:
         await update.message.reply_text("Попытка получить баланс...", parse_mode="HTML")
         balance = await exchange.fetch_balance()
-        
-        # Безопасно форматируем ответ для отправки
         balance_str = json.dumps(balance, indent=2, ensure_ascii=False)
-        
-        # Telegram имеет лимит на длину сообщения
         if len(balance_str) > 4000:
             balance_str = balance_str[:4000] + "\n... (ответ обрезан)"
-
         await update.message.reply_text(
             f"✅ <b>УСПЕХ!</b>\nПодключение к OKX прошло успешно.\n\n"
             f"<b>Полная структура баланса:</b>\n<pre>{balance_str}</pre>",
@@ -390,11 +386,15 @@ async def post_init(app: Application):
 
 if __name__ == "__main__":
     app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
-    app.add_handler(CommandHandler("start", start_command))
-    app.add_handler(CommandHandler("stop", stop_command))
-    app.add_handler(CommandHandler("status", status_command))
-    app.add_handler(CommandHandler("set_deposit", set_deposit_command))
-    app.add_handler(CommandHandler("set_leverage", set_leverage_command))
-    app.add_handler(CommandHandler("test_trade", test_trade_command))
-    app.add_handler(CommandHandler("apitest", apitest_command))
-    log.info("Запуск бота..."); app.run_polling()
+    
+    log.info("Запуск бота...")
+    # Указываем, какие сигналы системы должны грациозно останавливать бота
+    # Это решает проблему 'telegram.error.Conflict' при перезапуске
+    app.run_polling(stop_signals=[signal.SIGINT, signal.SIGTERM])
+
+    # Код ниже выполнится после остановки бота
+    log.info("Бот остановлен. Сохранение состояния...")
+    # Принудительно выключаем мониторинг в состоянии перед сохранением
+    state["monitoring"] = False
+    save_state()
+    log.info("Состояние сохранено. Выход.")
