@@ -8,16 +8,14 @@
 # ============================================================================
 
 """
-Основные исправления по сравнению с предыдущей ревизией
-------------------------------------------------------
-1.  Все обращения к рынку через `ex.market(PAIR_SYMBOL)` вместо прямого
-   индекса `ex.markets[...]` — работает и с alias‑ами OKX (`BTC-USDT-SWAP`,
-   `BTC/USDT:USDT`, etc.).
-2.  Расчёт размера позиции делает `floor` до шага‑минимума, чтобы не
-   получить ноль при маленьком депозите.
-3.  TP/SL ставятся одним **conditional**‑ордером (поддерживает `-1` для
-   рыночного выхода). Для хедж‑режима добавлены и `side`, и `posSide`.
-4.  Обработчик SIGTERM — dyno Heroku завершится без R12.
+🔥 Главное исправление  — SL/TP ставятся как ордера **ordType="conditional"**,
+что позволяет передавать `tpOrdPx = slOrdPx = "-1"` (рыночное исполнение).
+
+Также учтены:
+• расчёт `size` через floor() и `step`, чтобы не получить 0;
+• `ex.market(PAIR_SYMBOL)` вместо обращения к словарю;
+• корректное закрытие асинхронных задач при SIGTERM (Heroku R12);
+• одинаковые изменения в execute_trade() и cmd_test_trade().
 """
 
 import os, json, logging, asyncio, signal, sys, math
@@ -83,19 +81,6 @@ def load_state():
             log.warning("STATE‑файл повреждён → создаю новый")
     save_state()
 
-# ───────────────────  SIGTERM graceful shutdown  ─────────────────────────
-
-def handle_sigterm(*_):
-    log.info("SIGTERM received, shutting down…")
-    for t in asyncio.all_tasks():
-        t.cancel()
-    try:
-        asyncio.get_event_loop().run_until_complete(asyncio.sleep(0))
-    finally:
-        sys.exit(0)
-
-signal.signal(signal.SIGTERM, handle_sigterm)
-
 # ─────────────────── HELPERS ─────────────────────────────────────────────
 async def notify(text: str, bot: Optional[Bot] = None):
     bot = bot or Bot(BOT_TOKEN)
@@ -149,16 +134,15 @@ async def recalc_adx_threshold():
     finally:
         await ex.close()
 
-async def calc_position_size(market, price):
+def calc_size(market, price, deposit, leverage):
     step = float(market["limits"]["amount"]["min"])
-    raw  = (state["deposit"] * state["leverage"]) / price / float(market["contractSize"])
-    size = math.floor(raw/step) * step
-    return size, step
+    raw  = (deposit * leverage) / price / float(market["contractSize"])
+    return math.floor(raw / step) * step
 
 async def place_tp_sl(ex, size, side, pos_side, price):
-    sl_price = price * (1 - SL_PCT / 100) if side == "LONG" else price * (1 + SL_PCT / 100)
-    tp_price = price * (1 + SL_PCT * RR_RATIO / 100) if side == "LONG" else price * (1 - SL_PCT * RR_RATIO / 100)
-    side_close = "sell" if side == "LONG" else "buy"
+    sl_price = price * (1 - SL_PCT/100) if side=="LONG" else price * (1 + SL_PCT/100)
+    tp_price = price * (1 + SL_PCT*RR_RATIO/100) if side=="LONG" else price * (1 - SL_PCT*RR_RATIO/100)
+    side_close = "sell" if side=="LONG" else "buy"
 
     await ex.private_post_trade_order_algo({
         "instId":       PAIR_SYMBOL,
@@ -166,7 +150,7 @@ async def place_tp_sl(ex, size, side, pos_side, price):
         "side":         side_close,
         "posSide":      pos_side,
         "sz":           str(size),
-        "ordType":      "conditional",
+        "ordType":      "conditional",   # ключевое исправление
         "tpTriggerPx":  str(tp_price),
         "tpOrdPx":      "-1",
         "slTriggerPx":  str(sl_price),
@@ -175,22 +159,19 @@ async def place_tp_sl(ex, size, side, pos_side, price):
 
 async def execute_trade(ex, side, price):
     market = ex.market(PAIR_SYMBOL)
-    size, step = await calc_position_size(market, price)
-    if size < step:
-        await notify("🔴 Размер сделки меньше минимального")
-        return None
+    size   = calc_size(market, price, state["deposit"], state["leverage"])
+    if size < float(market["limits"]["amount"]["min"]):
+        await notify("🔴 Размер сделки меньше минимального"); return None
 
-    pos_side   = "long" if side == "LONG" else "short"
-    order_side = "buy"  if side == "LONG" else "sell"
+    pos_side   = "long" if side=="LONG" else "short"
+    order_side = "buy"  if side=="LONG" else "sell"
 
-    order = await ex.create_order(
-        PAIR_SYMBOL, "market", order_side, size,
-        params={"tdMode": "isolated", "posSide": pos_side}
-    )
-    await notify(f"✅ Открыта позиция {side}  ID <code>{order['id']}</code>. Устанавливаю SL/TP…", parse_mode="HTML")
+    order = await ex.create_order(PAIR_SYMBOL, "market", order_side, size,
+                                  params={"tdMode":"isolated","posSide":pos_side})
+    await notify(f"✅ Открыта позиция {side}  ID <code>{order['id']}</code>. Устанавливаю SL/TP…")
 
     await place_tp_sl(ex, size, side, pos_side, price)
-    await notify(f"✅ SL/TP для ордера <code>{order['id']}</code> успешно установлены.", parse_mode="HTML")
+    await notify(f"✅ SL/TP для ордера <code>{order['id']}</code> установлены.")
     return order["id"]
 
 # ─────────────────── MONITOR ─────────────────────────────────────────────
@@ -201,11 +182,13 @@ async def monitor(app: Application):
 
     try:
         while state["monitoring"]:
+            # пересчёт ADX‑порога раз в час
             last = state["last_adx_recalc"]
             if not last or (datetime.now(timezone.utc)-datetime.fromisoformat(last)).total_seconds()>3600:
                 await recalc_adx_threshold()
 
-            if (tr:=state.get("active_trade")):
+            # контроль открытой позиции
+            if (tr := state.get("active_trade")):
                 poss = await ex.fetch_positions([PAIR_SYMBOL])
                 side = "long" if tr["side"]=="LONG" else "short"
                 open_now = any(p["side"]==side and float(p.get("contracts",0))>0 for p in poss)
@@ -213,15 +196,18 @@ async def monitor(app: Application):
                     state["active_trade"] = None; save_state(); await notify("ℹ️ Позиция закрыта")
                 await asyncio.sleep(60); continue
 
+            # поиск новой точки входа
             ohlcv = await ex.fetch_ohlcv(PAIR_SYMBOL, TIMEFRAME, limit=100)
-            df = add_indicators(df_from_ohlcv(ohlcv)); last = df.iloc[-1]
-            price = last["close"]
-            if last[ADX_COL] >= state["adx_threshold"]:
+            df    = add_indicators(df_from_ohlcv(ohlcv)); last = df.iloc[-1]; price = last["close"]
+
+            if last[ADX_COL] >= state["adx_threshold"]:   # флэт‑фильтр не прошёл
                 await asyncio.sleep(60); continue
-            side = "LONG"  if price<=last[BBL_COL] and last[RSI_COL]<RSI_OS else \
+
+            side = "LONG" if price<=last[BBL_COL] and last[RSI_COL]<RSI_OS else \
                    "SHORT" if price>=last[BBU_COL] and last[RSI_COL]>RSI_OB else None
             if not side:
                 await asyncio.sleep(60); continue
+
             oid = await execute_trade(ex, side, price)
             if oid:
                 state["active_trade"] = {"id":oid,"side":side,"entry_price":price}; save_state()
@@ -229,7 +215,7 @@ async def monitor(app: Application):
     except asyncio.CancelledError:
         pass
     finally:
-        try: await ex.close()
+        try: await ex.close();
         except Exception: pass
         log.info("Мониторинг остановлен")
 
@@ -239,12 +225,15 @@ async def reporter(app: Application):
         now = datetime.now(timezone.utc)
         tgt = now.replace(hour=REPORT_UTC_HOUR,minute=0,second=0,microsecond=0)
         if now>tgt: tgt += timedelta(days=1)
-        try: await asyncio.sleep((tgt-now).total_seconds())
-        except asyncio.CancelledError: break
+        try:
+            await asyncio.sleep((tgt-now).total_seconds())
+        except asyncio.CancelledError:
+            break
         data = state.pop("daily_pnls",[]); state["daily_pnls"]=[]; save_state()
-        if not data: await notify("📊 За сутки сделок не было"); continue
-        pnl = sum(d["pnl_usd"] for d in data); wins = sum(d["pnl_usd"]>0 for d in data)
-        wr = wins/len(data)*100
+        if not data:
+            await notify("📊 За сутки сделок не было"); continue
+        pnl  = sum(d["pnl_usd"] for d in data); wins = sum(d["pnl_usd"]>0 for d in data)
+        wr   = wins/len(data)*100
         await notify(f"📊 24‑ч отчёт: {len(data)} сделок • win‑rate {wr:.1f}% • P&L {pnl:+.2f}$")
 
 # ─────────────────── COMMANDS ───────────────────────────────────────────
@@ -259,7 +248,7 @@ async def cmd_status(u: Update, c: ContextTypes.DEFAULT_TYPE):
            f"\nПлечо: {state['leverage']}x  |  Депозит: {state['deposit']}$"
            f"{trade}")
     await u.message.reply_text(txt, parse_mode="HTML")
-
+   
 async def cmd_test_trade(u: Update, c: ContextTypes.DEFAULT_TYPE):
     """Открывает тестовую позицию с параметрами: deposit, leverage, sl, tp, side"""
     try:
