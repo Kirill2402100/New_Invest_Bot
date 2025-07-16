@@ -1,19 +1,20 @@
 #!/usr/bin/env python3
 # ============================================================================
-# Flat-Liner v11.2 • 16 Jul 2025
+# Flat-Liner v11.3 • 16 Jul 2025
 # ============================================================================
 # • СТРАТЕГИЯ: Флэтовая стратегия 'Flat_BB_Fade' с обязательным фильтром по ADX
 # • БИРЖА: OKX (финальная версия для нового хостинга)
 # • АВТОТРЕЙДИНГ: Полная интеграция с API для размещения ордеров
-# • ИСПРАВЛЕНИЕ v11.2:
-#   - Улучшена команда /apitest. Теперь она выводит полную структуру баланса
-#     для отладки, не вызывая ошибок.
+# • ИСПРАВЛЕНИЕ v11.3:
+#   - Исправлена структура запроса для создания ордера с SL/TP на OKX.
+#   - Улучшено логирование ошибок при размещении ордера.
 # ============================================================================
 
 import os
 import json
 import logging
 import asyncio
+import traceback
 from datetime import datetime, timezone, timedelta
 
 import numpy as np
@@ -28,27 +29,27 @@ from telegram.ext import (
 )
 
 # ── ENV: КОНФИГУРАЦИЯ БОТА ───────────────────────────────────────────────────
-BOT_TOKEN     = os.getenv("BOT_TOKEN")
-CHAT_IDS_RAW  = os.getenv("CHAT_IDS", "")
-PAIR_SYMBOL   = os.getenv("PAIR_SYMBOL", "BTC-USDT-SWAP") # Формат OKX
-TIMEFRAME     = os.getenv("TIMEFRAME", "5m")
-STRAT_VERSION = "v11_2_flatliner_okx_render"
-SHEET_ID      = os.getenv("SHEET_ID")
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+CHAT_IDS_RAW = os.getenv("CHAT_IDS", "")
+PAIR_SYMBOL = os.getenv("PAIR_SYMBOL", "BTC-USDT-SWAP") # Формат OKX
+TIMEFRAME = os.getenv("TIMEFRAME", "5m")
+STRAT_VERSION = "v11_3_flatliner_okx_render"
+SHEET_ID = os.getenv("SHEET_ID")
 
 # --- OKX API ---
-OKX_API_KEY      = os.getenv("OKX_API_KEY")
-OKX_API_SECRET   = os.getenv("OKX_API_SECRET")
+OKX_API_KEY = os.getenv("OKX_API_KEY")
+OKX_API_SECRET = os.getenv("OKX_API_SECRET")
 OKX_API_PASSPHRASE = os.getenv("OKX_API_PASSPHRASE")
-OKX_DEMO_MODE    = os.getenv("OKX_DEMO_MODE", "0") 
+OKX_DEMO_MODE = os.getenv("OKX_DEMO_MODE", "0")
 
 # --- Параметры стратегии ---
 DEFAULT_DEPOSIT_USD = float(os.getenv("DEFAULT_DEPOSIT_USD", "50.0"))
-DEFAULT_LEVERAGE    = float(os.getenv("DEFAULT_LEVERAGE", "100.0"))
-FLAT_RR_RATIO       = float(os.getenv("FLAT_RR_RATIO", "1.0"))
-FLAT_SL_PCT         = float(os.getenv("FLAT_SL_PCT", "0.10"))
-FLAT_RSI_OVERSOLD   = float(os.getenv("FLAT_RSI_OVERSOLD", "35"))
+DEFAULT_LEVERAGE = float(os.getenv("DEFAULT_LEVERAGE", "100.0"))
+FLAT_RR_RATIO = float(os.getenv("FLAT_RR_RATIO", "1.0"))
+FLAT_SL_PCT = float(os.getenv("FLAT_SL_PCT", "0.10"))
+FLAT_RSI_OVERSOLD = float(os.getenv("FLAT_RSI_OVERSOLD", "35"))
 FLAT_RSI_OVERBOUGHT = float(os.getenv("FLAT_RSI_OVERBOUGHT", "65"))
-REPORT_TIME_UTC     = os.getenv("REPORT_TIME_UTC", "21:00")
+REPORT_TIME_UTC = os.getenv("REPORT_TIME_UTC", "21:00")
 
 # ── НАСТРОЙКА ЛОГИРОВАНИЯ ────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)-8s  %(message)s")
@@ -148,25 +149,33 @@ async def execute_trade(exchange, signal: dict):
         if order_size_contracts < float(market['limits']['amount']['min']):
             await notify_all(f"🔴 ОШИБКА: Рассчитанный размер ({order_size_contracts}) меньше минимального."); return None
 
-        pre_check_params = {'instId': PAIR_SYMBOL, 'tdMode': 'isolated', 'side': 'buy' if side == 'LONG' else 'sell', 'posSide': 'long' if side == 'LONG' else 'short', 'ordType': 'market', 'sz': str(order_size_contracts)}
+        # Создаем параметры для ордера. Для OKX SL/TP передаются на верхнем уровне.
+        params = {
+            'tdMode': 'isolated',
+            'posSide': 'long' if side == 'LONG' else 'short',
+            'slTriggerPx': str(sl_price),
+            'slOrdPx': '-1',  # -1 означает исполнение по рынку
+            'tpTriggerPx': str(tp_price),
+            'tpOrdPx': '-1'   # -1 означает исполнение по рынку
+        }
         
-        if hasattr(exchange, 'privatePostTradeOrderPrecheck'):
-            pre_check_result = await exchange.privatePostTradeOrderPrecheck([pre_check_params])
-            if pre_check_result.get('code') != '0' or (pre_check_result.get('data') and pre_check_result['data'][0].get('sCode') != '0'):
-                error_msg = pre_check_result['data'][0]['sMsg'] if pre_check_result.get('data') else 'Неизвестная ошибка pre-check'
-                await notify_all(f"🔴 ПРЕДВАРИТЕЛЬНАЯ ПРОВЕРКА НЕ ПРОЙДЕНА: {error_msg}"); return None
-            log.info("Предварительная проверка пройдена.")
-        else:
-            log.warning("Метод pre-check не найден. Пропускаю проверку.")
-
-        params = {'tdMode': 'isolated', 'posSide': 'long' if side == 'LONG' else 'short', 'attachAlgoOrds': [{'slTriggerPx': str(sl_price), 'slOrdPx': '-1'}, {'tpTriggerPx': str(tp_price), 'tpOrdPx': '-1'}]}
-        order = await exchange.create_order(symbol=PAIR_SYMBOL, type='market', side='buy' if side == 'LONG' else 'sell', amount=order_size_contracts, params=params)
+        order = await exchange.create_order(
+            symbol=PAIR_SYMBOL,
+            type='market',
+            side='buy' if side == 'LONG' else 'sell',
+            amount=order_size_contracts,
+            params=params
+        )
         
         log.info(f"Ордер успешно размещен! ID: {order['id']}")
         await notify_all(f"✅ <b>ОРДЕР РАЗМЕЩЕН</b>\n\n<b>ID:</b> {order['id']}\n<b>Тип:</b> {side}\n<b>SL:</b> {sl_price:.2f}\n<b>TP:</b> {tp_price:.2f}")
         return order['id']
     except Exception as e:
-        log.error(f"Ошибка размещения ордера: {e}"); await notify_all(f"🔴 ОШИБКА РАЗМЕЩЕНИЯ ОРДЕРА: <code>{e}</code>"); return None
+        # Улучшенное логирование для более детальной отладки
+        error_details = traceback.format_exc()
+        log.error(f"Ошибка размещения ордера: {e}\n{error_details}")
+        await notify_all(f"🔴 ОШИБКА РАЗМЕЩЕНИЯ ОРДЕРА: <code>{e}</code>")
+        return None
 
 async def process_closed_trade(exchange, trade_details, bot):
     try:
@@ -344,7 +353,7 @@ async def test_trade_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"⚠️ Ошибка формата. Пример: /test_trade deposit=20 leverage=10 tp=65000 sl=60000 side=LONG", parse_mode="HTML")
 
 async def apitest_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("⚙️ <b>Тест API ключей OKX... (v2)</b>", parse_mode="HTML")
+    await update.message.reply_text("⚙️ <b>Тест API ключей OKX...</b>", parse_mode="HTML")
     exchange = await initialize_exchange()
     if not exchange:
         await update.message.reply_text("🔴 Не удалось инициализировать биржу."); return
