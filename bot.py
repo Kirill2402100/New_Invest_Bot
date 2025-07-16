@@ -162,51 +162,73 @@ async def monitor(app: Application):
         log.info("🚀 Мониторинг запущен.")
 
         while state["monitoring"]:
-            # пересчёт ADX раз в час
-            last = state["last_adx_recalc"]
-            if not last or (datetime.now(timezone.utc)
-                            - datetime.fromisoformat(last)).seconds > 3600:
-                await recalc_adx_threshold()
+            try:                                         # ← новый защитный try/except
+                # ── пересчёт ADX раз в час ────────────────────────────────
+                last = state["last_adx_recalc"]
+                if (not last or
+                    (datetime.now(timezone.utc) -
+                     datetime.fromisoformat(last)).seconds > 3600):
+                    await recalc_adx_threshold()
 
-            # позиция ещё открыта?
-            if (tr := state.get("active_trade")):
-                poss = await ex.fetch_positions([PAIR_SYMBOL])
-                side = "long" if tr["side"]=="LONG" else "short"
-                still_open = any(p["side"]==side and float(p["contracts"] or 0)>0
-                                 for p in poss)
-                if not still_open:
-                    state["active_trade"] = None; save_state()
-                    await notify("ℹ️ Позиция закрыта (факт).")
-                await asyncio.sleep(60); continue
+                # ── проверяем, закрыта ли уже позиция ────────────────────
+                if (tr := state.get("active_trade")):
+                    poss = await ex.fetch_positions([PAIR_SYMBOL])
+                    side = "long" if tr["side"] == "LONG" else "short"
+                    still_open = any(p["side"] == side and
+                                     float(p["contracts"] or 0) > 0
+                                     for p in poss)
+                    if not still_open:
+                        state["active_trade"] = None
+                        save_state()
+                        await notify("ℹ️ Позиция закрыта (факт).")
+                    await asyncio.sleep(60)
+                    continue
 
-            # ищем новый сигнал
-            ohlcv = await ex.fetch_ohlcv(PAIR_SYMBOL, timeframe=TIMEFRAME, limit=100)
-            df = add_indicators(df_from_ohlcv(ohlcv))
-            last = df.iloc[-1];   price = last["close"]
+                # ── ищем новый сигнал ────────────────────────────────────
+                ohlcv = await ex.fetch_ohlcv(PAIR_SYMBOL,
+                                             timeframe=TIMEFRAME, limit=100)
+                df = add_indicators(df_from_ohlcv(ohlcv))
+                last_candle = df.iloc[-1]
+                price = last_candle["close"]
 
-            if last[ADX_COL] >= state["adx_threshold"]:
-                await asyncio.sleep(60); continue
+                if last_candle[ADX_COL] >= state["adx_threshold"]:
+                    await asyncio.sleep(60)
+                    continue
 
-            side = None
-            if price <= last[BBL_COL] and last[RSI_COL] < RSI_OS: side = "LONG"
-            if price >= last[BBU_COL] and last[RSI_COL] > RSI_OB: side = "SHORT"
-            if not side:
-                await asyncio.sleep(60); continue
+                side = None
+                if price <= last_candle[BBL_COL] and last_candle[RSI_COL] < RSI_OS:
+                    side = "LONG"
+                elif price >= last_candle[BBU_COL] and last_candle[RSI_COL] > RSI_OB:
+                    side = "SHORT"
+                if not side:
+                    await asyncio.sleep(60)
+                    continue
 
-            order_id = await execute_trade(ex, side, price)
-            if order_id:
-                state["active_trade"] = {"id": order_id, "side": side,
-                                         "entry_price": price}
-                save_state()
+                order_id = await execute_trade(ex, side, price)
+                if order_id:
+                    state["active_trade"] = {
+                        "id": order_id,
+                        "side": side,
+                        "entry_price": price
+                    }
+                    save_state()
 
-            await asyncio.sleep(60)
+                await asyncio.sleep(60)
+
+            except ccxt.NetworkError as e:               # ← ловим сетевые проблемы
+                log.warning("CCXT network error: %s", e)
+                await asyncio.sleep(30)
+
+            except Exception as e:                       # ← и любые прочие сбои
+                log.exception("Сбой внутри monitor-loop: %s", e)
+                await asyncio.sleep(30)
 
     except asyncio.CancelledError:
         pass
     finally:
         await ex.close()
         log.info("Мониторинг остановлен.")
-
+        
 # ─────────────────── REPORTER ──────────────────────────────────────────────
 async def reporter(app: Application):
     while True:
