@@ -461,7 +461,7 @@ async def cmd_test_trade(u: Update, c: ContextTypes.DEFAULT_TYPE):
         side = args.get('side', '').upper()
         if side not in ['LONG', 'SHORT']: raise ValueError
         deposit  = float(args.get('deposit', state['deposit']))
-        leverage = int  (args.get('leverage', state['leverage']))
+        leverage = int(float(args.get('leverage', state['leverage'])))
     except Exception:
         await u.message.reply_text("❌ Параметры: side=LONG|SHORT deposit=50 leverage=20")
         return
