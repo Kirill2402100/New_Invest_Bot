@@ -218,16 +218,22 @@ async def execute_trade(ex, side: str, price: float, entry_adx: float, bot: Bot)
     pos_side   = "long" if side == "LONG" else "short"
     order_side = "buy"  if side == "LONG" else "sell"
 
-    # --- market-ордер ------------------------------------------------------
-    order = await ex.create_order(
-        PAIR_SYMBOL, "market", order_side, size,
-        params={"tdMode": "isolated", "posSide": pos_side}
-    )
-    fee_open = order.get("fee", {}).get("cost", 0.0)
+    # --- market-order ------------------------------------------------------
+order = await ex.create_order(
+    PAIR_SYMBOL, "market", order_side, size,
+    params={"tdMode": "isolated", "posSide": pos_side}
+)
 
-    # --- SL / TP -----------------------------------------------------------
-    sl_price, tp_price = await place_tp_sl(ex, size, side, pos_side, price)
-    
+# ❶  Фактическая цена исполнения
+fill_px = float(
+    order.get("average")                          # стандартное поле CCXT
+    or order["info"].get("avgPx")                 # RAW-поле OKX
+    or order["price"]                             # fallback
+)
+
+# --- SL / TP -----------------------------------------------------------
+sl_price, tp_price = await place_tp_sl(ex, size, side, pos_side, fill_px)
+
     # --- Уведомление об открытии --------------------------------------------
     await notify(
         f"🟢 ОТКРЫТ <b>{side}</b> • size {size} • entry {price}\n"
