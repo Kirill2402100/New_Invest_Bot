@@ -257,68 +257,68 @@ async def monitor(app: Application):
                 await recalc_adx_threshold()
 
             # ---------- контроль открытой позиции ----------------------------------
-if (tr := state.get("active_trade")):
-    poss = await ex.fetch_positions([PAIR_SYMBOL])
-    side_mark = "long" if tr["side"] == "LONG" else "short"
+    if (tr := state.get("active_trade")):
+        poss = await ex.fetch_positions([PAIR_SYMBOL])
+        side_mark = "long" if tr["side"] == "LONG" else "short"
 
-    still_open = any(p["side"] == side_mark and float(p.get("contracts", 0)) > 0 for p in poss)
-    if still_open:
-        await asyncio.sleep(60)
-        continue
+        still_open = any(p["side"] == side_mark and float(p.get("contracts", 0)) > 0 for p in poss)
+        if still_open:
+            await asyncio.sleep(60)
+            continue
 
     # --- позиция закрыта -------------------------------------------------
     # 1) определяем цену выхода
-    if not poss:
-        exit_price = float((await ex.fetch_ticker(PAIR_SYMBOL))["last"])
-    else:
-        pos = poss[0]
-        exit_price = float(
-            pos.get("avgPx") or
-            pos.get("markPx") or
-            (await ex.fetch_ticker(PAIR_SYMBOL))["last"]
-        )
+        if not poss:
+            exit_price = float((await ex.fetch_ticker(PAIR_SYMBOL))["last"])
+        else:
+            pos = poss[0]
+            exit_price = float(
+                pos.get("avgPx") or
+                pos.get("markPx") or
+                (await ex.fetch_ticker(PAIR_SYMBOL))["last"]
+            )
 
     # 2) комиссия за закрытие
-    close_ord = await ex.fetch_order(tr["id"], PAIR_SYMBOL)
-    fee_close = close_ord["fee"]["cost"] if close_ord.get("fee") else 0.0
-    fee_total = tr["fee_open"] + fee_close
+        close_ord = await ex.fetch_order(tr["id"], PAIR_SYMBOL)
+        fee_close = close_ord["fee"]["cost"] if close_ord.get("fee") else 0.0
+        fee_total = tr["fee_open"] + fee_close
 
     # 3) P&L
-    gross_pnl = (exit_price - tr["entry_price"]) * tr["size"] \
-                if tr["side"] == "LONG" else (tr["entry_price"] - exit_price) * tr["size"]
-    net_pnl   = gross_pnl - fee_total
+        gross_pnl = (exit_price - tr["entry_price"]) * tr["size"] \
+                    if tr["side"] == "LONG" else (tr["entry_price"] - exit_price) * tr["size"]
+        net_pnl   = gross_pnl - fee_total
 
-    state["daily_pnls"].append({"ts": datetime.utcnow().isoformat(),
-                                "pnl_usd": net_pnl})
-    save_state()
+        state["daily_pnls"].append({"ts": datetime.utcnow().isoformat(),
+                                    "pnl_usd": net_pnl})
+        save_state()
 
-    await notify(f"ℹ️ Позиция закрыта  Net P&L {net_pnl:+.2f}$")
+        await notify(f"ℹ️ Позиция закрыта  Net P&L {net_pnl:+.2f}$")
 
     # 4) JOURNAL : строка CLOSE
-    sheet_log([
-        tr["id"],                          # Signal_ID
-        "Flat-Liner v28-2025-07-16",       # Version
-        "Flat_BB_Fade",                    # Strategy_Used
-        "CLOSE",                           # Status
-        tr["side"],                        # Side
-        tr["entry_time"],                  # Entry_Time_UTC
-        datetime.utcnow().isoformat(),     # Exit_Time_UTC
-        tr["entry_price"],                 # Entry_Price
-        exit_price,                        # Exit_Price
-        tr["sl_price"],                    # SL_Price
-        tr["tp_price"],                    # TP_Price
-        gross_pnl,                         # Gross P&L
-        fee_total,                         # Fee USD
-        net_pnl,                           # Net P&L
-        tr["deposit"],                     # Entry_Deposit_USD
-        tr["entry_adx"],                   # Entry_ADX
-        state["adx_threshold"]             # ADX_Threshold
-    ])
+        sheet_log([
+            tr["id"],                          # Signal_ID
+            "Flat-Liner v28-2025-07-16",       # Version
+            "Flat_BB_Fade",                    # Strategy_Used
+            "CLOSE",                           # Status
+            tr["side"],                        # Side
+            tr["entry_time"],                  # Entry_Time_UTC
+            datetime.utcnow().isoformat(),     # Exit_Time_UTC
+            tr["entry_price"],                 # Entry_Price
+            exit_price,                        # Exit_Price
+            tr["sl_price"],                    # SL_Price
+            tr["tp_price"],                    # TP_Price
+            gross_pnl,                         # Gross P&L
+            fee_total,                         # Fee USD
+            net_pnl,                           # Net P&L
+            tr["deposit"],                     # Entry_Deposit_USD
+            tr["entry_adx"],                   # Entry_ADX
+            state["adx_threshold"]             # ADX_Threshold
+        ])
 
-    state["active_trade"] = None
-    save_state()
-    await asyncio.sleep(60)
-    continue
+        state["active_trade"] = None
+        save_state()
+        await asyncio.sleep(60)
+        continue
     
             # поиск точки входа
             ohlcv = await ex.fetch_ohlcv(PAIR_SYMBOL, TIMEFRAME, limit=100)
