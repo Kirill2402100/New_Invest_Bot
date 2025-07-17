@@ -159,12 +159,20 @@ async def recalc_adx_threshold():
         await ex.close()
 
 def calc_size(market, price, deposit, leverage):
-    step = float(market["limits"]["amount"]["min"])
-    prec = market["precision"]["amount"]
+    """
+    Возвращает (size, step) c учётом:
+      • минимального шага (step)
+      • точности amount (precision, целое кол-во знаков)
+    """
+    step = float(market["limits"]["amount"]["min"])          # 0.01
+    # precision["amount"] иногда возвращает float (0.01), иногда int (2).
+    raw_prec = market["precision"].get("amount", 0) or 0
+    prec = int(raw_prec) if isinstance(raw_prec, (int, float)) else 0
+
     raw  = (deposit * leverage) / price / float(market["contractSize"])
-    size = math.floor(raw / step) * step
+    size = math.floor(raw / step) * step                      # учитываем шаг
     return round(size, prec), step
- 
+    
 async def place_tp_sl(ex, size, side, pos_side, entry_price):
     sl_price = entry_price * (1 - SL_PCT/100) if side == "LONG" else entry_price * (1 + SL_PCT/100)
     tp_price = entry_price * (1 + SL_PCT*RR_RATIO/100) if side == "LONG" else entry_price * (1 - SL_PCT*RR_RATIO/100)
