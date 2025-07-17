@@ -173,39 +173,39 @@ def calc_size(market, price, deposit, leverage):
     size = math.floor(raw / step) * step                      # учитываем шаг
     return round(size, prec), step
     
-# ─────────── TP + SL (два отдельных algo-ордера) ─────────────────────────
+# ─────────── TP + SL В ОДНОМ conditional-ордере ────────────
 async def place_tp_sl(ex, size, side, pos_side, entry_price):
-    """Создаёт два независимых conditional-ордера: TP и SL.
-       Возвращает (sl_price, tp_price)."""
-
-    # расчёт цен
+    """
+    Отправляет ОДИН запрос /trade/order_algo с двумя триггерами.
+    Возвращает (sl_price, tp_price).
+    """
     sl_price = entry_price * (1 - SL_PCT/100) if side == "LONG" else entry_price * (1 + SL_PCT/100)
     tp_price = entry_price * (1 + SL_PCT*RR_RATIO/100) if side == "LONG" else entry_price * (1 - SL_PCT*RR_RATIO/100)
+
     side_close = "sell" if side == "LONG" else "buy"
     inst_id    = ex.market(PAIR_SYMBOL)["id"]
 
-    # ---------- STOP-LOSS --------------------------------------------------
-    sl_payload = {
-        "instId": inst_id, "tdMode": "isolated",
-        "side": side_close, "posSide": pos_side, "sz": str(size),
+    payload = {
+        "instId": inst_id,
+        "tdMode": "isolated",
+        "side":   side_close,
+        "posSide": pos_side,
         "ordType": "conditional",
-        "slTriggerPx": str(sl_price),
-        "slOrdPx": "-1",                 # market-close
-    }
-    log.info("ALGOREQ-SL %s", sl_payload)
-    await ex.private_post_trade_order_algo(sl_payload)
+        "sz":     str(size),
 
-    # ---------- TAKE-PROFIT -----------------------------------------------
-    tp_payload = {
-        "instId": inst_id, "tdMode": "isolated",
-        "side": side_close, "posSide": pos_side, "sz": str(size),
-        "ordType": "conditional",
-        "tpTriggerPx": str(tp_price),
-        "tpOrdPx": "-1",                 # market-close
-    }
-    log.info("ALGOREQ-TP %s", tp_payload)
-    await ex.private_post_trade_order_algo(tp_payload)
+        # --- TP ---
+        "tpTriggerPx":      str(tp_price),   # цена триггера
+        "tpTriggerPxType":  "last",          # по Last-price
+        "tpOrdPx":          "-1",            # рыночное закрытие
 
+        # --- SL ---
+        "slTriggerPx":      str(sl_price),
+        "slTriggerPxType":  "last",
+        "slOrdPx":          "-1",
+    }
+
+    log.info("ALGOREQ TP+SL %s", payload)
+    await ex.private_post_trade_order_algo(payload)
     return sl_price, tp_price
     
 async def execute_trade(ex, side: str, price: float, entry_adx: float, bot: Bot):
