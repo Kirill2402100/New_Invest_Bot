@@ -207,8 +207,9 @@ async def place_tp_sl(ex, size, side, pos_side, entry_price):
     await ex.private_post_trade_order_algo(payload)   # ☑️ единственный вызов
     return sl_price, tp_price
     
+# ───── execute_trade ───────────────────────────────────────────────────
 async def execute_trade(ex, side: str, price: float, entry_adx: float, bot: Bot):
-    """Создать рыночный ордер, выставить SL/TP, занести строку OPEN в G-Sheets."""
+    """Создать market-ордер, навесить OCO-TP/SL, записать журнал."""
     market = ex.market(PAIR_SYMBOL)
     size, step = calc_size(market, price, state["deposit"], state["leverage"])
     if size < step:
@@ -218,42 +219,43 @@ async def execute_trade(ex, side: str, price: float, entry_adx: float, bot: Bot)
     pos_side   = "long" if side == "LONG" else "short"
     order_side = "buy"  if side == "LONG" else "sell"
 
-    # --- market-order ------------------------------------------------------
-order = await ex.create_order(
-    PAIR_SYMBOL, "market", order_side, size,
-    params={"tdMode": "isolated", "posSide": pos_side}
-)
+    # 1. Market-ордер
+    order = await ex.create_order(
+        PAIR_SYMBOL, "market", order_side, size,
+        params={"tdMode": "isolated", "posSide": pos_side}
+    )
+    fee_open = order.get("fee", {}).get("cost", 0.0)
 
-# ❶  Фактическая цена исполнения
-fill_px = float(
-    order.get("average")                          # стандартное поле CCXT
-    or order["info"].get("avgPx")                 # RAW-поле OKX
-    or order["price"]                             # fallback
-)
+    # 2. Фактическая цена входа
+    fill_px = float(
+        order.get("average") or                 # CCXT normalised
+        order["info"].get("avgPx") or           # RAW OKX
+        order["price"]                          # fallback
+    )
 
-# --- SL / TP -----------------------------------------------------------
-sl_price, tp_price = await place_tp_sl(ex, size, side, pos_side, fill_px)
+    # 3. Вешаем TP+SL одним OCO-ордером
+    sl_price, tp_price = await place_tp_sl(ex, size, side, pos_side, fill_px)
 
-    # --- Уведомление об открытии --------------------------------------------
+    # 4. Уведомление
     await notify(
-        f"🟢 ОТКРЫТ <b>{side}</b> • size {size} • entry {price}\n"
+        f"🟢 ОТКРЫТ <b>{side}</b> • size {size} • entry {fill_px}\n"
         f"SL {sl_price:.4f}  |  TP {tp_price:.4f}",
         bot, parse_mode="HTML"
     )
 
-    # --- JOURNAL : строка OPEN --------------------------------------------
+    # 5. Лог-строка в Google Sheets
     now_iso = datetime.utcnow().isoformat()
     sheet_log([
         order["id"], "Flat-Liner v28-2025-07-17", "Flat_BB_Fade", "OPEN",
-        side, now_iso, "", price, "", sl_price, tp_price, "", "", "",
+        side, now_iso, "", fill_px, "", sl_price, tp_price, "", "", "",
         state["deposit"], entry_adx, state["adx_threshold"]
     ])
 
-    # --- сохраняем в state --------------------------------------------------
+    # 6. Обновляем state
     return {
         "id":          order["id"],
         "side":        side,
-        "entry_price": price,
+        "entry_price": fill_px,
         "size":        size,
         "entry_time":  now_iso,
         "fee_open":    fee_open,
@@ -262,7 +264,7 @@ sl_price, tp_price = await place_tp_sl(ex, size, side, pos_side, fill_px)
         "entry_adx":   entry_adx,
         "deposit":     state["deposit"]
     }
-
+    
 # ─────────────────── MONITOR (авто-сделки) ───────────────────────────────
 async def monitor(app: Application):
     ex = await create_exchange()
