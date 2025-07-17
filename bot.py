@@ -246,105 +246,116 @@ async def execute_trade(ex, side: str, price: float):
     }
 # ─────────────────── MONITOR (авто-сделки) ───────────────────────────────
 async def monitor(app: Application):
-    ex = await create_exchange(); await set_leverage(ex, state["leverage"])
-    await recalc_adx_threshold(); log.info("🚀 Мониторинг запущен")
+    ex = await create_exchange()
+    await set_leverage(ex, state["leverage"])
+    await recalc_adx_threshold()
+    log.info("🚀 Мониторинг запущен")
 
     try:
         while state["monitoring"]:
-            # пересчёт ADX-порога
+            # ── пересчёт ADX порога раз в час ────────────────────────────
             last = state["last_adx_recalc"]
-            if not last or (datetime.now(timezone.utc)-datetime.fromisoformat(last)).total_seconds() > 3600:
+            if (not last or
+                (datetime.now(timezone.utc) - datetime.fromisoformat(last)).total_seconds() > 3600):
                 await recalc_adx_threshold()
 
-            # ---------- контроль открытой позиции ----------------------------------
-    if (tr := state.get("active_trade")):
-        poss = await ex.fetch_positions([PAIR_SYMBOL])
-        side_mark = "long" if tr["side"] == "LONG" else "short"
+            # ── контроль открытой позиции ────────────────────────────────
+            if (tr := state.get("active_trade")):
+                poss = await ex.fetch_positions([PAIR_SYMBOL])
+                side_mark = "long" if tr["side"] == "LONG" else "short"
 
-        still_open = any(p["side"] == side_mark and float(p.get("contracts", 0)) > 0 for p in poss)
-        if still_open:
-            await asyncio.sleep(60)
-            continue
+                still_open = any(
+                    p["side"] == side_mark and float(p.get("contracts", 0)) > 0
+                    for p in poss
+                )
+                if still_open:
+                    await asyncio.sleep(60)
+                    continue
 
-    # --- позиция закрыта -------------------------------------------------
-    # 1) определяем цену выхода
-        if not poss:
-            exit_price = float((await ex.fetch_ticker(PAIR_SYMBOL))["last"])
-        else:
-            pos = poss[0]
-            exit_price = float(
-                pos.get("avgPx") or
-                pos.get("markPx") or
-                (await ex.fetch_ticker(PAIR_SYMBOL))["last"]
-            )
+                # ----- позиция закрыта -----------------------------------
+                if not poss:
+                    exit_price = float((await ex.fetch_ticker(PAIR_SYMBOL))["last"])
+                else:
+                    pos = poss[0]
+                    exit_price = float(
+                        pos.get("avgPx") or
+                        pos.get("markPx") or
+                        (await ex.fetch_ticker(PAIR_SYMBOL))["last"]
+                    )
 
-    # 2) комиссия за закрытие
-        close_ord = await ex.fetch_order(tr["id"], PAIR_SYMBOL)
-        fee_close = close_ord["fee"]["cost"] if close_ord.get("fee") else 0.0
-        fee_total = tr["fee_open"] + fee_close
+                # комиссия за закрытие
+                close_ord = await ex.fetch_order(tr["id"], PAIR_SYMBOL)
+                fee_close = close_ord["fee"]["cost"] if close_ord.get("fee") else 0.0
+                fee_total = tr["fee_open"] + fee_close
 
-    # 3) P&L
-        gross_pnl = (exit_price - tr["entry_price"]) * tr["size"] \
-                    if tr["side"] == "LONG" else (tr["entry_price"] - exit_price) * tr["size"]
-        net_pnl   = gross_pnl - fee_total
+                # P&L
+                gross_pnl = (
+                    (exit_price - tr["entry_price"]) * tr["size"]
+                    if tr["side"] == "LONG"
+                    else (tr["entry_price"] - exit_price) * tr["size"]
+                )
+                net_pnl = gross_pnl - fee_total
 
-        state["daily_pnls"].append({"ts": datetime.utcnow().isoformat(),
-                                    "pnl_usd": net_pnl})
-        save_state()
+                # статистика
+                state["daily_pnls"].append({
+                    "ts":   datetime.utcnow().isoformat(),
+                    "pnl_usd": net_pnl
+                })
+                save_state()
 
-        await notify(f"ℹ️ Позиция закрыта  Net P&L {net_pnl:+.2f}$")
+                await notify(f"ℹ️ Позиция закрыта  Net P&L {net_pnl:+.2f}$")
 
-    # 4) JOURNAL : строка CLOSE
-        sheet_log([
-            tr["id"],                          # Signal_ID
-            "Flat-Liner v28-2025-07-16",       # Version
-            "Flat_BB_Fade",                    # Strategy_Used
-            "CLOSE",                           # Status
-            tr["side"],                        # Side
-            tr["entry_time"],                  # Entry_Time_UTC
-            datetime.utcnow().isoformat(),     # Exit_Time_UTC
-            tr["entry_price"],                 # Entry_Price
-            exit_price,                        # Exit_Price
-            tr["sl_price"],                    # SL_Price
-            tr["tp_price"],                    # TP_Price
-            gross_pnl,                         # Gross P&L
-            fee_total,                         # Fee USD
-            net_pnl,                           # Net P&L
-            tr["deposit"],                     # Entry_Deposit_USD
-            tr["entry_adx"],                   # Entry_ADX
-            state["adx_threshold"]             # ADX_Threshold
-        ])
+                # журнал (Google Sheets) — строка CLOSE
+                sheet_log([
+                    tr["id"], "Flat-Liner v28-2025-07-16", "Flat_BB_Fade",
+                    "CLOSE", tr["side"], tr["entry_time"],
+                    datetime.utcnow().isoformat(),
+                    tr["entry_price"], exit_price,
+                    tr["sl_price"], tr["tp_price"],
+                    gross_pnl, fee_total, net_pnl,
+                    tr["deposit"], tr["entry_adx"], state["adx_threshold"]
+                ])
 
-        state["active_trade"] = None
-        save_state()
-        await asyncio.sleep(60)
-        continue
-    
-            # поиск точки входа
+                state["active_trade"] = None
+                save_state()
+                await asyncio.sleep(60)
+                continue
+
+            # ── поиск новой точки входа ──────────────────────────────────
             ohlcv = await ex.fetch_ohlcv(PAIR_SYMBOL, TIMEFRAME, limit=100)
-            df    = add_indicators(df_from_ohlcv(ohlcv)); last = df.iloc[-1]; price = last["close"]
+            df    = add_indicators(df_from_ohlcv(ohlcv))
+            last  = df.iloc[-1]
+            price = last["close"]
 
             if last[ADX_COL] >= state["adx_threshold"]:
-                await asyncio.sleep(60); continue
+                await asyncio.sleep(60)
+                continue
 
-            side = "LONG" if price<=last[BBL_COL] and last[RSI_COL]<RSI_OS else \
-                   "SHORT" if price>=last[BBU_COL] and last[RSI_COL]>RSI_OB else None
+            side = (
+                "LONG"  if price <= last[BBL_COL] and last[RSI_COL] < RSI_OS else
+                "SHORT" if price >= last[BBU_COL] and last[RSI_COL] > RSI_OB else
+                None
+            )
             if not side:
-                await asyncio.sleep(60); continue
+                await asyncio.sleep(60)
+                continue
 
-            res = await execute_trade(ex, side, price)
-            if res:
-                oid, size = res                     # ← распаковка!
-                state["active_trade"] = {"id":oid,"side":side,"entry_price":price,"size":size}
+            tr_info = await execute_trade(ex, side, price)
+            if tr_info:
+                state["active_trade"] = tr_info
                 save_state()
+
             await asyncio.sleep(60)
+
     except asyncio.CancelledError:
         pass
     finally:
-        try: await ex.close()
-        except: pass
+        try:
+            await ex.close()
+        except Exception:
+            pass
         log.info("Мониторинг остановлен")
-
+        
 # ─────────────────── REPORTER (суточный отчёт) ───────────────────────────
 async def reporter(app: Application):
     while True:
