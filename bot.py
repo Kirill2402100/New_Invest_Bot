@@ -136,11 +136,15 @@ async def create_exchange():
         "apiKey":   OKX_API_KEY,
         "secret":   OKX_API_SECRET,
         "password": OKX_API_PASSPHRASE,
-        "options":  {"defaultType": "swap"},
+        "options":  {
+            "defaultType": "swap",
+            "instType":    "SWAP",   # <-- добавили
+        },
     })
     ex.set_sandbox_mode(OKX_SANDBOX)
-    await ex.load_markets(); return ex
-
+    await ex.load_markets()
+    return ex
+    
 async def set_leverage(ex, lev):
     for side in ("long", "short"):
         await ex.set_leverage(lev, PAIR_SYMBOL, {"mgnMode":"isolated", "posSide":side})
@@ -400,11 +404,14 @@ async def get_status_text() -> str:
     """Получает актуальные данные с биржи и формирует текстовое представление статуса."""
     ex = await create_exchange()
     try:
-        last_ohlcv = await ex.fetch_ohlcv(PAIR_SYMBOL, TIMEFRAME, limit=100)
+        last_ohlcv = await ex.fetch_ohlcv(
+            PAIR_SYMBOL, TIMEFRAME, limit=100,
+            params={"instType": "SWAP"}          # ← ключевая строка
+        )
         last = add_indicators(df_from_ohlcv(last_ohlcv)).iloc[-1]
     finally:
         await ex.close()
-
+        
     adx_now = last[ADX_COL]
     adx_dyn = state["adx_threshold"]
     is_flat = adx_now < adx_dyn
