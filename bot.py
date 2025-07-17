@@ -405,26 +405,43 @@ async def get_status_text() -> str:
             f"RSI-14: <b>{last[RSI_COL]:.2f}</b>\n"
             f"Цена vs BB: {boll_pos}")
 
-# ─────────────────── TICKER (авто-статусы) ───────────────────────────────
+# ─────────── TICKER (авто-статусы) ───────────────────────────────
 async def ticker(app: Application):
-    """B. Корутина для периодической отправки статуса."""
+    """
+    Отправляет статус каждые 30 мин в FLAT-режиме и 60 мин в TREND-режиме,
+    + мгновенно уведомляет о смене режима.
+    """
+    last_mode = None          # 'FLAT' или 'TREND'
+
+    # ждём, пока monitor впервые запишет ADX
+    while state.get("last_adx_value") == 25.0:      # значение-по-умолчанию
+        await asyncio.sleep(2)
+
     while True:
         try:
+            adx_now = state["last_adx_value"]
+            mode    = "FLAT" if adx_now < state["adx_threshold"] else "TREND"
+
+            # уведомление о смене режима
+            if mode != last_mode and last_mode is not None:
+                arrow = "🟢" if mode == "FLAT" else "🔴"
+                await notify(f"{arrow} Режим изменился: <b>{mode}</b>", app.bot)
+
+            # отправляем детальный статус
             status_text = await get_status_text()
             await notify(status_text, app.bot)
 
-            adx_now = state.get("last_adx_value", state["adx_threshold"])
-            interval = 1800 if adx_now < state["adx_threshold"] else 3600
+            last_mode = mode
+            interval  = 1800 if mode == "FLAT" else 3600      # 30 или 60 мин
             await asyncio.sleep(interval)
-            
+
         except asyncio.CancelledError:
-            log.info("Ticker-задача отменена.")
             break
         except Exception as e:
-            log.error("Ошибка в ticker: %s", e)
+            log.error("Ticker error: %s", e)
             await notify(f"‼️ Ошибка в ticker: {e}", app.bot)
             await asyncio.sleep(60)
-
+            
 # ─────────────────── TELEGRAM COMMANDS ───────────────────────────────────
 async def cmd_start(u: Update, c: ContextTypes.DEFAULT_TYPE):
     await notify("🚀 Flat-Liner запущен. Используйте /status.", c.bot)
