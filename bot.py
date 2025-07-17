@@ -276,58 +276,55 @@ async def monitor(app: Application):
     await recalc_adx_threshold()
     log.info("🚀 Мониторинг запущен")
 
+    prev_regime: Optional[str] = None          # ← NEW: запоминаем предыдущий режим
+
     try:
         while state["monitoring"]:
-            # A. качаем последние свечи и обновляем ADX
+            # ── получаем последние данные ────────────────────────────────
             try:
                 ohlcv = await ex.fetch_ohlcv(PAIR_SYMBOL, TIMEFRAME, limit=100)
                 df    = add_indicators(df_from_ohlcv(ohlcv))
                 last  = df.iloc[-1]
-
-                adx_now = float(last[ADX_COL])
-                state["last_adx_value"] = adx_now
-
-                # ➊ определяем текущий режим
-                regime_now = "FLAT" if adx_now < state["adx_threshold"] else "TREND"
-                prev = state.get("last_regime")
-
-                # ➋ если режим изменился — уведомляем один раз
-                if prev and prev != regime_now:
-                    await notify(
-                        f"🔔 <b>Режим сменился</b>: {prev} → {regime_now}\n"
-                        f"ADX = {adx_now:.2f} (порог {state['adx_threshold']:.2f})",
-                        app.bot
-                    )
-                state["last_regime"] = regime_now      # обновляем всегда
-                save_state()
-
+                state["last_adx_value"] = float(last[ADX_COL])
             except Exception as e:
                 log.error("Ошибка получения OHLCV в цикле monitor: %s", e)
                 await asyncio.sleep(60)
                 continue
 
-            # ── пересчёт ADX-порога раз в час ───────────────────────────
+            # ── уведомление о смене FLAT / TREND ─────────────────────────
+            regime = "FLAT" if last[ADX_COL] < state["adx_threshold"] else "TREND"
+            if prev_regime is None:
+                prev_regime = regime                       # первая инициализация
+            elif regime != prev_regime:                    # ← NEW: смена режима
+                prev_regime = regime
+                await notify(
+                    f"🔄 Режим изменён на <b>{regime}</b>\n"
+                    f"ADX сейчас — {last[ADX_COL]:.2f}  •  Порог — {state['adx_threshold']:.2f}",
+                    app.bot
+                )
+                log.info("Regime change → %s", regime)
+
+            # ── пересчёт ADX-порога раз в час ────────────────────────────
             last_recalc = state["last_adx_recalc"]
             if (not last_recalc or
-                (datetime.now(timezone.utc) - datetime.fromisoformat(last_recalc)
-                 ).total_seconds() > 3600):
+                (datetime.now(timezone.utc) - datetime.fromisoformat(last_recalc)).total_seconds() > 3600):
                 await recalc_adx_threshold()
 
-            # ---------- управление открытой позицией --------------------
+            # ── контроль открытой позиции ────────────────────────────────
             if (tr := state.get("active_trade")):
                 poss = await ex.fetch_positions([PAIR_SYMBOL])
                 side_mark = "long" if tr["side"] == "LONG" else "short"
-                if any(p["side"] == side_mark and float(p.get("contracts", 0)) > 0
-                       for p in poss):
+                if any(p["side"] == side_mark and float(p.get("contracts", 0)) > 0 for p in poss):
                     await asyncio.sleep(60)
                     continue
-                # … блок закрытия позиции остаётся без изменений …
-                # (опущен для краткости)
+                # --- блок обработки закрытия (без изменений) ---
+                # ...
 
-            # ---------- поиск новой точки входа -------------------------
+            # ── поиск новой точки входа ──────────────────────────────────
             price = last["close"]
-            if adx_now >= state["adx_threshold"]:
-                await asyncio.sleep(60); continue
+            if last[ADX_COL] >= state["adx_threshold"]:
+                await asyncio.sleep(60)
+                continue
 
             side = (
                 "LONG"  if price <= last[BBL_COL] and last[RSI_COL] < RSI_OS else
@@ -335,9 +332,10 @@ async def monitor(app: Application):
                 None
             )
             if not side:
-                await asyncio.sleep(60); continue
+                await asyncio.sleep(60)
+                continue
 
-            tr_info = await execute_trade(ex, side, price, adx_now, app.bot)
+            tr_info = await execute_trade(ex, side, price, last[ADX_COL], app.bot)
             if tr_info:
                 state["active_trade"] = tr_info
                 save_state()
