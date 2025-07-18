@@ -375,14 +375,31 @@ async def get_status_text() -> str:
     """Получает актуальные данные с биржи и формирует текстовое представление статуса."""
     ex = await create_exchange()
     try:
+        # 1. Получение данных
         last_ohlcv = await ex.fetch_ohlcv(
             PAIR_SYMBOL, TIMEFRAME, limit=100,
-            params={"instType": "SWAP"}          # ← ключевая строка
+            params={"instType": "SWAP"}
         )
-        last = add_indicators(df_from_ohlcv(last_ohlcv)).iloc[-1]
+
+        # 2. Проверка данных
+        if not last_ohlcv:
+            return "Не удалось получить данные о свечах с биржи."
+
+        # 3. Расчет индикаторов с обработкой ошибок
+        try:
+            df = df_from_ohlcv(last_ohlcv)
+            df_with_indicators = add_indicators(df)
+            if df_with_indicators.empty:
+                return "Недостаточно данных для расчета индикаторов."
+            last = df_with_indicators.iloc[-1]
+        except Exception as e:
+            log.error("Ошибка при расчете индикаторов: %s", e)
+            return f"Ошибка при расчете индикаторов: {e}"
+
     finally:
         await ex.close()
         
+    # 4. Формирование текста статуса
     adx_now = last[ADX_COL]
     adx_dyn = state["adx_threshold"]
     is_flat = adx_now < adx_dyn
@@ -398,13 +415,13 @@ async def get_status_text() -> str:
     
     return (f"<b>Flat-Liner status</b>\n"
             f"Мониторинг: {status}{trade}\n"
-            f"Плечо: <b>{state['leverage']}x</b>   Депозит: <b>{state['deposit']}$</b>\n\n"
+            f"Плечо: <b>{state['leverage']}x</b>    Депозит: <b>{state['deposit']}$</b>\n\n"
             f"ADX текущий: <b>{adx_now:.2f}</b>\n"
             f"ADX порог : <b>{adx_dyn:.2f}</b>\n"
             f"Режим: <b>{'FLAT' if is_flat else 'TREND'}</b>\n"
             f"RSI-14: <b>{last[RSI_COL]:.2f}</b>\n"
             f"Цена vs BB: {boll_pos}")
-
+    
 # ─────────── TICKER (авто-статусы) ───────────────────────────────
 async def ticker(app: Application):
     """
