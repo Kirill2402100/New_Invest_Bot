@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python3 
 # ============================================================================
 #  Flat‑Liner • MEXC Edition — 18 Jul 2025
 #  Стратегия  : Flat_BB_Fade  +  динамический ADX‑фильтр  +  RR 1:1
