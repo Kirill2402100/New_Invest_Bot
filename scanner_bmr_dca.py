@@ -19,7 +19,7 @@ log = logging.getLogger("bmr_dca_engine")
 # CONFIG
 # ---------------------------------------------------------------------------
 class CONFIG:
-    SYMBOL = "EURC/USDT:USDT"
+    SYMBOL = "JPY/USDT:USDT"
     TF_ENTRY = "5m"
     TF_RANGE = "1h"
     STRATEGIC_LOOKBACK_DAYS = 60
@@ -395,7 +395,7 @@ async def scanner_main_loop(app: Application, broadcast):
     })
     await exchange.load_markets(True)
     
-    candidates = [CONFIG.SYMBOL, "EUR/USDT:USDT", "EUR/USDT", "EURC/USDT", "EURUSDT"]
+    candidates = [CONFIG.SYMBOL, "JPY/USDT:USDT", "JPY/USDT", "JPYUSDT", "JPYC/USDT:USDT", "JPYC/USDT", "JPYCUSDT"]
     symbol = None
     for s in candidates:
         if s in exchange.markets:
