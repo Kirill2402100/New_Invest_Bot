@@ -9,7 +9,7 @@ from scanner_bmr_dca import CONFIG
 import trade_executor
 
 # --- Конфигурация ---
-BOT_VERSION = "BMR-DCA EURC v0.1"
+BOT_VERSION = "BMR-DCA JPY v0.1"
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
 if not BOT_TOKEN:
