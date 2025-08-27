@@ -1,6 +1,6 @@
 from __future__ import annotations
 import asyncio, time, logging, json, os, inspect, numbers
-# ИСПРАВЛЕНО: Возвращены недостающие импорты
+from typing import Optional
 from datetime import datetime, timezone
 
 import numpy as np
@@ -29,7 +29,6 @@ class CONFIG:
     DCA_LEVELS = 7
     DCA_GROWTH = 2.0
     LEVERAGE = 50
-    # ИЗМЕНЕНО: Комиссии по умолчанию
     FEE_MAKER = 0.0002
     FEE_TAKER = 0.0002
     Q_LOWER = 0.025
@@ -52,7 +51,7 @@ class CONFIG:
     REBUILD_RANGE_EVERY_MIN = 15
     REBUILD_TACTICAL_EVERY_MIN = 5
     SAFETY_BANK_USDT = 1500.0
-    CUM_DEPOSIT_FRAC_AT_FULL = 2/3
+    CUM_DEPOSIT_FRAC_AT_FULL = 2 / 3
     AUTO_LEVERAGE = False
     MIN_LEVERAGE = 2
     MAX_LEVERAGE = 50
@@ -66,6 +65,14 @@ class CONFIG:
         "low_vol_z": 0.5,
         "growth_A": 1.6,
         "growth_B": 2.2,
+    }
+    ADD_COOLDOWN_SEC = 25
+    SPIKE = {
+        "WICK_RATIO": 2.0,
+        "ATR_MULT": 1.6,
+        "VOLZ_THR": 1.5,
+        "RETRACE_FRAC": 0.35,
+        "RETRACE_WINDOW_SEC": 120,
     }
 
 # ---------------------------------------------------------------------------
@@ -258,17 +265,63 @@ def choose_growth(ind: dict, rng_strat: dict, rng_tac: dict) -> float:
     low_vol = abs(ind.get("vol_z", 0.0)) <= CONFIG.AUTO_ALLOC["low_vol_z"]
     return CONFIG.AUTO_ALLOC["growth_A"] if (thin and low_vol) else CONFIG.AUTO_ALLOC["growth_B"]
 
-# ДОБАВЛЕНО: Хелпер для расчета чистого PnL
+def _pos_total_margin(pos):
+    ord_used = sum(pos.step_margins[:min(pos.steps_filled, getattr(pos, 'ord_levels', pos.steps_filled))])
+    res = pos.reserve_margin_usdt if getattr(pos, 'reserve_used', False) else 0.0
+    return ord_used + res
+
 def compute_net_pnl(pos, exit_p: float, fee_entry: float, fee_exit: float) -> tuple[float, float]:
-    sum_margin = sum(pos.step_margins[:pos.steps_filled]) or 1e-9
+    sum_margin = _pos_total_margin(pos) or 1e-9
     raw_pnl = (exit_p / pos.avg - 1.0) * (1 if pos.side == "LONG" else -1)
     gross_usd = sum_margin * (raw_pnl * pos.leverage)
+    entry_notional = sum_margin * pos.leverage
     exit_notional  = exit_p * pos.qty
-    fee_entry_usd = (sum_margin * pos.leverage) * fee_entry # Исправлено: комиссия на вход
+    fee_entry_usd = entry_notional * fee_entry
     fee_exit_usd  = exit_notional  * fee_exit
     net_usd = gross_usd - fee_entry_usd - fee_exit_usd
     net_pct = (net_usd / sum_margin) * 100.0
     return net_usd, net_pct
+
+def last_candle_ohlc(df5: pd.DataFrame):
+    o = float(df5["open"].iloc[-1])
+    h = float(df5["high"].iloc[-1])
+    l = float(df5["low"].iloc[-1])
+    c = float(df5["close"].iloc[-1])
+    return o, h, l, c
+
+def detect_spike_direction(o: float, h: float, l: float, c: float, atr5m: float, vol_z: float) -> Optional[str]:
+    body = abs(c - o)
+    upper_wick = max(0.0, h - max(o, c))
+    lower_wick = max(0.0, min(o, c) - l)
+    rng = max(1e-12, h - l)
+
+    if vol_z < CONFIG.SPIKE["VOLZ_THR"]:
+        return None
+    if rng < CONFIG.SPIKE["ATR_MULT"] * max(1e-12, atr5m):
+        return None
+
+    if lower_wick >= CONFIG.SPIKE["WICK_RATIO"] * body:
+        return "down"
+    if upper_wick >= CONFIG.SPIKE["WICK_RATIO"] * body:
+        return "up"
+    return None
+
+def spike_retrace_ok_ref(direction: str, ref_ohlc: tuple[float,float,float,float], px_now: float) -> bool:
+    o, h, l, c = ref_ohlc
+    frac = CONFIG.SPIKE["RETRACE_FRAC"]
+    if direction == "down":
+        ceiling = max(o, c, h)
+        if ceiling <= l + 1e-12:
+            return False
+        progress = (px_now - l) / (ceiling - l)
+        return progress >= frac
+    elif direction == "up":
+        floor_ = min(o, c, l)
+        if h <= floor_ + 1e-12:
+            return False
+        progress = (h - px_now) / (h - floor_)
+        return progress >= frac
+    return False
 
 # ---------------------------------------------------------------------------
 # Core Logic Functions
@@ -337,7 +390,7 @@ def compute_indicators_5m(df: pd.DataFrame) -> dict:
 # Position State Manager
 # ---------------------------------------------------------------------------
 class Position:
-    def __init__(self, side: str, signal_id: str, leverage: int | None=None):
+    def __init__(self, side: str, signal_id: str, leverage: int | None = None):
         self.side = side
         self.signal_id = signal_id
         self.steps_filled = 0
@@ -350,54 +403,69 @@ class Position:
         self.open_ts = time.time()
         self.leverage = leverage or CONFIG.LEVERAGE
         self.max_steps = CONFIG.DCA_LEVELS
-        self.reserved_one = False
         self.last_sl_notified_price = None
         self.ordinary_targets: list[dict] = []
         self.trail_stage: int = -1
-        self.growth = CONFIG.DCA_GROWTH  # <— сохраняем коэффициент роста
+        self.growth = CONFIG.DCA_GROWTH
+        self.ord_levels: int = 0
+        self.reserve_margin_usdt: float = 0.0
+        self.reserve_available: bool = False
+        self.reserve_used: bool = False
+        self.freeze_ordinary: bool = False
+        self.last_add_ts: float | None = None
+        self.spike_flag: bool = False
+        self.spike_direction: str | None = None
+        self.spike_deadline_ts: float | None = None
+        self.spike_ref_ohlc: Optional[tuple[float, float, float, float]] = None
 
-    def plan_margins(self, bank: float, growth: float, levels: int | None = None):
-        """План на фактическое число шагов (по умолчанию self.max_steps)."""
+    def plan_with_reserve(self, bank: float, growth: float, ord_levels: int):
         self.growth = growth
-        n = int(levels or self.max_steps)
+        self.ord_levels = max(1, int(ord_levels))
         total_target = bank * CONFIG.CUM_DEPOSIT_FRAC_AT_FULL
-        self.step_margins = plan_margins_bank_first(total_target, n, growth)
+        margins_full = plan_margins_bank_first(total_target, self.ord_levels + 1, growth)
+        self.step_margins = margins_full[:self.ord_levels]
+        self.reserve_margin_usdt = margins_full[-1]
+        self.reserve_available = True
+        self.reserve_used = False
+        self.freeze_ordinary = False
+        self.max_steps = self.ord_levels + 1
 
-    def rebalance_tail_margins(self, bank: float, ord_total: int | None = None, remaining_levels: int | None = None):
-        """
-        Перераспределяет НЕИСПОЛЬЗОВАННЫЙ бюджет на оставшиеся шаги с тем же growth.
-        ord_total — количество «обычных» таргетов (без учёта входа).
-        remaining_levels — можно передать напрямую (например, когда оставили только 1 резерв).
-        """
-        # сколько шагов ещё можно сделать?
-        if remaining_levels is None:
-            if ord_total is None:
-                return
-            # ИСПРАВЛЕНО: Корректный расчет оставшихся обычных шагов
-            rem = max(0, ord_total - self.steps_filled)
-            remaining_levels = min(rem, max(0, self.max_steps - self.steps_filled))
-
+    def rebalance_tail_margins_excluding_reserve(self, bank: float):
+        total_target = bank * CONFIG.CUM_DEPOSIT_FRAC_AT_FULL
+        used_ord = sum(self.step_margins[:self.steps_filled]) if self.step_margins else 0.0
+        remaining_budget_for_ord = max(0.0, total_target - used_ord - self.reserve_margin_usdt)
+        remaining_levels = max(0, self.ord_levels - self.steps_filled)
         if remaining_levels <= 0:
-            self.max_steps = self.steps_filled
             return
-
-        total_target = bank * CONFIG.CUM_DEPOSIT_FRAC_AT_FULL
-        used = sum(self.step_margins[:self.steps_filled]) if self.step_margins else 0.0
-        remaining_budget = max(0.0, total_target - used)
-
-        # пересобираем хвост геометрической прогрессией
-        tail = plan_margins_bank_first(remaining_budget, remaining_levels, self.growth)
+        tail = plan_margins_bank_first(remaining_budget_for_ord, remaining_levels, self.growth)
         self.step_margins = (self.step_margins[:self.steps_filled] or []) + tail
-        self.max_steps = self.steps_filled + remaining_levels
+        self.max_steps = self.steps_filled + remaining_levels + (1 if (self.reserve_available and not self.reserve_used) else 0)
 
     def add_step(self, price: float):
         margin = self.step_margins[self.steps_filled]
         notional = margin * self.leverage
-        new_qty = notional / max(price,1e-9)
-        self.avg = (self.avg*self.qty + price*new_qty) / max(self.qty+new_qty,1e-9) if self.qty>0 else price
+        new_qty = notional / max(price, 1e-9)
+        self.avg = (self.avg * self.qty + price * new_qty) / max(self.qty + new_qty, 1e-9) if self.qty > 0 else price
         self.qty += new_qty
         self.steps_filled += 1
-        self.tp_price = self.avg*(1+self.tp_pct) if self.side=="LONG" else self.avg*(1-self.tp_pct)
+        self.tp_price = self.avg * (1 + self.tp_pct) if self.side == "LONG" else self.avg * (1 - self.tp_pct)
+        self.last_add_ts = time.time()
+        return margin, notional
+
+    def add_reserve_step(self, price: float):
+        if not self.reserve_available or self.reserve_used:
+            return 0.0, 0.0
+        margin = self.reserve_margin_usdt
+        notional = margin * self.leverage
+        new_qty = notional / max(price, 1e-9)
+        self.avg = (self.avg * self.qty + price * new_qty) / max(self.qty + new_qty, 1e-9) if self.qty > 0 else price
+        self.qty += new_qty
+        self.steps_filled += 1
+        self.reserve_available = False
+        self.reserve_used = True
+        self.tp_price = self.avg * (1 + self.tp_pct) if self.side == "LONG" else self.avg * (1 - self.tp_pct)
+        self.last_add_ts = time.time()
+        self.max_steps = self.steps_filled
         return margin, notional
 
 # ---------------------------------------------------------------------------
@@ -555,14 +623,18 @@ async def scanner_main_loop(app: Application, broadcast):
 
             if pos:
                 brk_up, brk_dn = break_levels(rng_strat)
-                if px >= brk_up or px <= brk_dn:
-                    if not pos.reserved_one:
-                        pos.max_steps = min(pos.steps_filled + 1, CONFIG.DCA_LEVELS)
-                        pos.reserved_one = True
-                        # перераспределяем оставшийся бюджет на единственный резервный добор
-                        pos.rebalance_tail_margins(bank, remaining_levels=pos.max_steps - pos.steps_filled)
-                        if broadcast:
-                            await broadcast(app, "📌 Пробой коридора — обычные усреднения заморожены. Оставлен 1 резерв на ретест.")
+                on_break = (px >= brk_up) or (px <= brk_dn)
+                if on_break and not pos.freeze_ordinary:
+                    pos.freeze_ordinary = True
+                    o, h, l, c = last_candle_ohlc(df5)
+                    direction = detect_spike_direction(o, h, l, c, ind["atr5m"], ind["vol_z"])
+                    if direction is not None:
+                        pos.spike_flag = True
+                        pos.spike_direction = direction
+                        pos.spike_deadline_ts = time.time() + CONFIG.SPIKE["RETRACE_WINDOW_SEC"]
+                        pos.spike_ref_ohlc = (o, h, l, c)
+                    if broadcast:
+                        await broadcast(app, "📌 Пробой STRAT — обычные усреднения заморожены. Резерв держим на ретест.")
 
             if not pos and (app.bot_data.get("manual_open") is not None or not manage_only):
                 manual = app.bot_data.pop("manual_open", None)
@@ -575,32 +647,26 @@ async def scanner_main_loop(app: Application, broadcast):
                 if side_cand:
                     pos = Position(side_cand, signal_id=f"{symbol.split('/')[0]}_{int(now)}")
 
-                    # 1) плечо
                     if manual and manual.get("leverage") is not None:
                         pos.leverage = max(CONFIG.MIN_LEVERAGE, min(CONFIG.MAX_LEVERAGE, int(manual["leverage"])))
                     else:
                         pos.leverage = CONFIG.LEVERAGE
 
-                    # 2) фактическое число шагов до планирования маржей
                     if manual and manual.get("max_steps") is not None:
-                        pos.max_steps = max(1, min(CONFIG.DCA_LEVELS, int(manual["max_steps"])))
+                        ord_levels = max(1, min(CONFIG.DCA_LEVELS - 1, int(manual["max_steps"])))
                     else:
-                        pos.max_steps = min(6, CONFIG.DCA_LEVELS)
+                        ord_levels = max(1, min(5, CONFIG.DCA_LEVELS - 1))
 
-                    # 3) growth и первичное планирование на pos.max_steps
                     growth = choose_growth(ind, rng_strat, rng_tac)
-                    pos.plan_margins(bank, growth, levels=pos.max_steps)
+                    pos.plan_with_reserve(bank, growth, ord_levels)
 
-                    # 4) таргеты
                     pos.ordinary_targets = compute_mixed_targets(entry=px, side=pos.side, rng_strat=rng_strat, rng_tac=rng_tac, tick=tick)
-                    
-                    # ИСПОЛНЯЕМ ПЕРВЫЙ ШАГ И СРАЗУ РЕБАЛАНСИРУЕМ ХВОСТ
-                    pos.reserved_one = False
+
                     margin, _ = pos.add_step(px)
-                    pos.rebalance_tail_margins(bank, ord_total=len(pos.ordinary_targets))
+                    pos.rebalance_tail_margins_excluding_reserve(bank)
                     app.bot_data["position"] = pos
 
-                    cum_margin = sum(pos.step_margins[:pos.steps_filled])
+                    cum_margin = _pos_total_margin(pos)
                     cum_notional = cum_margin * pos.leverage
                     fees_paid_est = cum_notional * fee_taker * CONFIG.LIQ_FEE_BUFFER
                     liq = approx_liq_price_cross(
@@ -615,12 +681,11 @@ async def scanner_main_loop(app: Application, broadcast):
                     nxt = next_pct_target(pos)
                     nxt_txt = "N/A" if nxt is None else f"{fmt(nxt['price'])} ({nxt['label']})"
 
-                    ord_total = len(pos.ordinary_targets)
-                    # Off-by-one в расчете оставшихся шагов в сообщении
-                    remaining = min(pos.max_steps - pos.steps_filled, ord_total - (pos.steps_filled - 1))
-                    remaining = max(0, remaining)
+                    total_ord = max(0, min(pos.ord_levels - 1, len(pos.ordinary_targets)))
+                    used_ord = max(0, min(total_ord, pos.steps_filled - 1 - (1 if pos.reserve_used else 0)))
+                    remaining = max(0, total_ord - used_ord)
 
-                    nxt_margin = pos.step_margins[pos.steps_filled] if pos.steps_filled < pos.max_steps else None
+                    nxt_margin = pos.step_margins[pos.steps_filled] if pos.steps_filled < pos.ord_levels else None
                     nxt_dep_txt = f"{nxt_margin:.2f} USDT" if nxt_margin is not None else "N/A"
 
                     brk_up, brk_dn = break_levels(rng_strat)
@@ -637,7 +702,7 @@ async def scanner_main_loop(app: Application, broadcast):
                             f"TP: <code>{fmt(pos.tp_price)}</code> (+{CONFIG.TP_PCT*100:.2f}%)\n"
                             f"Ликвидация: {liq_arrow}<code>{fmt(liq)}</code> (до лик.: {dist_txt})\n"
                             f"{brk_line}\n"
-                            f"След. усреднение: <code>{nxt_txt}</code> | Плановый добор: <b>{nxt_dep_txt}</b> (осталось: {remaining} из {ord_total})"
+                            f"След. усреднение: <code>{nxt_txt}</code> | Плановый добор: <b>{nxt_dep_txt}</b> (осталось: {remaining} из {total_ord})"
                         )
                     await log_event_safely({
                         "Event_ID": f"OPEN_{pos.signal_id}", "Signal_ID": pos.signal_id, "Leverage": pos.leverage,
@@ -656,22 +721,31 @@ async def scanner_main_loop(app: Application, broadcast):
 
             pos = app.bot_data.get("position")
             if pos:
-                if not manage_only:
-                    if pos.reserved_one:
-                        need_retest = (pos.side=="SHORT" and px <= rng_strat["upper"] * (1 - CONFIG.REENTRY_BAND)) or \
-                                      (pos.side=="LONG"  and px >= rng_strat["lower"] * (1 + CONFIG.REENTRY_BAND))
-                        can_add = pos.steps_filled < pos.max_steps
-                        if need_retest and can_add and trend_reversal_confirmed(pos.side, ind):
-                            margin, _ = pos.add_step(px)
-                            pos.rebalance_tail_margins(bank, ord_total=len(pos.ordinary_targets))
-                            pos.max_steps = pos.steps_filled
-                            cum_margin = sum(pos.step_margins[:pos.steps_filled])
+                if pos.freeze_ordinary and pos.reserve_available and not manage_only:
+                    need_retest_slow = (
+                        ((pos.side == "SHORT" and px <= rng_strat["upper"] * (1 - CONFIG.REENTRY_BAND)) or
+                         (pos.side == "LONG" and px >= rng_strat["lower"] * (1 + CONFIG.REENTRY_BAND)))
+                        and trend_reversal_confirmed(pos.side, ind)
+                    )
+                    need_retest_spike = False
+                    if pos.spike_flag and (pos.spike_deadline_ts is None or time.time() <= pos.spike_deadline_ts):
+                        if pos.spike_ref_ohlc is not None and spike_retrace_ok_ref(pos.spike_direction, pos.spike_ref_ohlc, px):
+                            if (pos.side == "LONG" and pos.spike_direction == "down") or (pos.side == "SHORT" and pos.spike_direction == "up"):
+                                need_retest_spike = True
+                    
+                    if need_retest_slow or need_retest_spike:
+                        now_ts = time.time()
+                        if pos.last_add_ts is None or (now_ts - pos.last_add_ts) >= CONFIG.ADD_COOLDOWN_SEC:
+                            margin, _ = pos.add_reserve_step(px)
+                            pos.spike_flag = False
+                            pos.spike_deadline_ts = None
+                            pos.spike_ref_ohlc = None
+                            
+                            cum_margin = _pos_total_margin(pos)
                             cum_notional = cum_margin * pos.leverage
                             fees_paid_est = cum_notional * fee_taker * CONFIG.LIQ_FEE_BUFFER
-                            liq = approx_liq_price_cross(
-                                avg=pos.avg, side=pos.side, qty=pos.qty,
-                                equity=bank, mmr=CONFIG.MAINT_MMR, fees_paid=fees_paid_est
-                            )
+                            liq = approx_liq_price_cross(avg=pos.avg, side=pos.side, qty=pos.qty,
+                                                         equity=bank, mmr=CONFIG.MAINT_MMR, fees_paid=fees_paid_est)
                             if not np.isfinite(liq) or liq <= 0: liq = None
                             dist_to_liq_pct = liq_distance_pct(pos.side, px, liq)
                             dist_txt = "N/A" if np.isnan(dist_to_liq_pct) else f"{dist_to_liq_pct:.2f}%"
@@ -684,76 +758,86 @@ async def scanner_main_loop(app: Application, broadcast):
 
                             if broadcast:
                                 await broadcast(app,
-                                    f"↩️ Ретест — резервный добор\n"
+                                    f"↩️ Ретест — резервный добор ({'шип' if need_retest_spike else 'плавный'})\n"
                                     f"Цена: <code>{fmt(px)}</code>\n"
                                     f"Добор (резерв): <b>{margin:.2f} USDT</b> | Депозит (текущий): <b>{cum_margin:.2f} USDT</b>\n"
                                     f"Средняя: <code>{fmt(pos.avg)}</code> | TP: <code>{fmt(pos.tp_price)}</code>\n"
                                     f"Ликвидация: {liq_arrow}<code>{fmt(liq)}</code> (до лик.: {dist_txt})\n"
-                                    f"{brk_line}")
+                                    f"{brk_line}"
+                                )
                             await log_event_safely({
-                                "Event_ID": f"RETEST_ADD_{pos.signal_id}_{pos.steps_filled}", "Signal_ID": pos.signal_id,
+                                "Event_ID": f"RETEST_ADD_{pos.signal_id}_{pos.steps_filled}",
+                                "Signal_ID": pos.signal_id,
                                 "Timestamp_UTC": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
                                 "Pair": symbol, "Side": pos.side, "Event": "RETEST_ADD",
                                 "Step_No": pos.steps_filled, "Step_Margin_USDT": margin,
                                 "Entry_Price": px, "Avg_Price": pos.avg
                             })
-                    else:
-                        nxt = next_pct_target(pos)
-                        trigger = (nxt is not None) and ((pos.side=="LONG" and px <= nxt["price"]) or (pos.side=="SHORT" and px >= nxt["price"]))
-                        if trigger and pos.steps_filled < pos.max_steps:
-                            margin, _ = pos.add_step(px)
-                            pos.rebalance_tail_margins(bank, ord_total=len(pos.ordinary_targets))
-                            cum_margin = sum(pos.step_margins[:pos.steps_filled])
-                            cum_notional = cum_margin * pos.leverage
-                            fees_paid_est = cum_notional * fee_taker * CONFIG.LIQ_FEE_BUFFER
-                            liq = approx_liq_price_cross(
-                                avg=pos.avg, side=pos.side, qty=pos.qty,
-                                equity=bank, mmr=CONFIG.MAINT_MMR, fees_paid=fees_paid_est
-                            )
-                            if not np.isfinite(liq) or liq <= 0: liq = None
-                            dist_to_liq_pct = liq_distance_pct(pos.side, px, liq)
-                            dist_txt = "N/A" if np.isnan(dist_to_liq_pct) else f"{dist_to_liq_pct:.2f}%"
-                            liq_arrow = "↓" if pos.side == "LONG" else "↑"
+                
+                nxt = next_pct_target(pos)
+                trigger = (nxt is not None) and ((pos.side=="LONG" and px <= nxt["price"]) or (pos.side=="SHORT" and px >= nxt["price"]))
 
-                            nxt2 = next_pct_target(pos)
-                            nxt2_txt = "N/A" if nxt2 is None else f"{fmt(nxt2['price'])} ({nxt2['label']})"
+                if (not pos.freeze_ordinary) and trigger and (pos.steps_filled < pos.ord_levels):
+                    now_ts = time.time()
+                    if pos.last_add_ts is None or (now_ts - pos.last_add_ts) >= CONFIG.ADD_COOLDOWN_SEC:
+                        margin, _ = pos.add_step(px)
+                        pos.rebalance_tail_margins_excluding_reserve(bank)
+                        
+                        cum_margin = _pos_total_margin(pos)
+                        cum_notional = cum_margin * pos.leverage
+                        fees_paid_est = cum_notional * fee_taker * CONFIG.LIQ_FEE_BUFFER
+                        liq = approx_liq_price_cross(
+                            avg=pos.avg, side=pos.side, qty=pos.qty,
+                            equity=bank, mmr=CONFIG.MAINT_MMR, fees_paid=fees_paid_est
+                        )
+                        if not np.isfinite(liq) or liq <= 0: liq = None
+                        dist_to_liq_pct = liq_distance_pct(pos.side, px, liq)
+                        dist_txt = "N/A" if np.isnan(dist_to_liq_pct) else f"{dist_to_liq_pct:.2f}%"
+                        liq_arrow = "↓" if pos.side == "LONG" else "↑"
 
-                            ord_total = len(pos.ordinary_targets)
-                            remaining = min(pos.max_steps - pos.steps_filled, ord_total - (pos.steps_filled - 1))
-                            remaining = max(0, remaining)
+                        nxt2 = next_pct_target(pos)
+                        nxt2_txt = "N/A" if nxt2 is None else f"{fmt(nxt2['price'])} ({nxt2['label']})"
+                        
+                        total_ord = max(0, min(pos.ord_levels - 1, len(pos.ordinary_targets)))
+                        used_ord = max(0, min(total_ord, pos.steps_filled - 1 - (1 if pos.reserve_used else 0)))
+                        remaining = max(0, total_ord - used_ord)
+                        
+                        curr_label = pos.ordinary_targets[used_ord - 1]["label"] if used_ord >= 1 else ""
+                        
+                        next_idx = used_ord + 1
+                        nxt2_margin = (
+                            pos.step_margins[next_idx]
+                            if next_idx < pos.ord_levels else None
+                        )
+                        nxt2_dep_txt = "N/A" if nxt2_margin is None else f"{nxt2_margin:.2f} USDT"
 
-                            curr_label = pos.ordinary_targets[pos.steps_filled-2]["label"] if pos.steps_filled >= 2 else ""
+                        brk_up, brk_dn = break_levels(rng_strat)
+                        brk_up_pct, brk_dn_pct = break_distance_pcts(px, brk_up, brk_dn)
+                        brk_line = (f"Пробой: ↑<code>{fmt(brk_up)}</code> ({brk_up_pct:.2f}%) | "
+                                    f"↓<code>{fmt(brk_dn)}</code> ({brk_dn_pct:.2f}%)")
 
-                            nxt2_margin = pos.step_margins[pos.steps_filled] if pos.steps_filled < pos.max_steps else None
-                            nxt2_dep_txt = "N/A" if nxt2_margin is None else f"{nxt2_margin:.2f} USDT"
-
-                            brk_up, brk_dn = break_levels(rng_strat)
-                            brk_up_pct, brk_dn_pct = break_distance_pcts(px, brk_up, brk_dn)
-                            brk_line = (f"Пробой: ↑<code>{fmt(brk_up)}</code> ({brk_up_pct:.2f}%) | "
-                                        f"↓<code>{fmt(brk_dn)}</code> ({brk_dn_pct:.2f}%)")
-
-                            if broadcast:
-                                await broadcast(app,
-                                    f"➕ Усреднение #{pos.steps_filled-1} [{curr_label}]\n"
-                                    f"Цена: <code>{fmt(px)}</code>\n"
-                                    f"Добор: <b>{margin:.2f} USDT</b> | Депозит (текущий): <b>{cum_margin:.2f} USDT</b>\n"
-                                    f"Средняя: <code>{fmt(pos.avg)}</code> | TP: <code>{fmt(pos.tp_price)}</code>\n"
-                                    f"Ликвидация: {liq_arrow}<code>{fmt(liq)}</code> (до лик.: {dist_txt})\n"
-                                    f"{brk_line}\n"
-                                    f"След. усреднение: <code>{nxt2_txt}</code> | Плановый добор: <b>{nxt2_dep_txt}</b> (осталось: {remaining} из {ord_total})")
-                            await log_event_safely({
-                                "Event_ID": f"ADD_{pos.signal_id}_{pos.steps_filled}", "Signal_ID": pos.signal_id,
-                                "Timestamp_UTC": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
-                                "Pair": symbol, "Side": pos.side, "Event": "ADD",
-                                "Step_No": pos.steps_filled, "Step_Margin_USDT": margin,
-                                "Cum_Margin_USDT": cum_margin, "Entry_Price": px, "Avg_Price": pos.avg,
-                                "TP_Price": pos.tp_price, "SL_Price": pos.sl_price or "",
-                                "Liq_Est_Price": liq, "Next_DCA_Price": (nxt2 and nxt2["price"]) or "", "Next_DCA_Label": (nxt2 and nxt2["label"]) or "", "Triggered_Label": curr_label,
-                                "Fee_Rate_Maker": fee_maker, "Fee_Rate_Taker": fee_taker,
-                                "Fee_Est_USDT": fees_paid_est / CONFIG.LIQ_FEE_BUFFER, "ATR_5m": ind["atr5m"], "ATR_1h": rng_strat["atr1h"],
-                                "RSI_5m": ind["rsi"], "ADX_5m": ind["adx"], "Supertrend": ind["supertrend"], "Vol_z": ind["vol_z"],
-                                "Range_Lower": rng_strat["lower"], "Range_Upper": rng_strat["upper"], "Range_Width": rng_strat["width"]
-                            })
+                        if broadcast:
+                            await broadcast(app,
+                                f"➕ Усреднение #{pos.steps_filled} [{curr_label}]\n"
+                                f"Цена: <code>{fmt(px)}</code>\n"
+                                f"Добор: <b>{margin:.2f} USDT</b> | Депозит (текущий): <b>{cum_margin:.2f} USDT</b>\n"
+                                f"Средняя: <code>{fmt(pos.avg)}</code> | TP: <code>{fmt(pos.tp_price)}</code>\n"
+                                f"Ликвидация: {liq_arrow}<code>{fmt(liq)}</code> (до лик.: {dist_txt})\n"
+                                f"{brk_line}\n"
+                                f"След. усреднение: <code>{nxt2_txt}</code> | Плановый добор: <b>{nxt2_dep_txt}</b> (осталось: {remaining} из {total_ord})")
+                        await log_event_safely({
+                            "Event_ID": f"ADD_{pos.signal_id}_{pos.steps_filled}", "Signal_ID": pos.signal_id,
+                            "Timestamp_UTC": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+                            "Pair": symbol, "Side": pos.side, "Event": "ADD",
+                            "Step_No": pos.steps_filled, "Step_Margin_USDT": margin,
+                            "Cum_Margin_USDT": cum_margin, "Entry_Price": px, "Avg_Price": pos.avg,
+                            "TP_Price": pos.tp_price, "SL_Price": pos.sl_price or "",
+                            "Liq_Est_Price": liq, "Next_DCA_Price": (nxt2 and nxt2["price"]) or "", "Next_DCA_Label": (nxt2 and nxt2["label"]) or "", "Triggered_Label": curr_label,
+                            "Fee_Rate_Maker": fee_maker, "Fee_Rate_Taker": fee_taker,
+                            "Fee_Est_USDT": fees_paid_est / CONFIG.LIQ_FEE_BUFFER, "ATR_5m": ind["atr5m"], "ATR_1h": rng_strat["atr1h"],
+                            "RSI_5m": ind["rsi"], "ADX_5m": ind["adx"], "Supertrend": ind["supertrend"], "Vol_z": ind["vol_z"],
+                            "Range_Lower": rng_strat["lower"], "Range_Upper": rng_strat["upper"], "Range_Width": rng_strat["width"]
+                        })
 
                 if pos.side == "LONG": gain_to_tp = max(0.0, (px / max(pos.avg,1e-9) - 1.0) / CONFIG.TP_PCT)
                 else: gain_to_tp = max(0.0, (pos.avg / max(px,1e-9) - 1.0) / CONFIG.TP_PCT)
