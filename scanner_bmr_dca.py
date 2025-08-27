@@ -263,9 +263,8 @@ def compute_net_pnl(pos, exit_p: float, fee_entry: float, fee_exit: float) -> tu
     sum_margin = sum(pos.step_margins[:pos.steps_filled]) or 1e-9
     raw_pnl = (exit_p / pos.avg - 1.0) * (1 if pos.side == "LONG" else -1)
     gross_usd = sum_margin * (raw_pnl * pos.leverage)
-    entry_notional = sum_margin * pos.leverage
     exit_notional  = exit_p * pos.qty
-    fee_entry_usd = entry_notional * fee_entry
+    fee_entry_usd = (sum_margin * pos.leverage) * fee_entry # Исправлено: комиссия на вход
     fee_exit_usd  = exit_notional  * fee_exit
     net_usd = gross_usd - fee_entry_usd - fee_exit_usd
     net_pct = (net_usd / sum_margin) * 100.0
@@ -315,7 +314,7 @@ def compute_indicators_5m(df: pd.DataFrame) -> dict:
     d_col = next((c for c in st.columns if c.startswith("SUPERTd_")), None)
     if d_col is None:
         raise ValueError("Supertrend direction column not found")
-    
+
     dir_now  = int(st[d_col].iloc[-1])
     dir_prev = int(st[d_col].iloc[-2])
     st_state = (
@@ -355,10 +354,41 @@ class Position:
         self.last_sl_notified_price = None
         self.ordinary_targets: list[dict] = []
         self.trail_stage: int = -1
+        self.growth = CONFIG.DCA_GROWTH  # <— сохраняем коэффициент роста
 
-    def plan_margins(self, bank: float, growth: float):
+    def plan_margins(self, bank: float, growth: float, levels: int | None = None):
+        """План на фактическое число шагов (по умолчанию self.max_steps)."""
+        self.growth = growth
+        n = int(levels or self.max_steps)
         total_target = bank * CONFIG.CUM_DEPOSIT_FRAC_AT_FULL
-        self.step_margins = plan_margins_bank_first(total_target, CONFIG.DCA_LEVELS, growth)
+        self.step_margins = plan_margins_bank_first(total_target, n, growth)
+
+    def rebalance_tail_margins(self, bank: float, ord_total: int | None = None, remaining_levels: int | None = None):
+        """
+        Перераспределяет НЕИСПОЛЬЗОВАННЫЙ бюджет на оставшиеся шаги с тем же growth.
+        ord_total — количество «обычных» таргетов (без учёта входа).
+        remaining_levels — можно передать напрямую (например, когда оставили только 1 резерв).
+        """
+        # сколько шагов ещё можно сделать?
+        if remaining_levels is None:
+            if ord_total is None:
+                return
+            # ИСПРАВЛЕНО: Корректный расчет оставшихся обычных шагов
+            rem = max(0, ord_total - self.steps_filled)
+            remaining_levels = min(rem, max(0, self.max_steps - self.steps_filled))
+
+        if remaining_levels <= 0:
+            self.max_steps = self.steps_filled
+            return
+
+        total_target = bank * CONFIG.CUM_DEPOSIT_FRAC_AT_FULL
+        used = sum(self.step_margins[:self.steps_filled]) if self.step_margins else 0.0
+        remaining_budget = max(0.0, total_target - used)
+
+        # пересобираем хвост геометрической прогрессией
+        tail = plan_margins_bank_first(remaining_budget, remaining_levels, self.growth)
+        self.step_margins = (self.step_margins[:self.steps_filled] or []) + tail
+        self.max_steps = self.steps_filled + remaining_levels
 
     def add_step(self, price: float):
         margin = self.step_margins[self.steps_filled]
@@ -376,7 +406,7 @@ class Position:
 async def scanner_main_loop(app: Application, broadcast):
     log.info("BMR-DCA loop starting…")
     app.bot_data.setdefault("position", None)
-    
+
     try:
         creds_json = os.environ.get("GOOGLE_CREDENTIALS")
         sheet_key  = os.environ.get("SHEET_ID")
@@ -394,7 +424,7 @@ async def scanner_main_loop(app: Application, broadcast):
         'timeout': 20000,
     })
     await exchange.load_markets(True)
-    
+
     candidates = [CONFIG.SYMBOL, "JPY/USDT:USDT", "JPY/USDT", "JPYUSDT", "JPYC/USDT:USDT", "JPYC/USDT", "JPYCUSDT"]
     symbol = None
     for s in candidates:
@@ -435,7 +465,7 @@ async def scanner_main_loop(app: Application, broadcast):
             bank = float(app.bot_data.get("safety_bank_usdt", CONFIG.SAFETY_BANK_USDT))
             fee_maker = float(app.bot_data.get("fee_maker", CONFIG.FEE_MAKER))
             fee_taker = float(app.bot_data.get("fee_taker", CONFIG.FEE_TAKER))
-            
+
             now = time.time()
             manage_only = app.bot_data.get("scan_paused", False)
             pos: Position | None = app.bot_data.get("position")
@@ -454,7 +484,7 @@ async def scanner_main_loop(app: Application, broadcast):
                     last_build_tac = now
                     app.bot_data["intro_done"] = False
                     log.info(f"[RANGE-TAC]   lower={fmt(rng_tac['lower'])} upper={fmt(rng_tac['upper'])} width={fmt(rng_tac['width'])}")
-            
+
             if not (rng_strat and rng_tac):
                 log.error("Range is not available. Cannot proceed.")
                 await asyncio.sleep(10)
@@ -466,7 +496,7 @@ async def scanner_main_loop(app: Application, broadcast):
                 log.warning("Could not fetch 5m OHLCV data. Skipping this cycle.")
                 await asyncio.sleep(2)
                 continue
-            
+
             df5 = pd.DataFrame(ohlc5, columns=["ts","open","high","low","close","volume"])
             try:
                 ind = compute_indicators_5m(df5)
@@ -500,7 +530,7 @@ async def scanner_main_loop(app: Application, broadcast):
                 app.bot_data["intro_done"] = True
 
             pos = app.bot_data.get("position")
-            
+
             if pos and app.bot_data.get("force_close"):
                 exit_p = px
                 time_min = (time.time()-pos.open_ts)/60.0
@@ -508,9 +538,9 @@ async def scanner_main_loop(app: Application, broadcast):
 
                 if broadcast:
                     await broadcast(app, f"🧰 <b>MANUAL_CLOSE</b>\n"
-                                          f"Цена выхода: <code>{fmt(exit_p)}</code>\n"
-                                          f"P&L (net)≈ {net_usd:+.2f} USDT ({net_pct:+.2f}%)\n"
-                                          f"Время в сделке: {time_min:.1f} мин")
+                                         f"Цена выхода: <code>{fmt(exit_p)}</code>\n"
+                                         f"P&L (net)≈ {net_usd:+.2f} USDT ({net_pct:+.2f}%)\n"
+                                         f"Время в сделке: {time_min:.1f} мин")
                 await log_event_safely({
                     "Event_ID": f"MANUAL_CLOSE_{pos.signal_id}", "Signal_ID": pos.signal_id,
                     "Timestamp_UTC": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
@@ -529,6 +559,8 @@ async def scanner_main_loop(app: Application, broadcast):
                     if not pos.reserved_one:
                         pos.max_steps = min(pos.steps_filled + 1, CONFIG.DCA_LEVELS)
                         pos.reserved_one = True
+                        # перераспределяем оставшийся бюджет на единственный резервный добор
+                        pos.rebalance_tail_margins(bank, remaining_levels=pos.max_steps - pos.steps_filled)
                         if broadcast:
                             await broadcast(app, "📌 Пробой коридора — обычные усреднения заморожены. Оставлен 1 резерв на ретест.")
 
@@ -539,29 +571,35 @@ async def scanner_main_loop(app: Application, broadcast):
                 else:
                     pos_in = max(0.0, min(1.0, (px - rng_tac["lower"]) / max(rng_tac["width"], 1e-9)))
                     side_cand = "LONG" if pos_in <= 0.30 else ("SHORT" if pos_in >= 0.70 else None)
-                
+
                 if side_cand:
                     pos = Position(side_cand, signal_id=f"{symbol.split('/')[0]}_{int(now)}")
-                    
+
+                    # 1) плечо
                     if manual and manual.get("leverage") is not None:
                         pos.leverage = max(CONFIG.MIN_LEVERAGE, min(CONFIG.MAX_LEVERAGE, int(manual["leverage"])))
                     else:
                         pos.leverage = CONFIG.LEVERAGE
 
-                    growth = choose_growth(ind, rng_strat, rng_tac)
-                    pos.plan_margins(bank, growth)
-
+                    # 2) фактическое число шагов до планирования маржей
                     if manual and manual.get("max_steps") is not None:
                         pos.max_steps = max(1, min(CONFIG.DCA_LEVELS, int(manual["max_steps"])))
                     else:
                         pos.max_steps = min(6, CONFIG.DCA_LEVELS)
-                    
-                    pos.ordinary_targets = compute_mixed_targets(entry=px, side=pos.side, rng_strat=rng_strat, rng_tac=rng_tac, tick=tick)
-                    pos.reserved_one = False
 
-                    margin, _ = pos.add_step(px)
-                    app.bot_data["position"] = pos
+                    # 3) growth и первичное планирование на pos.max_steps
+                    growth = choose_growth(ind, rng_strat, rng_tac)
+                    pos.plan_margins(bank, growth, levels=pos.max_steps)
+
+                    # 4) таргеты
+                    pos.ordinary_targets = compute_mixed_targets(entry=px, side=pos.side, rng_strat=rng_strat, rng_tac=rng_tac, tick=tick)
                     
+                    # ИСПОЛНЯЕМ ПЕРВЫЙ ШАГ И СРАЗУ РЕБАЛАНСИРУЕМ ХВОСТ
+                    pos.reserved_one = False
+                    margin, _ = pos.add_step(px)
+                    pos.rebalance_tail_margins(bank, ord_total=len(pos.ordinary_targets))
+                    app.bot_data["position"] = pos
+
                     cum_margin = sum(pos.step_margins[:pos.steps_filled])
                     cum_notional = cum_margin * pos.leverage
                     fees_paid_est = cum_notional * fee_taker * CONFIG.LIQ_FEE_BUFFER
@@ -576,11 +614,12 @@ async def scanner_main_loop(app: Application, broadcast):
 
                     nxt = next_pct_target(pos)
                     nxt_txt = "N/A" if nxt is None else f"{fmt(nxt['price'])} ({nxt['label']})"
-                    
+
                     ord_total = len(pos.ordinary_targets)
+                    # Off-by-one в расчете оставшихся шагов в сообщении
                     remaining = min(pos.max_steps - pos.steps_filled, ord_total - (pos.steps_filled - 1))
                     remaining = max(0, remaining)
-                    
+
                     nxt_margin = pos.step_margins[pos.steps_filled] if pos.steps_filled < pos.max_steps else None
                     nxt_dep_txt = f"{nxt_margin:.2f} USDT" if nxt_margin is not None else "N/A"
 
@@ -624,6 +663,7 @@ async def scanner_main_loop(app: Application, broadcast):
                         can_add = pos.steps_filled < pos.max_steps
                         if need_retest and can_add and trend_reversal_confirmed(pos.side, ind):
                             margin, _ = pos.add_step(px)
+                            pos.rebalance_tail_margins(bank, ord_total=len(pos.ordinary_targets))
                             pos.max_steps = pos.steps_filled
                             cum_margin = sum(pos.step_margins[:pos.steps_filled])
                             cum_notional = cum_margin * pos.leverage
@@ -636,7 +676,7 @@ async def scanner_main_loop(app: Application, broadcast):
                             dist_to_liq_pct = liq_distance_pct(pos.side, px, liq)
                             dist_txt = "N/A" if np.isnan(dist_to_liq_pct) else f"{dist_to_liq_pct:.2f}%"
                             liq_arrow = "↓" if pos.side == "LONG" else "↑"
-                            
+
                             brk_up, brk_dn = break_levels(rng_strat)
                             brk_up_pct, brk_dn_pct = break_distance_pcts(px, brk_up, brk_dn)
                             brk_line = (f"Пробой: ↑<code>{fmt(brk_up)}</code> ({brk_up_pct:.2f}%) | "
@@ -662,6 +702,7 @@ async def scanner_main_loop(app: Application, broadcast):
                         trigger = (nxt is not None) and ((pos.side=="LONG" and px <= nxt["price"]) or (pos.side=="SHORT" and px >= nxt["price"]))
                         if trigger and pos.steps_filled < pos.max_steps:
                             margin, _ = pos.add_step(px)
+                            pos.rebalance_tail_margins(bank, ord_total=len(pos.ordinary_targets))
                             cum_margin = sum(pos.step_margins[:pos.steps_filled])
                             cum_notional = cum_margin * pos.leverage
                             fees_paid_est = cum_notional * fee_taker * CONFIG.LIQ_FEE_BUFFER
@@ -673,16 +714,16 @@ async def scanner_main_loop(app: Application, broadcast):
                             dist_to_liq_pct = liq_distance_pct(pos.side, px, liq)
                             dist_txt = "N/A" if np.isnan(dist_to_liq_pct) else f"{dist_to_liq_pct:.2f}%"
                             liq_arrow = "↓" if pos.side == "LONG" else "↑"
-                            
+
                             nxt2 = next_pct_target(pos)
                             nxt2_txt = "N/A" if nxt2 is None else f"{fmt(nxt2['price'])} ({nxt2['label']})"
-                            
+
                             ord_total = len(pos.ordinary_targets)
                             remaining = min(pos.max_steps - pos.steps_filled, ord_total - (pos.steps_filled - 1))
                             remaining = max(0, remaining)
-                            
+
                             curr_label = pos.ordinary_targets[pos.steps_filled-2]["label"] if pos.steps_filled >= 2 else ""
-                            
+
                             nxt2_margin = pos.step_margins[pos.steps_filled] if pos.steps_filled < pos.max_steps else None
                             nxt2_dep_txt = "N/A" if nxt2_margin is None else f"{nxt2_margin:.2f} USDT"
 
@@ -726,7 +767,7 @@ async def scanner_main_loop(app: Application, broadcast):
                     locked = pos.avg*(1+lock_pct) if pos.side=="LONG" else pos.avg*(1-lock_pct)
                     chand = chandelier_stop(pos.side, px, ind["atr5m"])
                     new_sl = max(locked, chand) if pos.side=="LONG" else min(locked, chand)
-                    
+
                     tick = app.bot_data.get("price_tick", 1e-4)
                     new_sl_q  = quantize_to_tick(new_sl, tick)
                     curr_sl_q = quantize_to_tick(pos.sl_price, tick)
@@ -759,10 +800,10 @@ async def scanner_main_loop(app: Application, broadcast):
                     atr_now = ind["atr5m"]
                     if broadcast:
                         await broadcast(app, f"{'✅' if net_usd > 0 else '❌'} <b>{reason}</b>\n"
-                                      f"Цена выхода: <code>{fmt(exit_p)}</code>\n"
-                                      f"P&L (net)≈ {net_usd:+.2f} USDT ({net_pct:+.2f}%)\n"
-                                      f"ATR(5m): {atr_now:.6f}\n"
-                                      f"Время в сделке: {time_min:.1f} мин")
+                                     f"Цена выхода: <code>{fmt(exit_p)}</code>\n"
+                                     f"P&L (net)≈ {net_usd:+.2f} USDT ({net_pct:+.2f}%)\n"
+                                     f"ATR(5m): {atr_now:.6f}\n"
+                                     f"Время в сделке: {time_min:.1f} мин")
                     await log_event_safely({
                         "Event_ID": f"{reason}_{pos.signal_id}", "Signal_ID": pos.signal_id,
                         "Timestamp_UTC": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
@@ -780,7 +821,7 @@ async def scanner_main_loop(app: Application, broadcast):
                 except Exception:
                     log.exception("flush_log_buffers failed")
                 last_flush = time.time()
-            
+
             await asyncio.sleep(CONFIG.SCAN_INTERVAL_SEC)
         except Exception:
             log.exception("BMR-DCA loop error")
