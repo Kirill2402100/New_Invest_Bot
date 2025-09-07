@@ -9,10 +9,9 @@ import pandas_ta as ta
 from telegram.ext import Application
 import gspread
 
-# ИЗМЕНЕНО: импорты для Forex
+# Forex adapter + feed
 from fx_mt5_adapter import FX, margin_to_lots, lots_to_margin, default_tick
-# ДОЛЖНО БЫТЬ
-from fx_feed import fetch_ohlcv as fetch_ohlcv_yf
+from fx_feed import fetch_ohlcv as fetch_ohlcv_yf  # алиас на fetch_fx_ohlcv
 
 import trade_executor
 
@@ -32,45 +31,59 @@ class CONFIG:
     STRATEGIC_LOOKBACK_DAYS = 60
     TACTICAL_LOOKBACK_DAYS = 3
     FETCH_TIMEOUT = 25
+
     BASE_STEP_MARGIN = 10.0
     DCA_LEVELS = 7
     DCA_GROWTH = 2.0
+
     Q_LOWER = 0.025
     Q_UPPER = 0.975
     RANGE_MIN_ATR_MULT = 1.5
+
     RSI_LEN = 14
     ADX_LEN = 14
     VOL_WIN = 50
+
     WEIGHTS = {
         "border": 0.45, "rsi": 0.15, "ema_dev": 0.20,
         "supertrend": 0.10, "vol": 0.10
     }
     SCORE_THR = 0.55
+
     ATR_MULTS = [0, 1, 2, 3, 4, 5, 6]
     STRATEGIC_PCTS = [0.10, 0.45, 0.90]
     TACTICAL_PCTS = [0.40, 0.80]
+
     TP_PCT = 0.010
     TRAILING_STAGES = [(0.35, 0.25), (0.60, 0.50), (0.85, 0.75)]
+
     SCAN_INTERVAL_SEC = 3
     REBUILD_RANGE_EVERY_MIN = 15
     REBUILD_TACTICAL_EVERY_MIN = 5
+
     SAFETY_BANK_USDT = 1500.0
     CUM_DEPOSIT_FRAC_AT_FULL = 2 / 3
+
     AUTO_LEVERAGE = False
     MIN_LEVERAGE = 2
     MAX_LEVERAGE = 500
+
     BREAK_EPS = 0.0025
     REENTRY_BAND = 0.003
     MAINT_MMR = 0.004
     LIQ_FEE_BUFFER = 1.0
+
     SL_NOTIFY_MIN_TICK_STEP = 1
+
     AUTO_ALLOC = {
         "thin_tac_vs_strat": 0.35,
         "low_vol_z": 0.5,
         "growth_A": 1.6,
         "growth_B": 2.2,
     }
+
     ADD_COOLDOWN_SEC = 25
+
     SPIKE = {
         "WICK_RATIO": 2.0,
         "ATR_MULT": 1.6,
@@ -79,7 +92,7 @@ class CONFIG:
         "RETRACE_WINDOW_SEC": 120,
     }
 
-# Символ и таймфреймы из ENV (если заданы)
+# Env overrides
 CONFIG.SYMBOL = os.getenv("FX_SYMBOL", CONFIG.SYMBOL).upper()
 CONFIG.TF_ENTRY = os.getenv("TF_ENTRY", CONFIG.TF_ENTRY)
 CONFIG.TF_RANGE = os.getenv("TF_TREND", CONFIG.TF_RANGE)
@@ -93,6 +106,7 @@ async def maybe_await(func, *args, **kwargs):
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, lambda: func(*args, **kwargs))
 
+
 SAFE_LOG_KEYS = {
     "Event_ID","Signal_ID","Leverage","Timestamp_UTC","Pair","Side","Event",
     "Step_No","Step_Margin_USDT","Cum_Margin_USDT","Entry_Price","Avg_Price",
@@ -101,7 +115,7 @@ SAFE_LOG_KEYS = {
     "ATR_5m","ATR_1h","RSI_5m","ADX_5m","Supertrend","Vol_z",
     "Range_Lower","Range_Upper","Range_Width",
     "PNL_Realized_USDT","PNL_Realized_Pct","Time_In_Trade_min","Trail_Stage",
-    "Next_DCA_Label", "Triggered_Label"
+    "Next_DCA_Label","Triggered_Label"
 }
 
 def _clean(v):
@@ -159,8 +173,7 @@ def trend_reversal_confirmed(side: str, ind: dict) -> bool:
            (side=="LONG"  and ind["supertrend"] in ("down_to_up_near","up"))
 
 def chandelier_stop(side: str, price: float, atr: float, mult: float = 3.0):
-    if side == "LONG": return price - mult*atr
-    else: return price + mult*atr
+    return price - mult*atr if side == "LONG" else price + mult*atr
 
 def break_levels(rng: dict) -> tuple[float, float]:
     up = rng["upper"] * (1.0 + CONFIG.BREAK_EPS)
@@ -309,10 +322,13 @@ def spike_retrace_ok_ref(direction: str, ref_ohlc: tuple[float,float,float,float
     return False
 
 # ---------------------------------------------------------------------------
-# Core Logic
+# Indicators & ranges
 # ---------------------------------------------------------------------------
 async def build_range_from_df(df: Optional[pd.DataFrame]):
-    if df is None or df.empty: return None
+    if df is None or df.empty:
+        return None
+
+    df = df.copy()
     df.columns = ["open","high","low","close","volume"]
     ema = ta.ema(df["close"], length=50)
     atr = ta.atr(df["high"], df["low"], df["close"], length=14)
@@ -329,10 +345,10 @@ async def build_range_from_df(df: Optional[pd.DataFrame]):
     return {"lower": lower, "upper": upper, "mid": mid, "atr1h": atr1h, "width": upper-lower}
 
 async def build_ranges(symbol: str):
-    # bars = количество баров, поэтому для 1h берём дни * 24
     s_df_task = asyncio.create_task(maybe_await(fetch_ohlcv_yf, symbol, CONFIG.TF_RANGE, CONFIG.STRATEGIC_LOOKBACK_DAYS * 24))
     t_df_task = asyncio.create_task(maybe_await(fetch_ohlcv_yf, symbol, CONFIG.TF_RANGE, CONFIG.TACTICAL_LOOKBACK_DAYS * 24))
     s_df, t_df = await asyncio.gather(s_df_task, t_df_task)
+
     s_task = asyncio.create_task(build_range_from_df(s_df))
     t_task = asyncio.create_task(build_range_from_df(t_df))
     strat, tac = await asyncio.gather(s_task, t_task)
@@ -457,12 +473,21 @@ class Position:
         return margin, notional
 
 # ---------------------------------------------------------------------------
-# Main Loop
+# Main loop (box-aware)
 # ---------------------------------------------------------------------------
-async def scanner_main_loop(app: Application, broadcast):
+async def scanner_main_loop(app: Application, broadcast, box: dict | None = None, **_):
     log.info("BMR-DCA loop starting…")
-    app.bot_data.setdefault("position", None)
 
+    # Локальное хранилище состояния для ЭТОГО сканера
+    B = box if isinstance(box, dict) else app.bot_data
+    B.setdefault("bot_on", True)
+    B.setdefault("scan_paused", False)
+
+    # Пин-адресат
+    async def say(txt: str):
+        await broadcast(app, txt, target_chat_id=B.get("chat_id"))
+
+    # Sheets
     try:
         creds_json = os.environ.get("GOOGLE_CREDENTIALS")
         sheet_key  = os.environ.get("SHEET_ID")
@@ -470,31 +495,32 @@ async def scanner_main_loop(app: Application, broadcast):
             gc = gspread.service_account_from_dict(json.loads(creds_json))
             sheet = gc.open_by_key(sheet_key)
             await maybe_await(trade_executor.ensure_bmr_log_sheet, sheet, title="BMR_DCA_Log")
-    except Exception as e:
-        log.error(f"Sheets init error: {e}", exc_info=True)
-    
-    symbol = CONFIG.SYMBOL
+    except Exception:
+        log.exception("Sheets init error")
+
+    symbol = (B.get("symbol") or CONFIG.SYMBOL).upper()
     if symbol not in FX:
         log.critical(f"Unsupported FX symbol: {symbol}. Supported: {list(FX.keys())}")
         return
+
     tick = default_tick(symbol)
-    app.bot_data["price_tick"] = tick
+    B["price_tick"] = tick
     log.info(f"Successfully initialized for Forex symbol {symbol} with tick size {tick}")
 
     rng_strat, rng_tac = None, None
-    last_flush = 0
+    last_flush = 0.0
     last_build_strat = 0.0
     last_build_tac = 0.0
 
-    while app.bot_data.get("bot_on", False):
+    while B.get("bot_on", False):
         try:
-            bank = float(app.bot_data.get("safety_bank_usdt", CONFIG.SAFETY_BANK_USDT))
-            fee_maker = float(app.bot_data.get("fee_maker", CONFIG.FEE_MAKER))
-            fee_taker = float(app.bot_data.get("fee_taker", CONFIG.FEE_TAKER))
+            bank = float(B.get("safety_bank_usdt", CONFIG.SAFETY_BANK_USDT))
+            fee_maker = float(B.get("fee_maker", CONFIG.FEE_MAKER))
+            fee_taker = float(B.get("fee_taker", CONFIG.FEE_TAKER))
 
             now = time.time()
-            manage_only = app.bot_data.get("scan_paused", False)
-            pos: Position | None = app.bot_data.get("position")
+            manage_only = B.get("scan_paused", False)
+            pos: Position | None = B.get("position")
 
             need_build_strat = (rng_strat is None) or ((now - last_build_strat > CONFIG.REBUILD_RANGE_EVERY_MIN*60) and (pos is None))
             need_build_tac   = (rng_tac is None) or ((now - last_build_tac > CONFIG.REBUILD_TACTICAL_EVERY_MIN*60) and (pos is None))
@@ -503,12 +529,12 @@ async def scanner_main_loop(app: Application, broadcast):
                 if need_build_strat and s:
                     rng_strat = s
                     last_build_strat = now
-                    app.bot_data["intro_done"] = False
+                    B["intro_done"] = False
                     log.info(f"[RANGE-STRAT] lower={fmt(rng_strat['lower'])} upper={fmt(rng_strat['upper'])} width={fmt(rng_strat['width'])}")
                 if need_build_tac and t:
                     rng_tac = t
                     last_build_tac = now
-                    app.bot_data["intro_done"] = False
+                    B["intro_done"] = False
                     log.info(f"[RANGE-TAC]   lower={fmt(rng_tac['lower'])} upper={fmt(rng_tac['upper'])} width={fmt(rng_tac['width'])}")
 
             if not (rng_strat and rng_tac):
@@ -516,16 +542,17 @@ async def scanner_main_loop(app: Application, broadcast):
                 await asyncio.sleep(10)
                 continue
 
-            # ВАЖНО: используем bars=..., а не limit=
-            bars_needed = max(600, CONFIG.VOL_WIN + CONFIG.ADX_LEN + 30)
+            # 5m OHLCV (bars, не limit)
+            bars_needed = max(60, CONFIG.VOL_WIN + CONFIG.ADX_LEN + 20)
             ohlc5_df = await maybe_await(fetch_ohlcv_yf, symbol, CONFIG.TF_ENTRY, bars_needed)
             if ohlc5_df is None or ohlc5_df.empty:
                 log.warning("Could not fetch 5m OHLCV data. Skipping this cycle.")
                 await asyncio.sleep(2)
                 continue
-            
+
             df5 = ohlc5_df.copy()
             df5.columns = ["open","high","low","close","volume"]
+
             try:
                 ind = compute_indicators_5m(df5)
             except (ValueError, IndexError) as e:
@@ -534,8 +561,9 @@ async def scanner_main_loop(app: Application, broadcast):
                 continue
 
             px = float(df5["close"].iloc[-1])
+            B["last_px"] = px
 
-            if (not app.bot_data.get("intro_done")) and (pos is None):
+            if (not B.get("intro_done")) and (pos is None):
                 p30_t = rng_tac["lower"] + 0.30 * rng_tac["width"]
                 p70_t = rng_tac["lower"] + 0.70 * rng_tac["width"]
                 d_to_long  = max(0.0, px - p30_t)
@@ -544,31 +572,30 @@ async def scanner_main_loop(app: Application, broadcast):
                 pct_to_short = (d_to_short / max(px, 1e-9)) * 100
                 brk_up, brk_dn = break_levels(rng_strat)
                 width_ratio = (rng_tac["width"] / max(rng_strat["width"], 1e-9)) * 100.0
-                if broadcast:
-                    msg = (
-                        f"🎯 Пороги входа (<b>TAC 30/70</b>): LONG ≤ <code>{fmt(p30_t)}</code>, SHORT ≥ <code>{fmt(p70_t)}</code>\n"
-                        f"📏 Диапазоны:\n"
-                        f"• STRAT: [{fmt(rng_strat['lower'])} … {fmt(rng_strat['upper'])}] w={fmt(rng_strat['width'])}\n"
-                        f"• TAC (3d): [{fmt(rng_tac['lower'])} … {fmt(rng_tac['upper'])}] w={fmt(rng_tac['width'])} (≈{width_ratio:.0f}% от STRAT)\n"
-                        f"🔓 Пробой STRAT: ↑{fmt(brk_up)} | ↓{fmt(brk_dn)}\n"
-                        f"Текущая: {fmt(px)}. До LONG: {fmt(d_to_long)} ({pct_to_long:.2f}%), "
-                        f"до SHORT: {fmt(d_to_short)} ({pct_to_short:.2f}%)."
-                    )
-                    await broadcast(app, msg)
-                app.bot_data["intro_done"] = True
+                await say(
+                    f"🎯 Пороги входа (<b>TAC 30/70</b>): LONG ≤ <code>{fmt(p30_t)}</code>, SHORT ≥ <code>{fmt(p70_t)}</code>\n"
+                    f"📏 Диапазоны:\n"
+                    f"• STRAT: [{fmt(rng_strat['lower'])} … {fmt(rng_strat['upper'])}] w={fmt(rng_strat['width'])}\n"
+                    f"• TAC (3d): [{fmt(rng_tac['lower'])} … {fmt(rng_tac['upper'])}] w={fmt(rng_tac['width'])} (≈{width_ratio:.0f}% от STRAT)\n"
+                    f"🔓 Пробой STRAT: ↑{fmt(brk_up)} | ↓{fmt(brk_dn)}\n"
+                    f"Текущая: {fmt(px)}. До LONG: {fmt(d_to_long)} ({pct_to_long:.2f}%), "
+                    f"до SHORT: {fmt(d_to_short)} ({pct_to_short:.2f}%)."
+                )
+                B["intro_done"] = True
 
-            pos = app.bot_data.get("position")
+            pos = B.get("position")
 
-            if pos and app.bot_data.get("force_close"):
+            if pos and B.get("force_close"):
                 exit_p = px
                 time_min = (time.time()-pos.open_ts)/60.0
                 net_usd, net_pct = compute_net_pnl(pos, exit_p, fee_taker, fee_maker)
 
-                if broadcast:
-                    await broadcast(app, f"🧰 <b>MANUAL_CLOSE</b>\n"
-                                         f"Цена выхода: <code>{fmt(exit_p)}</code>\n"
-                                         f"P&L (net)≈ {net_usd:+.2f} USD ({net_pct:+.2f}%)\n"
-                                         f"Время в сделке: {time_min:.1f} мин")
+                await say(
+                    f"🧰 <b>MANUAL_CLOSE</b>\n"
+                    f"Цена выхода: <code>{fmt(exit_p)}</code>\n"
+                    f"P&L (net)≈ {net_usd:+.2f} USD ({net_pct:+.2f}%)\n"
+                    f"Время в сделке: {time_min:.1f} мин"
+                )
                 await log_event_safely({
                     "Event_ID": f"MANUAL_CLOSE_{pos.signal_id}", "Signal_ID": pos.signal_id,
                     "Timestamp_UTC": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
@@ -576,9 +603,9 @@ async def scanner_main_loop(app: Application, broadcast):
                     "PNL_Realized_USDT": net_usd, "PNL_Realized_Pct": net_pct,
                     "Time_In_Trade_min": time_min
                 })
-                app.bot_data["force_close"] = False
+                B["force_close"] = False
                 pos.last_sl_notified_price = None
-                app.bot_data["position"] = None
+                B["position"] = None
                 continue
 
             if pos:
@@ -593,11 +620,11 @@ async def scanner_main_loop(app: Application, broadcast):
                         pos.spike_direction = direction
                         pos.spike_deadline_ts = time.time() + CONFIG.SPIKE["RETRACE_WINDOW_SEC"]
                         pos.spike_ref_ohlc = (o, h, l, c)
-                    if broadcast:
-                        await broadcast(app, "📌 Пробой STRAT — обычные усреднения заморожены. Резерв держим на ретест.")
+                    await say("📌 Пробой STRAT — обычные усреднения заморожены. Резерв держим на ретест.")
 
-            if not pos and (app.bot_data.get("manual_open") is not None or not manage_only):
-                manual = app.bot_data.pop("manual_open", None)
+            # Вход
+            if not pos and (B.get("manual_open") is not None or not manage_only):
+                manual = B.pop("manual_open", None)
                 if manual:
                     side_cand = manual.get("side")
                 else:
@@ -624,7 +651,7 @@ async def scanner_main_loop(app: Application, broadcast):
 
                     margin, _ = pos.add_step(px)
                     pos.rebalance_tail_margins_excluding_reserve(bank)
-                    app.bot_data["position"] = pos
+                    B["position"] = pos
 
                     cum_margin = _pos_total_margin(pos)
                     lots = margin_to_lots(symbol, margin, price=px, leverage=pos.leverage)
@@ -642,7 +669,7 @@ async def scanner_main_loop(app: Application, broadcast):
 
                     nxt = next_pct_target(pos)
                     nxt_txt = "N/A" if nxt is None else f"{fmt(nxt['price'])} ({nxt['label']})"
-                    
+
                     total_ord = max(0, min(pos.ord_levels - 1, len(pos.ordinary_targets)))
                     used_ord = max(0, min(total_ord, pos.steps_filled - 1 - (1 if pos.reserve_used else 0)))
                     remaining = max(0, total_ord - used_ord)
@@ -660,18 +687,17 @@ async def scanner_main_loop(app: Application, broadcast):
                                 f"↓<code>{fmt(brk_dn)}</code> ({brk_dn_pct:.2f}%)")
 
                     hdr = f"BMR-DCA {pos.side} ({symbol})" + (" [MANUAL]" if manual else "")
-                    if broadcast:
-                        await broadcast(app,
-                            f"⚡ <b>{hdr}</b>\n"
-                            f"Вход: <code>{fmt(px)}</code> | <b>{lots:.2f} lot</b>\n"
-                            f"Депозит (старт): <b>{cum_margin:.2f} USD</b> | Плечо: <b>{pos.leverage}x</b>\n"
-                            f"TP: <code>{fmt(pos.tp_price)}</code> (+{CONFIG.TP_PCT*100:.2f}%)\n"
-                            f"Ликвидация (est): {liq_arrow}<code>{fmt(liq)}</code> ({dist_txt})\n"
-                            f"{brk_line}\n"
-                            f"След. усреднение: <code>{nxt_txt}</code>\n"
-                            f"Плановый добор: <b>{nxt_dep_txt}</b> (осталось: {remaining} из {total_ord})\n"
-                            f"<i>Контролируй Margin level ≥ 20%</i>"
-                        )
+                    await say(
+                        f"⚡ <b>{hdr}</b>\n"
+                        f"Вход: <code>{fmt(px)}</code> | <b>{lots:.2f} lot</b>\n"
+                        f"Депозит (старт): <b>{cum_margin:.2f} USD</b> | Плечо: <b>{pos.leverage}x</b>\n"
+                        f"TP: <code>{fmt(pos.tp_price)}</code> (+{CONFIG.TP_PCT*100:.2f}%)\n"
+                        f"Ликвидация (est): {liq_arrow}<code>{fmt(liq)}</code> ({dist_txt})\n"
+                        f"{brk_line}\n"
+                        f"След. усреднение: <code>{nxt_txt}</code>\n"
+                        f"Плановый добор: <b>{nxt_dep_txt}</b> (осталось: {remaining} из {total_ord})\n"
+                        f"<i>Контролируй Margin level ≥ 20%</i>"
+                    )
                     await log_event_safely({
                         "Event_ID": f"OPEN_{pos.signal_id}", "Signal_ID": pos.signal_id, "Leverage": pos.leverage,
                         "Timestamp_UTC": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
@@ -687,8 +713,9 @@ async def scanner_main_loop(app: Application, broadcast):
                         "Range_Lower": rng_strat["lower"], "Range_Upper": rng_strat["upper"], "Range_Width": rng_strat["width"]
                     })
 
-            pos = app.bot_data.get("position")
+            pos = B.get("position")
             if pos:
+                # Ретест по пробою
                 if pos.freeze_ordinary and pos.reserve_available and not manage_only:
                     need_retest_slow = (
                         ((pos.side == "SHORT" and px <= rng_strat["upper"] * (1 - CONFIG.REENTRY_BAND)) or
@@ -700,7 +727,7 @@ async def scanner_main_loop(app: Application, broadcast):
                         if pos.spike_ref_ohlc is not None and spike_retrace_ok_ref(pos.spike_direction, pos.spike_ref_ohlc, px):
                             if (pos.side == "LONG" and pos.spike_direction == "down") or (pos.side == "SHORT" and pos.spike_direction == "up"):
                                 need_retest_spike = True
-                    
+
                     if need_retest_slow or need_retest_spike:
                         now_ts = time.time()
                         if pos.last_add_ts is None or (now_ts - pos.last_add_ts) >= CONFIG.ADD_COOLDOWN_SEC:
@@ -708,7 +735,7 @@ async def scanner_main_loop(app: Application, broadcast):
                             pos.spike_flag = False
                             pos.spike_deadline_ts = None
                             pos.spike_ref_ohlc = None
-                            
+
                             lots = margin_to_lots(symbol, margin, price=px, leverage=pos.leverage)
                             cum_margin = _pos_total_margin(pos)
                             cum_notional = cum_margin * pos.leverage
@@ -725,16 +752,15 @@ async def scanner_main_loop(app: Application, broadcast):
                             brk_line = (f"Пробой: ↑<code>{fmt(brk_up)}</code> ({brk_up_pct:.2f}%) | "
                                         f"↓<code>{fmt(brk_dn)}</code> ({brk_dn_pct:.2f}%)")
 
-                            if broadcast:
-                                await broadcast(app,
-                                    f"↩️ Ретест — резервный добор ({'шип' if need_retest_spike else 'плавный'})\n"
-                                    f"Цена: <code>{fmt(px)}</code> | <b>{lots:.2f} lot</b>\n"
-                                    f"Добор (резерв): <b>{margin:.2f} USD</b> | Депозит (тек): <b>{cum_margin:.2f} USD</b>\n"
-                                    f"Средняя: <code>{fmt(pos.avg)}</code> | TP: <code>{fmt(pos.tp_price)}</code>\n"
-                                    f"Ликвидация (est): {liq_arrow}<code>{fmt(liq)}</code> ({dist_txt})\n"
-                                    f"{brk_line}\n"
-                                    f"<i>Контролируй Margin level ≥ 20%</i>"
-                                )
+                            await say(
+                                f"↩️ Ретест — резервный добор ({'шип' if need_retest_spike else 'плавный'})\n"
+                                f"Цена: <code>{fmt(px)}</code> | <b>{lots:.2f} lot</b>\n"
+                                f"Добор (резерв): <b>{margin:.2f} USD</b> | Депозит (тек): <b>{cum_margin:.2f} USD</b>\n"
+                                f"Средняя: <code>{fmt(pos.avg)}</code> | TP: <code>{fmt(pos.tp_price)}</code>\n"
+                                f"Ликвидация (est): {liq_arrow}<code>{fmt(liq)}</code> ({dist_txt})\n"
+                                f"{brk_line}\n"
+                                f"<i>Контролируй Margin level ≥ 20%</i>"
+                            )
                             await log_event_safely({
                                 "Event_ID": f"RETEST_ADD_{pos.signal_id}_{pos.steps_filled}",
                                 "Signal_ID": pos.signal_id,
@@ -743,7 +769,8 @@ async def scanner_main_loop(app: Application, broadcast):
                                 "Step_No": pos.steps_filled, "Step_Margin_USDT": margin,
                                 "Entry_Price": px, "Avg_Price": pos.avg
                             })
-                
+
+                # Обычные усреднения
                 nxt = next_pct_target(pos)
                 trigger = (nxt is not None) and ((pos.side=="LONG" and px <= nxt["price"]) or (pos.side=="SHORT" and px >= nxt["price"]))
 
@@ -752,7 +779,7 @@ async def scanner_main_loop(app: Application, broadcast):
                     if pos.last_add_ts is None or (now_ts - pos.last_add_ts) >= CONFIG.ADD_COOLDOWN_SEC:
                         margin, _ = pos.add_step(px)
                         pos.rebalance_tail_margins_excluding_reserve(bank)
-                        
+
                         lots = margin_to_lots(symbol, margin, price=px, leverage=pos.leverage)
                         cum_margin = _pos_total_margin(pos)
                         cum_notional = cum_margin * pos.leverage
@@ -768,41 +795,37 @@ async def scanner_main_loop(app: Application, broadcast):
 
                         nxt2 = next_pct_target(pos)
                         nxt2_txt = "N/A" if nxt2 is None else f"{fmt(nxt2['price'])} ({nxt2['label']})"
-                        
+
                         total_ord = max(0, min(pos.ord_levels - 1, len(pos.ordinary_targets)))
                         used_ord = max(0, min(total_ord, pos.steps_filled - 1 - (1 if pos.reserve_used else 0)))
                         remaining = max(0, total_ord - used_ord)
-                        
+
                         curr_label = pos.ordinary_targets[used_ord - 1]["label"] if used_ord >= 1 else ""
-                        
+
                         next_idx = used_ord + 1
-                        nxt2_margin = (
-                            pos.step_margins[next_idx]
-                            if next_idx < pos.ord_levels else None
-                        )
+                        nxt2_margin = pos.step_margins[next_idx] if next_idx < pos.ord_levels else None
                         if nxt2_margin:
                             nxt_lots = margin_to_lots(symbol, nxt2_margin, price=px, leverage=pos.leverage)
                             nxt2_dep_txt = f"{nxt2_margin:.2f} USD ≈ {nxt_lots:.2f} lot"
                         else:
-                             nxt2_dep_txt = "N/A"
+                            nxt2_dep_txt = "N/A"
 
                         brk_up, brk_dn = break_levels(rng_strat)
                         brk_up_pct, brk_dn_pct = break_distance_pcts(px, brk_up, brk_dn)
                         brk_line = (f"Пробой: ↑<code>{fmt(brk_up)}</code> ({brk_up_pct:.2f}%) | "
                                     f"↓<code>{fmt(brk_dn)}</code> ({brk_dn_pct:.2f}%)")
 
-                        if broadcast:
-                            await broadcast(app,
-                                f"➕ Усреднение #{pos.steps_filled} [{curr_label}]\n"
-                                f"Цена: <code>{fmt(px)}</code> | <b>{lots:.2f} lot</b>\n"
-                                f"Добор: <b>{margin:.2f} USD</b> | Депозит (тек): <b>{cum_margin:.2f} USD</b>\n"
-                                f"Средняя: <code>{fmt(pos.avg)}</code> | TP: <code>{fmt(pos.tp_price)}</code>\n"
-                                f"Ликвидация (est): {liq_arrow}<code>{fmt(liq)}</code> ({dist_txt})\n"
-                                f"{brk_line}\n"
-                                f"След. усреднение: <code>{nxt2_txt}</code>\n"
-                                f"Плановый добор: <b>{nxt2_dep_txt}</b> (осталось: {remaining} из {total_ord})\n"
-                                f"<i>Контролируй Margin level ≥ 20%</i>"
-                            )
+                        await say(
+                            f"➕ Усреднение #{pos.steps_filled} [{curr_label}]\n"
+                            f"Цена: <code>{fmt(px)}</code> | <b>{lots:.2f} lot</b>\n"
+                            f"Добор: <b>{margin:.2f} USD</b> | Депозит (тек): <b>{cum_margin:.2f} USD</b>\n"
+                            f"Средняя: <code>{fmt(pos.avg)}</code> | TP: <code>{fmt(pos.tp_price)}</code>\n"
+                            f"Ликвидация (est): {liq_arrow}<code>{fmt(liq)}</code> ({dist_txt})\n"
+                            f"{brk_line}\n"
+                            f"След. усреднение: <code>{nxt2_txt}</code>\n"
+                            f"Плановый добор: <b>{nxt2_dep_txt}</b> (осталось: {remaining} из {total_ord})\n"
+                            f"<i>Контролируй Margin level ≥ 20%</i>"
+                        )
                         await log_event_safely({
                             "Event_ID": f"ADD_{pos.signal_id}_{pos.steps_filled}", "Signal_ID": pos.signal_id,
                             "Timestamp_UTC": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
@@ -817,8 +840,9 @@ async def scanner_main_loop(app: Application, broadcast):
                             "Range_Lower": rng_strat["lower"], "Range_Upper": rng_strat["upper"], "Range_Width": rng_strat["width"]
                         })
 
-                if pos.side == "LONG": gain_to_tp = max(0.0, (px / max(pos.avg,1e-9) - 1.0) / CONFIG.TP_PCT)
-                else: gain_to_tp = max(0.0, (pos.avg / max(px,1e-9) - 1.0) / CONFIG.TP_PCT)
+                # Трейлинг
+                gain_to_tp = (px / max(pos.avg,1e-9) - 1.0) / CONFIG.TP_PCT if pos.side == "LONG" else \
+                             (pos.avg / max(px,1e-9) - 1.0) / CONFIG.TP_PCT
 
                 for stage_idx, (arm, lock) in enumerate(CONFIG.TRAILING_STAGES):
                     if pos.trail_stage >= stage_idx:
@@ -830,19 +854,18 @@ async def scanner_main_loop(app: Application, broadcast):
                     chand = chandelier_stop(pos.side, px, ind["atr5m"])
                     new_sl = max(locked, chand) if pos.side=="LONG" else min(locked, chand)
 
-                    tick = app.bot_data.get("price_tick", 1e-4)
-                    new_sl_q  = quantize_to_tick(new_sl, tick)
-                    curr_sl_q = quantize_to_tick(pos.sl_price, tick)
-                    last_notif_q = quantize_to_tick(pos.last_sl_notified_price, tick)
+                    tick_ = B.get("price_tick", 1e-4)
+                    new_sl_q  = quantize_to_tick(new_sl, tick_)
+                    curr_sl_q = quantize_to_tick(pos.sl_price, tick_)
+                    last_notif_q = quantize_to_tick(pos.last_sl_notified_price, tick_)
                     improves = (curr_sl_q is None) or \
                                (pos.side == "LONG"  and new_sl_q > curr_sl_q) or \
                                (pos.side == "SHORT" and new_sl_q < curr_sl_q)
                     if improves:
                         pos.sl_price = new_sl_q
                         pos.trail_stage = stage_idx
-                        if sl_moved_enough(last_notif_q, pos.sl_price, pos.side, tick, CONFIG.SL_NOTIFY_MIN_TICK_STEP):
-                            if broadcast:
-                                await broadcast(app, f"🛡️ Трейлинг-SL (стадия {stage_idx+1}) → <code>{fmt(pos.sl_price)}</code>")
+                        if sl_moved_enough(last_notif_q, pos.sl_price, pos.side, tick_, CONFIG.SL_NOTIFY_MIN_TICK_STEP):
+                            await say(f"🛡️ Трейлинг-SL (стадия {stage_idx+1}) → <code>{fmt(pos.sl_price)}</code>")
                             pos.last_sl_notified_price = pos.sl_price
                             await log_event_safely({
                                 "Event_ID": f"TRAIL_SET_{pos.signal_id}_{int(now)}", "Signal_ID": pos.signal_id,
@@ -851,6 +874,7 @@ async def scanner_main_loop(app: Application, broadcast):
                                 "SL_Price": pos.sl_price, "Avg_Price": pos.avg, "Trail_Stage": stage_idx+1
                             })
 
+                # Выходы
                 tp_hit = (pos.side=="LONG" and px>=pos.tp_price) or (pos.side=="SHORT" and px<=pos.tp_price)
                 sl_hit = pos.sl_price and ((pos.side=="LONG" and px<=pos.sl_price) or (pos.side=="SHORT" and px>=pos.sl_price))
 
@@ -860,12 +884,13 @@ async def scanner_main_loop(app: Application, broadcast):
                     time_min = (time.time()-pos.open_ts)/60.0
                     net_usd, net_pct = compute_net_pnl(pos, exit_p, fee_taker, fee_maker)
                     atr_now = ind["atr5m"]
-                    if broadcast:
-                        await broadcast(app, f"{'✅' if net_usd > 0 else '❌'} <b>{reason}</b>\n"
-                                     f"Цена выхода: <code>{fmt(exit_p)}</code>\n"
-                                     f"P&L (net)≈ {net_usd:+.2f} USD ({net_pct:+.2f}%)\n"
-                                     f"ATR(5m): {atr_now:.6f}\n"
-                                     f"Время в сделке: {time_min:.1f} мин")
+                    await say(
+                        f"{'✅' if net_usd > 0 else '❌'} <b>{reason}</b>\n"
+                        f"Цена выхода: <code>{fmt(exit_p)}</code>\n"
+                        f"P&L (net)≈ {net_usd:+.2f} USD ({net_pct:+.2f}%)\n"
+                        f"ATR(5m): {atr_now:.6f}\n"
+                        f"Время в сделке: {time_min:.1f} мин"
+                    )
                     await log_event_safely({
                         "Event_ID": f"{reason}_{pos.signal_id}", "Signal_ID": pos.signal_id,
                         "Timestamp_UTC": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
@@ -875,7 +900,7 @@ async def scanner_main_loop(app: Application, broadcast):
                         "ATR_5m": atr_now
                     })
                     pos.last_sl_notified_price = None
-                    app.bot_data["position"] = None
+                    B["position"] = None
 
             if (time.time() - last_flush) >= 10:
                 try:
@@ -890,3 +915,30 @@ async def scanner_main_loop(app: Application, broadcast):
             await asyncio.sleep(5)
 
     log.info("BMR-DCA loop gracefully stopped.")
+
+
+# --- helpers exported for /status ---
+def estimate_margin_metrics(pos, px: float, bank: float):
+    used = _pos_total_margin(pos)
+    notional = used * max(1, int(getattr(pos, "leverage", 1) or 1))
+    if getattr(pos, "qty", 0) <= 0 or getattr(pos, "avg", 0) <= 0:
+        unreal = 0.0
+    else:
+        sgn = 1.0 if pos.side == "LONG" else -1.0
+        unreal = (px / pos.avg - 1.0) * sgn * notional
+    equity = bank + unreal
+    free = equity - used
+    ml = (equity / used) * 100.0 if used > 1e-12 else float("inf")
+    return used, equity, free, ml
+
+def fmt2(x: float) -> str:
+    try:
+        if x is None: return "N/A"
+        if isinstance(x, float) and (x != x or x in (float("inf"), float("-inf"))):
+            return "N/A"
+        ax = abs(x)
+        if ax < 1:     return f"{x:.4f}"
+        if ax < 1000:  return f"{x:.2f}"
+        return f"{x:.0f}"
+    except Exception:
+        return "N/A"
