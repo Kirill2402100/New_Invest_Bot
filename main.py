@@ -5,7 +5,7 @@ import logging
 from typing import Optional
 import inspect
 
-from telegram import Update, constants, BotCommand, BotCommandScopeAllGroupChats, BotCommandScopeAllPrivateChats, BotCommandScopeChat
+from telegram import Update, constants, BotCommand, BotCommandScopeAllGroupChats, BotCommandScopeAllPrivateChats, BotCommandScopeChat, MenuButtonCommands
 from telegram.ext import Application, ApplicationBuilder, CommandHandler, ContextTypes, PicklePersistence
 
 # --- Logging FIRST ---
@@ -50,49 +50,56 @@ except ImportError:
         return used, equity, free, ml
 
 # --- Configuration ---
-BOT_VERSION = "BMR-DCA FX v2.1 (Robust Spawner)"
+BOT_VERSION = "BMR-DCA FX v2.3 (Multi-Engine Safe)"
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN env var is not set")
 
-# --- Universal Scanner Spawner ---
+# --- Engine Compatibility Helpers ---
+def _engine_supports_multi() -> bool:
+    """Движок поддерживает символ/чат, если принимает kwargs
+    symbol_override и target_chat_id ИЛИ хотя бы 5 позиционных аргументов."""
+    try:
+        sig = inspect.signature(scanner_engine.scanner_main_loop)
+        names = list(sig.parameters.keys())
+        kw = set(names)
+        return {"symbol_override", "target_chat_id"}.issubset(kw) or len(names) >= 5
+    except Exception:
+        log.warning("Could not inspect scanner signature, assuming single-mode.")
+        return False
+
 def _spawn_scanner_task(app: Application, symbol: Optional[str], chat_id: Optional[int], box: Optional[dict]):
     fn = scanner_engine.scanner_main_loop
-    params = getattr(inspect, "signature", lambda f: None)(fn)
-    param_names = set(params.parameters.keys()) if params else set()
+    try:
+        sig = inspect.signature(fn)
+        param_names = set(sig.parameters.keys())
+    except Exception:
+        param_names = set()
 
-    # 1) If the function supports keyword arguments, pass only those that are present
-    if param_names:
-        kwargs = {}
-        if "symbol_override" in param_names:
-            kwargs["symbol_override"] = symbol
-        if "target_chat_id" in param_names:
-            kwargs["target_chat_id"] = chat_id
-        if "botbox" in param_names:
-            kwargs["botbox"] = box
-        if kwargs:
-            log.info(f"Spawning scanner for {symbol or 'default'} with kwargs {list(kwargs.keys())}.")
-            return asyncio.create_task(fn(app, broadcast, **kwargs))
+    # Сначала пробуем kwargs-версии
+    kwargs = {}
+    if "symbol_override" in param_names: kwargs["symbol_override"] = symbol
+    if "target_chat_id" in param_names: kwargs["target_chat_id"] = chat_id
+    if "botbox" in param_names: kwargs["botbox"] = box
+    if kwargs:
+        log.info(f"Spawning scanner for {symbol or 'default'} with kwargs {list(kwargs.keys())}.")
+        return asyncio.create_task(fn(app, broadcast, **kwargs))
 
-    # 2) Try 5 positional arguments (old extended version)
+    # Затем — 5, 3, 2 позиционных
     try:
         log.info(f"Spawning scanner for {symbol or 'default'} with 5 positional args.")
         return asyncio.create_task(fn(app, broadcast, symbol, chat_id, box))
     except TypeError:
         pass
-
-    # 3) Try 3 positional arguments (app, broadcast, box)
     try:
         log.info(f"Spawning scanner for {symbol or 'default'} with 3 positional args.")
         return asyncio.create_task(fn(app, broadcast, box))
     except TypeError:
         pass
 
-    # 4) Fallback: simple signature (app, broadcast)
     log.warning(f"Spawning scanner for {symbol or 'default'} with 2 positional args (fallback).")
     return asyncio.create_task(fn(app, broadcast))
-
 
 # --- Multi-Session Helpers ---
 def _parse_chat_symbols_env() -> list[tuple[int, str]]:
@@ -131,7 +138,7 @@ def _any_loop_running(app: Application) -> bool:
     t = app.bot_data.get("_main_loop_task")
     return bool(t and not t.done())
 
-# --- Utilities ---
+# --- Bot Initialization and Lifecycle ---
 async def post_init(app: Application):
     try:
         await app.bot.delete_webhook(drop_pending_updates=True)
@@ -159,25 +166,34 @@ async def post_init(app: Application):
         BotCommand("close", "Закрыть текущую позицию"),
         BotCommand("setbank", "Установить банк для вашего символа"),
     ]
+
+    for scope in (BotCommandScopeAllPrivateChats(), BotCommandScopeAllGroupChats()):
+        try: await app.bot.delete_my_commands(scope=scope)
+        except Exception as e: log.warning(f"delete_my_commands({scope}) failed: {e}")
+    try: await app.bot.delete_my_commands()
+    except Exception as e: log.warning(f"delete_my_commands(default) failed: {e}")
+
     await app.bot.set_my_commands(CMDS, scope=BotCommandScopeAllGroupChats())
     await app.bot.set_my_commands(CMDS, scope=BotCommandScopeAllPrivateChats())
     await app.bot.set_my_commands(CMDS)
-    
+
+    try: await app.bot.set_chat_menu_button(menu_button=MenuButtonCommands())
+    except Exception as e: log.warning(f"set_chat_menu_button(default) failed: {e}")
+
     pairs = _parse_chat_symbols_env()
     for chat_id, _ in pairs:
         try:
+            await app.bot.delete_my_commands(scope=BotCommandScopeChat(chat_id))
             await app.bot.set_my_commands(CMDS, scope=BotCommandScopeChat(chat_id))
-            log.info(f"Set commands specifically for chat {chat_id}")
+            await app.bot.set_chat_menu_button(chat_id=chat_id, menu_button=MenuButtonCommands())
+            log.info(f"Commands & menu set for chat {chat_id}")
         except Exception as e:
-            log.warning(f"set_my_commands for chat {chat_id} failed: {e}")
+            log.warning(f"Per-chat commands/menu for {chat_id} failed: {e}")
 
 async def broadcast(app: Application, txt: str, target_chat_id: int | None = None):
     chat_ids = set(app.bot_data.get('chat_ids', set()))
-    if target_chat_id:
-        chat_ids.add(target_chat_id)
-    
+    if target_chat_id: chat_ids.add(target_chat_id)
     targets = [target_chat_id] if target_chat_id else list(chat_ids)
-    
     for cid in targets:
         try:
             await app.bot.send_message(chat_id=cid, text=txt, parse_mode=constants.ParseMode.HTML)
@@ -185,13 +201,25 @@ async def broadcast(app: Application, txt: str, target_chat_id: int | None = Non
             log.error(f"Не удалось отправить сообщение в чат {cid}: {e}")
             if "bot was blocked" in str(e).lower() or "chat not found" in str(e).lower():
                 chat_ids.discard(cid)
-                log.info(f"Чат {cid} удален из рассылки (бот заблокирован).")
+                log.info(f"Чат {cid} удален из рассылки.")
     app.bot_data['chat_ids'] = chat_ids
 
 async def start_symbol_loops(app: Application):
+    app.bot_data["bot_on"] = True
     pairs = _parse_chat_symbols_env()
+    supports_multi = _engine_supports_multi()
+
+    if not supports_multi:
+        if pairs:
+            log.warning("Engine has no multi-session API; ignoring CHAT_SYMBOLS and running single-mode.")
+        box = {"bot_on": True, "scan_paused": False}
+        task = _spawn_scanner_task(app, None, None, box)
+        app.bot_data["_main_loop_task"] = task
+        app.bot_data["_main_loop_box"] = box
+        return
+
     if not pairs:
-        log.warning("CHAT_SYMBOLS пуст — запускается одиночный цикл.")
+        log.warning("CHAT_SYMBOLS is empty — running single-mode.")
         box = {"bot_on": True, "scan_paused": False}
         task = _spawn_scanner_task(app, None, None, box)
         app.bot_data["_main_loop_task"] = task
@@ -204,7 +232,6 @@ async def start_symbol_loops(app: Application):
         if rec and rec.get("task") and not rec["task"].done():
             log.warning(f"Loop for {symbol} already running. Skipping.")
             continue
-
         box = {"bot_on": True, "scan_paused": False}
         task = _spawn_scanner_task(app, symbol, chat_id, box)
         app.bot_data["loops"][symbol] = {"task": task, "box": box, "chat_id": chat_id}
@@ -228,6 +255,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_run(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     app = ctx.application
+    app.bot_data["bot_on"] = True
     if _any_loop_running(app):
         await update.message.reply_text("ℹ️ Сканеры уже запущены. Для остановки используйте /stop.")
         return
@@ -236,6 +264,7 @@ async def cmd_run(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     app = ctx.application
+    app.bot_data["bot_on"] = False
     if not _any_loop_running(app):
         await update.message.reply_text("ℹ️ Сканеры уже остановлены.")
         return
