@@ -7,19 +7,57 @@ from typing import Optional
 from telegram import Update, constants, BotCommand
 from telegram.ext import Application, ApplicationBuilder, CommandHandler, ContextTypes, PicklePersistence
 
+# --- Logging FIRST (до фоллбек-импорта) ---
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+logging.getLogger("httpx").setLevel(logging.WARNING)
+log = logging.getLogger("bot")
+
+# --- Imports with Fallback ---
 import scanner_bmr_dca as scanner_engine
-from scanner_bmr_dca import CONFIG, estimate_margin_metrics, fmt2
+from scanner_bmr_dca import CONFIG
+
+try:
+    from scanner_bmr_dca import estimate_margin_metrics, fmt2
+except ImportError:
+    log.warning("Could not import helpers from scanner_engine. Using fallbacks in main.py.")
+    # --- Fallbacks if the module does not contain these functions ---
+    def fmt2(x: float) -> str:
+        try:
+            if x is None: return "N/A"
+            if isinstance(x, float) and (x != x or x == float("inf") or x == float("-inf")):
+                return "N/A"
+            ax = abs(x)
+            if ax < 1:     return f"{x:.4f}"
+            if ax < 1000:  return f"{x:.2f}"
+            return f"{x:.0f}"
+        except Exception:
+            return "N/A"
+
+    def _pos_total_margin(pos):
+        ord_used = sum(pos.step_margins[:min(pos.steps_filled, getattr(pos, 'ord_levels', pos.steps_filled))])
+        res = pos.reserve_margin_usdt if getattr(pos, 'reserve_used', False) else 0.0
+        return ord_used + res
+
+    def estimate_margin_metrics(pos, px: float, bank: float):
+        used = _pos_total_margin(pos)
+        notional = used * max(1, int(getattr(pos, "leverage", 1) or 1))
+        if getattr(pos, "qty", 0) <= 0 or getattr(pos, "avg", 0) <= 0:
+            unreal = 0.0
+        else:
+            sgn = 1.0 if pos.side == "LONG" else -1.0
+            unreal = (px / pos.avg - 1.0) * sgn * notional
+        equity = bank + unreal
+        free = equity - used
+        ml = (equity / used) * 100.0 if used > 1e-12 else float("inf")
+        return used, equity, free, ml
 
 # --- Configuration ---
-BOT_VERSION = "BMR-DCA FX v1.6 (Final Polished)"
+BOT_VERSION = "BMR-DCA FX v1.7 (Stable)"
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN env var is not set")
 
-log = logging.getLogger("bot")
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-logging.getLogger("httpx").setLevel(logging.WARNING)
 
 # --- Multi-Session Helpers ---
 def _parse_chat_symbols_env() -> list[tuple[int, str]]:
@@ -288,7 +326,7 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         
         reserved_used = bool(getattr(pos, "reserve_used", False))
         reserved_available = bool(getattr(pos, "reserve_available", False) and not reserved_used)
-        total_ord = max(0, getattr(pos, "ord_levels", 0) -1)
+        total_ord = max(0, min(getattr(pos, "ord_levels", 0) - 1, len(getattr(pos, "ordinary_targets", []))))
         used_ord = max(0, min(total_ord, pos.steps_filled - 1 - (1 if reserved_used else 0)))
         ordinary_left = max(0, total_ord - used_ord)
         reserve_left = 1 if reserved_available else 0
