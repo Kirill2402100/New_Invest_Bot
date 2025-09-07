@@ -3,9 +3,8 @@ httpx==0.25.2
 h2==4.1.0
 hpack==4.0.0
 hyperframe==6.0.1
-
 pandas==2.2.2
 numpy==1.26.4
-pandas-ta==0.3.14b0
 gspread==6.1.2
 google-auth==2.29.0
+pandas-ta @ git+https://github.com/twopirllc/pandas-ta@0.3.14b0
