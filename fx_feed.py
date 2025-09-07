@@ -1,63 +1,119 @@
 # fx_feed.py
 from __future__ import annotations
-import os, time, math
-from typing import Optional, Tuple
+import os
+from typing import Optional, Dict, Any
+
 import httpx
 import pandas as pd
 
+# ===== API KEYS =====
 TD_KEY = os.getenv("TWELVEDATA_API_KEY", "").strip()
 AV_KEY = os.getenv("ALPHAVANTAGE_API_KEY", "").strip()
 
-# ---- ВСПОМОГАТЕЛЬНОЕ ----
+# ===== Helpers =====
 def _pair_from_symbol(sym: str) -> str:
-    """Ваши символы из CHAT_SYMBOLS: EUR, GBP, AUD, JPY -> полноценные пары."""
+    """
+    Преобразует короткие обозначения (EUR, GBP, AUD, JPY) в пары к USD.
+    Иначе возвращает исходное (например, EURUSD / USDJPY).
+    """
     s = sym.upper()
     m = {
         "EUR": "EURUSD",
         "GBP": "GBPUSD",
         "AUD": "AUDUSD",
-        "JPY": "USDJPY",  # важный особый случай
+        "JPY": "USDJPY",  # особый случай для иены
     }
     return m.get(s, s)
 
 def _td_symbol(pair: str) -> str:
-    """TwelveData ждёт формат USD/JPY."""
+    """TwelveData ожидает формат 'EUR/USD'."""
     p = pair.upper()
-    return f"{p[:3]}/{p[3:]}"
+    base, quote = p[:3], p[3:]
+    return f"{base}/{quote}"
 
-def _norm_df(rows, ts_key="datetime"):
+def _normalize_df(rows: list[Dict[str, Any]], ts_key: str = "datetime") -> pd.DataFrame:
+    """
+    Преобразует список словарей TwelveData/AV в DataFrame c индексом-временем (UTC)
+    и столбцами [open, high, low, close, volume].
+    """
+    if not rows:
+        return pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
+
     df = pd.DataFrame(rows)
     df[ts_key] = pd.to_datetime(df[ts_key], utc=True)
     df = df.set_index(ts_key).sort_index()
-    # привести имена столбцов к привычным
-    rename = {"open":"open","high":"high","low":"low","close":"close","volume":"volume"}
-    for k in ("open","high","low","close"):
-        df[k] = pd.to_numeric(df[k], errors="coerce")
-    if "volume" not in df.columns:
-        df["volume"] = 0.0
-    return df[["open","high","low","close","volume"]]
 
-# ---- TWELVE DATA ----
-def _fetch_td(pair: str, interval: str="1min", bars: int=2000) -> Optional[pd.DataFrame]:
-    if not TD_KEY: return None
+    for k in ("open", "high", "low", "close", "volume"):
+        if k not in df.columns:
+            df[k] = 0.0
+    for k in ("open", "high", "low", "close", "volume"):
+        df[k] = pd.to_numeric(df[k], errors="coerce")
+
+    return df[["open", "high", "low", "close", "volume"]]
+
+def _resample_ohlc(df: pd.DataFrame, rule: str) -> pd.DataFrame:
+    """
+    Ресэмплинг минутных/часовых данных в OHLC.
+    Используется, например, для 4H из 60min у Alpha Vantage.
+    """
+    if df.empty:
+        return df
+    o = df["open"].resample(rule).first()
+    h = df["high"].resample(rule).max()
+    l = df["low"].resample(rule).min()
+    c = df["close"].resample(rule).last()
+    v = df["volume"].resample(rule).sum(min_count=1)
+    out = pd.concat([o, h, l, c, v], axis=1)
+    out.columns = ["open", "high", "low", "close", "volume"]
+    out = out.dropna(subset=["open", "high", "low", "close"])
+    return out
+
+# ===== Twelve Data =====
+def _fetch_td(pair: str, interval: str = "1min", bars: int = 2000) -> Optional[pd.DataFrame]:
+    if not TD_KEY:
+        return None
     url = "https://api.twelvedata.com/time_series"
     params = {
         "symbol": _td_symbol(pair),
-        "interval": interval,
-        "outputsize": bars,
+        "interval": interval,           # 1min,5min,15min,30min,1h,4h,1day
+        "outputsize": bars,             # сколько баров вернуть
+        "timezone": "UTC",
         "apikey": TD_KEY,
     }
-    with httpx.Client(timeout=15) as c:
-        r = c.get(url, params=params)
-    data = r.json()
-    if "values" not in data:
-        # ошибки TD возвращаются в {"code":..., "message": "..."}
+    try:
+        with httpx.Client(timeout=20) as c:
+            r = c.get(url, params=params)
+            r.raise_for_status()
+        data = r.json()
+    except Exception:
         return None
-    return _norm_df(data["values"])
 
-# ---- ALPHA VANTAGE ----
-def _fetch_av(pair: str, interval: str="1min", full: bool=True) -> Optional[pd.DataFrame]:
-    if not AV_KEY: return None
+    # Ошибка у TD приходит как {"code": ..., "message": "..."}
+    if not isinstance(data, dict) or "values" not in data:
+        return None
+
+    values = data["values"]
+    # Приведение формата к единому виду
+    rows = []
+    for row in values:
+        rows.append({
+            "datetime": row.get("datetime"),
+            "open": row.get("open"),
+            "high": row.get("high"),
+            "low": row.get("low"),
+            "close": row.get("close"),
+            "volume": row.get("volume", 0.0),
+        })
+    rows.reverse()  # TD отдаёт от нового к старому — перевернём
+    return _normalize_df(rows)
+
+# ===== Alpha Vantage =====
+def _fetch_av_intraday(pair: str, interval: str = "60min", full: bool = True) -> Optional[pd.DataFrame]:
+    """
+    FX_INTRADAY: интервалы 1min,5min,15min,30min,60min.
+    """
+    if not AV_KEY:
+        return None
     base, quote = pair[:3], pair[3:]
     url = "https://www.alphavantage.co/query"
     params = {
@@ -68,65 +124,159 @@ def _fetch_av(pair: str, interval: str="1min", full: bool=True) -> Optional[pd.D
         "outputsize": "full" if full else "compact",
         "apikey": AV_KEY,
     }
-    with httpx.Client(timeout=20) as c:
-        r = c.get(url, params=params)
-    j = r.json()
-    # признак лимита у AV — ключ "Note"
-    if "Note" in j or "Information" in j:
+    try:
+        with httpx.Client(timeout=25) as c:
+            r = c.get(url, params=params)
+            r.raise_for_status()
+        j = r.json()
+    except Exception:
         return None
+
+    # Признаки лимита/ошибок
+    if not isinstance(j, dict) or "Note" in j or "Information" in j:
+        return None
+
     key = f"Time Series FX ({interval})"
     ts = j.get(key)
-    if not ts: return None
-    # ts = { "2025-09-07 14:22:00": { "1. open": "...", ...}, ...}
+    if not isinstance(ts, dict):
+        return None
+
+    rows = []
+    # AV отдаёт "YYYY-mm-dd HH:MM:SS" -> {"1. open": "...", ...}
+    for t, ohlc in ts.items():
+        try:
+            rows.append({
+                "datetime": pd.to_datetime(t, utc=True),
+                "open": float(ohlc["1. open"]),
+                "high": float(ohlc["2. high"]),
+                "low":  float(ohlc["3. low"]),
+                "close":float(ohlc["4. close"]),
+                "volume": 0.0,
+            })
+        except Exception:
+            continue
+    rows.sort(key=lambda x: x["datetime"])
+    return _normalize_df(rows)
+
+def _fetch_av_daily(pair: str, full: bool = True) -> Optional[pd.DataFrame]:
+    """
+    FX_DAILY: дневные бары.
+    """
+    if not AV_KEY:
+        return None
+    base, quote = pair[:3], pair[3:]
+    url = "https://www.alphavantage.co/query"
+    params = {
+        "function": "FX_DAILY",
+        "from_symbol": base,
+        "to_symbol": quote,
+        "outputsize": "full" if full else "compact",
+        "apikey": AV_KEY,
+    }
+    try:
+        with httpx.Client(timeout=25) as c:
+            r = c.get(url, params=params)
+            r.raise_for_status()
+        j = r.json()
+    except Exception:
+        return None
+
+    if not isinstance(j, dict) or "Note" in j or "Information" in j:
+        return None
+
+    ts = j.get("Time Series FX (Daily)")
+    if not isinstance(ts, dict):
+        return None
+
     rows = []
     for t, ohlc in ts.items():
-        rows.append({
-            "datetime": pd.to_datetime(t, utc=True),
-            "open": float(ohlc["1. open"]),
-            "high": float(ohlc["2. high"]),
-            "low":  float(ohlc["3. low"]),
-            "close":float(ohlc["4. close"]),
-            "volume": 0.0,
-        })
+        try:
+            rows.append({
+                "datetime": pd.to_datetime(t, utc=True),
+                "open": float(ohlc["1. open"]),
+                "high": float(ohlc["2. high"]),
+                "low":  float(ohlc["3. low"]),
+                "close":float(ohlc["4. close"]),
+                "volume": 0.0,
+            })
+        except Exception:
+            continue
     rows.sort(key=lambda x: x["datetime"])
-    return _norm_df(rows)
+    return _normalize_df(rows)
 
-# ---- ПУБЛИЧНАЯ ФУНКЦИЯ ----
-def fetch_fx_ohlcv(sym_or_pair: str, interval: str="1min", bars: int=2000) -> pd.DataFrame:
+# ===== Public API =====
+def fetch_fx_ohlcv(sym_or_pair: str, interval: str = "1min", bars: int = 2000) -> pd.DataFrame:
     """
-    Возвращает DataFrame с индексом-временем и колонками [open,high,low,close,volume].
-    sym_or_pair: 'EUR' -> EURUSD, 'USDJPY' -> USDJPY и т.п.
-    Интервалы:
+    Возвращает DataFrame с индексом времени (UTC) и колонками:
+    [open, high, low, close, volume].
+
+    interval:
       TwelveData: 1min,5min,15min,30min,1h,4h,1day
-      AlphaVantage: 1min,5min,15min,30min,60min
+      Alpha Vantage: 1min,5min,15min,30min,60min (+ daily отдельно)
+
+    bars: желаемое количество баров (если провайдер умеет ограничивать).
     """
     pair = sym_or_pair.upper()
-    if len(pair) == 3:  # EUR/GBP/AUD/JPY короткий вид из CHAT_SYMBOLS
+    if len(pair) == 3:  # короткие имена из CHAT_SYMBOLS
         pair = _pair_from_symbol(pair)
 
-    # 1) TwelveData
+    # --- Попытка №1: Twelve Data (напрямую нужный интервал) ---
     df = _fetch_td(pair, interval=interval, bars=bars)
-    if isinstance(df, pd.DataFrame) and len(df):
+    if isinstance(df, pd.DataFrame) and not df.empty:
         return df
 
-    # 2) Alpha Vantage (интервалы 60min вместо 1h и т.п.)
-    av_interval = interval.replace("h", "0min") if interval.endswith("h") else interval
-    df = _fetch_av(pair, interval=av_interval, full=True)
-    if isinstance(df, pd.DataFrame) and len(df):
-        return df
+    # --- Попытка №2: Alpha Vantage ---
+    # Дневки — отдельная функция
+    if interval in ("1day", "1d", "D"):
+        df = _fetch_av_daily(pair, full=True)
+        if isinstance(df, pd.DataFrame) and not df.empty:
+            return df
+        raise RuntimeError(f"FX feed failed for {pair} (providers exhausted for daily)")
+
+    # Для 4h у AV прямого интервала нет — берём 60min и ресемплим
+    if interval == "4h":
+        base_df = _fetch_av_intraday(pair, interval="60min", full=True)
+        if isinstance(base_df, pd.DataFrame) and not base_df.empty:
+            return _resample_ohlc(base_df, "4H")
+
+    # Для 1h — берём 60min
+    if interval in ("1h", "60min"):
+        df = _fetch_av_intraday(pair, interval="60min", full=True)
+        if isinstance(df, pd.DataFrame) and not df.empty:
+            return df
+
+    # Прочие интервалы: 1min/5min/15min/30min
+    if interval in ("1min", "5min", "15min", "30min"):
+        df = _fetch_av_intraday(pair, interval=interval, full=True)
+        if isinstance(df, pd.DataFrame) and not df.empty:
+            return df
 
     raise RuntimeError(f"FX feed failed for {pair} (providers exhausted)")
-    # ---- алиасы интервалов (чтобы "5m" -> "5min", "1h" оставался "1h" и т.д.)
-_INTERVAL_ALIASES = {
-    "1m": "1min", "5m": "5min", "15m": "15min", "30m": "30min",
-    "1h": "1h", "2h": "2h", "4h": "4h", "1d": "1day", "1D": "1day"
+
+# Обёртка под старую сигнатуру сканера:
+# fetch_ohlcv(symbol, timeframe, limit)
+_TF_MAP = {
+    "1m": "1min",
+    "5m": "5min",
+    "15m": "15min",
+    "30m": "30min",
+    "1h": "1h",
+    "4h": "4h",
+    "1d": "1day",
+    "D": "1day",
 }
-def _norm_interval(iv: str) -> str:
-    return _INTERVAL_ALIASES.get(iv.strip(), iv)
 
-# (по желанию) можно внутри _fetch_td/_fetch_av использовать _norm_interval(interval)
+def fetch_ohlcv(symbol: str, timeframe: str, limit: int | None = 2000) -> pd.DataFrame:
+    """
+    Совместимо со старым вызовом (как было у yfinance-обёртки в проекте):
+      fetch_ohlcv(symbol='USDJPY', timeframe='5m', limit=1200)
+    """
+    interval = _TF_MAP.get(timeframe, timeframe)
+    bars = int(limit or 2000)
+    return fetch_fx_ohlcv(symbol, interval=interval, bars=bars)
 
-def fetch_ohlcv(sym_or_pair: str, interval: str = "1m", limit: int = 2000):
-    """Совместимый алиас для scanner_bmr_dca: принимает limit, а не bars."""
-    interval = _norm_interval(interval)
-    return fetch_fx_ohlcv(sym_or_pair, interval=interval, bars=limit)
+
+__all__ = [
+    "fetch_fx_ohlcv",
+    "fetch_ohlcv",
+]
