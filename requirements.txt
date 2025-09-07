@@ -7,4 +7,4 @@ pandas==2.2.2
 numpy==1.26.4
 gspread==6.1.2
 google-auth==2.29.0
-pandas-ta @ git+https://github.com/twopirllc/pandas-ta@0.3.14b0
+pandas-ta @ https://github.com/twopirllc/pandas-ta/archive/refs/tags/0.3.14b0.tar.gz
