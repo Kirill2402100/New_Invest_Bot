@@ -1,10 +1,10 @@
-python-telegram-bot
-pandas
-pandas-ta
+python-telegram-bot>=20,<21
+pandas>=2.0,<3.0
+pandas-ta>=0.3.14b
 xgboost
 scikit-learn
 joblib
-ccxt
 gspread==5.12.0
 oauth2client
 numpy~=1.26.4
+yfinance>=0.2.40
