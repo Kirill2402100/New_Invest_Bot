@@ -11,7 +11,8 @@ import gspread
 
 # ИЗМЕНЕНО: импорты для Forex
 from fx_mt5_adapter import FX, margin_to_lots, lots_to_margin, default_tick
-from fx_feed import fetch_fx_ohlcv as fetch_ohlcv_yf  # <-- ВАЖНО: правильная функция
+# ДОЛЖНО БЫТЬ
+from fx_feed import fetch_ohlcv as fetch_ohlcv_yf
 
 import trade_executor
 
