@@ -345,15 +345,21 @@ async def build_range_from_df(df: Optional[pd.DataFrame]):
     return {"lower": lower, "upper": upper, "mid": mid, "atr1h": atr1h, "width": upper-lower}
 
 async def build_ranges(symbol: str):
-    s_df_task = asyncio.create_task(maybe_await(fetch_ohlcv_yf, symbol, CONFIG.TF_RANGE, CONFIG.STRATEGIC_LOOKBACK_DAYS * 24))
-    t_df_task = asyncio.create_task(maybe_await(fetch_ohlcv_yf, symbol, CONFIG.TF_RANGE, CONFIG.TACTICAL_LOOKBACK_DAYS * 24))
-    s_df, t_df = await asyncio.gather(s_df_task, t_df_task)
+    # Раньше было два параллельных запроса одного и того же ТФ
+    max_bars = max(CONFIG.STRATEGIC_LOOKBACK_DAYS, CONFIG.TACTICAL_LOOKBACK_DAYS) * 24
+    full_df = await maybe_await(fetch_ohlcv_yf, symbol, CONFIG.TF_RANGE, limit=max_bars)
+
+    # разрезаем один датафрейм на стратегию и тактику
+    s_tail = CONFIG.STRATEGIC_LOOKBACK_DAYS * 24
+    t_tail = CONFIG.TACTICAL_LOOKBACK_DAYS * 24
+    s_df = full_df.tail(s_tail)
+    t_df = full_df.tail(t_tail)
 
     s_task = asyncio.create_task(build_range_from_df(s_df))
     t_task = asyncio.create_task(build_range_from_df(t_df))
     strat, tac = await asyncio.gather(s_task, t_task)
     return strat, tac
-
+    
 def compute_indicators_5m(df: pd.DataFrame) -> dict:
     atr5m = ta.atr(df["high"], df["low"], df["close"], length=14).iloc[-1]
     rsi = ta.rsi(df["close"], length=CONFIG.RSI_LEN).iloc[-1]
