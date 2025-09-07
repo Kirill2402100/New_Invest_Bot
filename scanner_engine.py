@@ -1,5 +1,3 @@
-# scanner_engine.py
-
 import asyncio
 import time
 import logging
@@ -52,21 +50,21 @@ class CONFIG:
     ATR_COOLDOWN_BARS = 3
     
     # --- Параметры стратегии и риска ---
-    SL_FIXED_PCT = 1.0              # Фиксированный стоп-лосс в процентах
-    TP_FIXED_PCT = 2.0              # Фиксированный тейк-профит в процентах
+    SL_FIXED_PCT = 1.0         # Фиксированный стоп-лосс в процентах
+    TP_FIXED_PCT = 2.0         # Фиксированный тейк-профит в процентах
     
     # --- Параметры двухэтапного переноса стопа ---
-    TRAIL_TRIGGER_PCT = 1.2         # % прибыли для активации 2-го переноса стопа
-    TRAIL_PROFIT_LOCK_PCT = 1.0     # % прибыли для фиксации на 2-м этапе
-    SECOND_TRAIL_TRIGGER_PCT = 0.7  # % прибыли для активации 1-го переноса стопа
-    SECOND_TRAIL_LOCK_PCT = 0.3     # % прибыли для фиксации на 1-м этапе
+    TRAIL_TRIGGER_PCT = 1.2        # % прибыли для активации 2-го переноса стопа
+    TRAIL_PROFIT_LOCK_PCT = 1.0    # % прибыли для фиксации на 2-м этапе
+    SECOND_TRAIL_TRIGGER_PCT = 0.7 # % прибыли для активации 1-го переноса стопа
+    SECOND_TRAIL_LOCK_PCT = 0.3    # % прибыли для фиксации на 1-м этапе
 
     # --- Дополнительные фильтры и выходы ---
-    STOCH_ENTRY_OVERSOLD = 25       # Stoch RSI должен быть НИЖЕ этого уровня для входа в LONG
-    STOCH_ENTRY_OVERBOUGHT = 75     # Stoch RSI должен быть ВЫШЕ этого уровня для входа в SHORT
-    IMPULSE_CANDLE_ATR_MULT = 1.5   # Макс. размер свечи входа (в ATR) для отсечения аномалий
-    TIME_STOP_MINUTES = 30          # Макс. время в сделке (в минутах) до проверки MFE
-    TIME_STOP_MFE_THRESHOLD = 0.3   # Порог MFE. Если цена не прошла 30% пути к TP, сделка закроется по тайм-стопу
+    STOCH_ENTRY_OVERSOLD = 25      # Stoch RSI должен быть НИЖЕ этого уровня для входа в LONG
+    STOCH_ENTRY_OVERBOUGHT = 75    # Stoch RSI должен быть ВЫШЕ этого уровня для входа в SHORT
+    IMPULSE_CANDLE_ATR_MULT = 1.5  # Макс. размер свечи входа (в ATR) для отсечения аномалий
+    TIME_STOP_MINUTES = 30         # Макс. время в сделке (в минутах) до проверки MFE
+    TIME_STOP_MFE_THRESHOLD = 0.3  # Порог MFE. Если цена не прошла 30% пути к TP, сделка закроется по тайм-стопу
 
     # --- Системные параметры ---
     SCANNER_INTERVAL_SECONDS = 300
@@ -127,6 +125,7 @@ def format_price(price: float) -> str:
     if price < 0.01: return f"{price:.6f}"
     elif price < 1.0: return f"{price:.5f}"
     else: return f"{price:.4f}"
+
 async def get_market_regime(exchange: ccxt.Exchange, app: Application) -> Optional[bool]:
     bot_data = app.bot_data
     now = time.time()
@@ -137,6 +136,7 @@ async def get_market_regime(exchange: ccxt.Exchange, app: Application) -> Option
     regime = await _is_bull_market_uncached(exchange)
     bot_data["market_regime_cache"] = {'regime': regime, 'timestamp': now}
     return regime
+
 async def _is_bull_market_uncached(exchange: ccxt.Exchange) -> Optional[bool]:
     try:
         btc_ohlcv = await exchange.fetch_ohlcv("BTC/USDT:USDT", "4h", limit=250)
@@ -152,12 +152,14 @@ async def _is_bull_market_uncached(exchange: ccxt.Exchange) -> Optional[bool]:
     except Exception as e:
         log.error(f"Could not determine market regime: {e}")
         return None
+
 def tf_seconds(tf: str) -> int:
     unit = tf[-1].lower(); n = int(tf[:-1])
     if unit == "m": return n * 60
     if unit == "h": return n * 3600
     if unit == "d": return n * 86400
     return 0
+
 def fixed_percentage_levels(symbol: str, entry: float, side: str, exchange: ccxt.Exchange) -> tuple[float, float]:
     """Calculates SL/TP and rounds them to the exchange's price precision."""
     if side == "LONG":
@@ -190,11 +192,9 @@ def check_entry_conditions(df: pd.DataFrame) -> Optional[str]:
     is_uptrend = last['close'] > ema_trend * buffer
     is_downtrend = last['close'] < ema_trend / buffer
 
-    # ИЗМЕНЕНО: Stoch RSI должен не просто развернуться, а выйти из зоны перепроданности
     if is_uptrend and ema_fast > ema_slow and k_prev < CONFIG.STOCH_ENTRY_OVERSOLD and k_now > CONFIG.STOCH_ENTRY_OVERSOLD:
         return "LONG"
     
-    # ИЗМЕНЕНО: Аналогично для шорта - выход из зоны перекупленности
     if is_downtrend and ema_fast < ema_slow and k_prev > CONFIG.STOCH_ENTRY_OVERBOUGHT and k_now < CONFIG.STOCH_ENTRY_OVERBOUGHT:
         return "SHORT"
         
@@ -203,6 +203,13 @@ def check_entry_conditions(df: pd.DataFrame) -> Optional[str]:
 # ===========================================================================
 # MARKET SCANNER & TRADE MANAGER
 # ===========================================================================
+def _is_swap(sym, exchange):
+    try:
+        m = exchange.market(sym)
+        return (m.get('type') or m.get('spot', False) is False) and ('swap' in (m.get('type') or '') or m.get('swap') is True)
+    except Exception:
+        return False
+
 async def find_trade_signals(exchange: ccxt.Exchange, app: Application) -> None:
     bot_data = app.bot_data
     if len(bot_data.get("active_trades", [])) >= CONFIG.MAX_CONCURRENT_POSITIONS:
@@ -215,7 +222,9 @@ async def find_trade_signals(exchange: ccxt.Exchange, app: Application) -> None:
         else: log.info("Market Regime: NEUTRAL/FLAT. All signals allowed.")
     try:
         tickers = await exchange.fetch_tickers()
-        liquid_pairs = [s for s, t in tickers.items() if (t.get('quoteVolume') or 0) > CONFIG.MIN_VOL_USD and exchange.market(s).get('type') == 'swap' and s.endswith("USDT:USDT")]
+        liquid_pairs = [s for s, t in tickers.items() 
+                        if (t.get('quoteVolume') or 0) > CONFIG.MIN_VOL_USD 
+                        and _is_swap(s, exchange) and s.endswith("USDT:USDT")]
         log.info(f"Found {len(liquid_pairs)} liquid pairs.")
     except Exception as e:
         log.error(f"Could not fetch tickers or filter by volume: {e}"); return
@@ -257,10 +266,10 @@ async def find_trade_signals(exchange: ccxt.Exchange, app: Application) -> None:
             if side:
                 candidate_data = {'symbol': symbol, 'side': side, 'df': df}
                 if side == "LONG":
-                    if market_is_bull is True:
+                    if market_is_bull is not False: # Allow longs in BULL and NEUTRAL
                         pre_long_candidates.append(candidate_data)
                 else: # SHORT
-                    if market_is_bull is not True: 
+                    if market_is_bull is not True: # Allow shorts in BEAR and NEUTRAL
                         pre_short_candidates.append(candidate_data)
         except Exception as e:
             log.error(f"Error pre-processing symbol {symbol}: {e}")
@@ -368,25 +377,26 @@ async def monitor_active_trades(exchange: ccxt.Exchange, app: Application):
     if not active_trades: return
     
     trades_to_close = []
-    symbols = [t['Pair'] for t in active_trades]
+    symbols = list(set([t['Pair'] for t in active_trades]))
     sem = asyncio.Semaphore(CONFIG.CONCURRENCY_SEMAPHORE)
     
-    async def safe_fetch_ohlcv(symbol):
+    async def safe_fetch_ticker(symbol):
         async with sem:
-            try: return await exchange.fetch_ohlcv(symbol, CONFIG.TIMEFRAME, limit=CONFIG.OHLCV_LIMIT)
+            try: return await exchange.fetch_ticker(symbol)
             except Exception: return None
             
-    tasks = [safe_fetch_ohlcv(s) for s in symbols]
-    ohlcv_results = await asyncio.gather(*tasks)
+    tasks = [safe_fetch_ticker(s) for s in symbols]
+    ticker_results = await asyncio.gather(*tasks)
+    ticker_map = {res['symbol']: res for res in ticker_results if res}
+    
     broadcast = app.bot_data.get('broadcast_func')
     
-    for i, trade in enumerate(active_trades):
+    for trade in active_trades:
         try:
-            ohlcv = ohlcv_results[i]
-            if not ohlcv: continue
+            ticker = ticker_map.get(trade['Pair'])
+            if not ticker or not ticker.get('last'): continue
             
-            df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-            current_price = df.iloc[-1]['close']
+            current_price = ticker['last']
             
             if trade['Side'] == 'LONG':
                 trade['MFE_Price'] = max(trade.get('MFE_Price', current_price), current_price)
@@ -395,7 +405,7 @@ async def monitor_active_trades(exchange: ccxt.Exchange, app: Application):
 
             profit_pct = ((current_price - trade['Entry_Price']) / trade['Entry_Price'] * 100) if trade['Side'] == 'LONG' else ((trade['Entry_Price'] - current_price) / trade['Entry_Price'] * 100)
 
-            # Этап 1: Перенос в +0.3% при достижении +0.7%
+            # Stage 1: Move to +0.3% on +0.7% profit
             if not trade.get('trail_1_done') and profit_pct >= CONFIG.SECOND_TRAIL_TRIGGER_PCT:
                 if trade['Side'] == 'LONG':
                     new_sl_raw = trade['Entry_Price'] * (1 + CONFIG.SECOND_TRAIL_LOCK_PCT / 100)
@@ -412,7 +422,7 @@ async def monitor_active_trades(exchange: ccxt.Exchange, app: Application):
                            f"<b>Новый SL:</b> <code>{format_price(new_sl)}</code>")
                     await broadcast(app, msg)
 
-            # Этап 2: Перенос в +1.0% при достижении +1.2%
+            # Stage 2: Move to +1.0% on +1.2% profit
             if not trade.get('trail_2_done') and profit_pct >= CONFIG.TRAIL_TRIGGER_PCT:
                 if trade['Side'] == 'LONG':
                     new_sl_raw = trade['Entry_Price'] * (1 + CONFIG.TRAIL_PROFIT_LOCK_PCT / 100)
@@ -434,14 +444,9 @@ async def monitor_active_trades(exchange: ccxt.Exchange, app: Application):
                                f"<b>Новый SL:</b> <code>{format_price(new_sl)}</code>")
                         await broadcast(app, msg)
             
-            df_indicators = df.copy()
-            if len(df_indicators) < CONFIG.EMA_TREND_PERIOD: continue
-            df_indicators.ta.ema(length=CONFIG.EMA_FAST_PERIOD, append=True); df_indicators.ta.ema(length=CONFIG.EMA_SLOW_PERIOD, append=True)
-            last = df_indicators.iloc[-1]
             exit_reason = None
             
-            # ИЗМЕНЕН ПОРЯДОК: Сначала жесткие выходы, потом мягкие
-            # 1. Проверка SL/TP
+            # 1. Check SL/TP
             if trade['Side'] == 'LONG':
                 if current_price <= trade['SL_Price']: exit_reason = "STOP_LOSS"
                 elif current_price >= trade['TP_Price']: exit_reason = "TAKE_PROFIT"
@@ -449,16 +454,7 @@ async def monitor_active_trades(exchange: ccxt.Exchange, app: Application):
                 if current_price >= trade['SL_Price']: exit_reason = "STOP_LOSS"
                 elif current_price <= trade['TP_Price']: exit_reason = "TAKE_PROFIT"
             
-            # 2. Проверка на инвалидацию по EMA
-            if not exit_reason:
-                ema_fast = last[f"EMA_{CONFIG.EMA_FAST_PERIOD}"]
-                ema_slow = last[f"EMA_{CONFIG.EMA_SLOW_PERIOD}"]
-                if trade['Side'] == 'LONG' and ema_fast < ema_slow:
-                    exit_reason = "INVALIDATION_EMA_CROSS"
-                elif trade['Side'] == 'SHORT' and ema_fast > ema_slow:
-                    exit_reason = "INVALIDATION_EMA_CROSS"
-
-            # 3. Проверка по тайм-стопу (последней)
+            # 2. Check for time-based stop
             if not exit_reason:
                 try:
                     FMT = '%Y-%m-%d %H:%M:%S'
@@ -474,13 +470,12 @@ async def monitor_active_trades(exchange: ccxt.Exchange, app: Application):
                 except (ValueError, KeyError) as e:
                     log.warning(f"Could not calculate time_in_trade for {trade['Pair']}: {e}")
 
-            if exit_reason: trades_to_close.append((trade, exit_reason, df_indicators))
+            if exit_reason: trades_to_close.append((trade, exit_reason, current_price))
         except Exception as e:
             log.error(f"Error monitoring trade for {trade['Pair']}: {e}", exc_info=True)
     
     if trades_to_close:
-        for trade, reason, df_final in trades_to_close:
-            exit_price = df_final.iloc[-1]['close']
+        for trade, reason, exit_price in trades_to_close:
             if reason == "TAKE_PROFIT":
                 pnl_display = trade['tp_pct'] * CONFIG.LEVERAGE
             else:
@@ -489,9 +484,9 @@ async def monitor_active_trades(exchange: ccxt.Exchange, app: Application):
             pnl_usd = CONFIG.POSITION_SIZE_USDT * pnl_display / 100
             app.bot_data.setdefault("trade_cooldown", {})[trade['Pair']] = time.time()
             mfe_atr, mfe_tp_pct = 0, 0
-            df_final.ta.atr(length=CONFIG.ATR_PERIOD, append=True)
-            atr_col = next((c for c in df_final.columns if c.startswith("ATR")), None)
-            current_atr = df_final[atr_col].iloc[-1] if atr_col and not pd.isna(df_final[atr_col].iloc[-1]) else trade.get("ATR_Entry")
+            
+            # We don't have fresh ATR here, so we will use entry ATR for MFE calc
+            current_atr = trade.get("ATR_Entry", 0)
             if current_atr and current_atr > 0: mfe_atr = abs(trade['MFE_Price'] - trade['Entry_Price']) / current_atr
             tp_diff = abs(trade['TP_Price'] - trade['Entry_Price'])
             if tp_diff > 0: mfe_tp_pct = abs(trade['MFE_Price'] - trade['Entry_Price']) / tp_diff
@@ -545,6 +540,8 @@ async def scanner_main_loop(app: Application, broadcast):
         log.critical(f"Could not initialize Google Sheets during startup: {e}", exc_info=True)
         return
     exchange = ccxt.mexc({'options': {'defaultType': 'swap'}, 'enableRateLimit': True, 'rateLimit': 200})
+    await exchange.load_markets(True) # NEW
+    
     last_scan_time = 0
     last_flush_time = 0
     while app.bot_data.get("bot_on", False):
