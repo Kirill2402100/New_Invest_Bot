@@ -1,4 +1,6 @@
+# scanner_bmr_dca.py
 from __future__ import annotations
+
 import asyncio, time, logging, json, os, inspect, numbers
 from typing import Optional
 from datetime import datetime, timezone
@@ -9,9 +11,9 @@ import pandas_ta as ta
 from telegram.ext import Application
 import gspread
 
-# Forex adapter + feed
+# === Forex адаптеры и фид ===
 from fx_mt5_adapter import FX, margin_to_lots, lots_to_margin, default_tick
-from fx_feed import fetch_ohlcv as fetch_ohlcv_yf  # алиас на fetch_fx_ohlcv
+from fx_feed import fetch_ohlcv as fetch_ohlcv_yf
 
 import trade_executor
 
@@ -21,60 +23,66 @@ log = logging.getLogger("bmr_dca_engine")
 # CONFIG
 # ---------------------------------------------------------------------------
 class CONFIG:
+    # Пара по умолчанию (можно переопределить через ENV FX_SYMBOL)
     SYMBOL = "USDJPY"
-    LEVERAGE = 200
+
+    # Комиссии в долях (0.0004 = 0.04%)
     FEE_MAKER = 0.0
     FEE_TAKER = 0.0
 
+    # Плечо по умолчанию
+    LEVERAGE = 200
+    MIN_LEVERAGE = 2
+    MAX_LEVERAGE = 500
+
+    # Таймфреймы
     TF_ENTRY = "5m"
     TF_RANGE = "1h"
-    STRATEGIC_LOOKBACK_DAYS = 60
-    TACTICAL_LOOKBACK_DAYS = 3
+
+    # Сколько истории собирать под диапазоны
+    STRATEGIC_LOOKBACK_DAYS = 60   # для TF_RANGE
+    TACTICAL_LOOKBACK_DAYS  = 3    # для TF_RANGE
+
+    # Таймауты/интервалы
     FETCH_TIMEOUT = 25
+    SCAN_INTERVAL_SEC = 3
+    REBUILD_RANGE_EVERY_MIN   = 15
+    REBUILD_TACTICAL_EVERY_MIN = 5
 
-    BASE_STEP_MARGIN = 10.0
-    DCA_LEVELS = 7
-    DCA_GROWTH = 2.0
-
+    # Диапазон/квантили/индикаторы
     Q_LOWER = 0.025
     Q_UPPER = 0.975
     RANGE_MIN_ATR_MULT = 1.5
-
     RSI_LEN = 14
     ADX_LEN = 14
     VOL_WIN = 50
 
+    # Весовая модель
     WEIGHTS = {
         "border": 0.45, "rsi": 0.15, "ema_dev": 0.20,
         "supertrend": 0.10, "vol": 0.10
     }
     SCORE_THR = 0.55
 
-    ATR_MULTS = [0, 1, 2, 3, 4, 5, 6]
-    STRATEGIC_PCTS = [0.10, 0.45, 0.90]
-    TACTICAL_PCTS = [0.40, 0.80]
+    # DCA
+    DCA_LEVELS = 7
+    DCA_GROWTH = 2.0
+    CUM_DEPOSIT_FRAC_AT_FULL = 2/3
+    ADD_COOLDOWN_SEC = 25
 
+    # Тейк/Трейл
     TP_PCT = 0.010
     TRAILING_STAGES = [(0.35, 0.25), (0.60, 0.50), (0.85, 0.75)]
 
-    SCAN_INTERVAL_SEC = 3
-    REBUILD_RANGE_EVERY_MIN = 15
-    REBUILD_TACTICAL_EVERY_MIN = 5
-
-    SAFETY_BANK_USDT = 1500.0
-    CUM_DEPOSIT_FRAC_AT_FULL = 2 / 3
-
-    AUTO_LEVERAGE = False
-    MIN_LEVERAGE = 2
-    MAX_LEVERAGE = 500
-
+    # Безопасность/ликвидация
     BREAK_EPS = 0.0025
     REENTRY_BAND = 0.003
     MAINT_MMR = 0.004
     LIQ_FEE_BUFFER = 1.0
 
-    SL_NOTIFY_MIN_TICK_STEP = 1
-
+    # Банк и авто-аллоцирование
+    SAFETY_BANK_USDT = 1500.0
+    AUTO_LEVERAGE = False
     AUTO_ALLOC = {
         "thin_tac_vs_strat": 0.35,
         "low_vol_z": 0.5,
@@ -82,8 +90,7 @@ class CONFIG:
         "growth_B": 2.2,
     }
 
-    ADD_COOLDOWN_SEC = 25
-
+    # «Шипы» / ретест
     SPIKE = {
         "WICK_RATIO": 2.0,
         "ATR_MULT": 1.6,
@@ -92,8 +99,8 @@ class CONFIG:
         "RETRACE_WINDOW_SEC": 120,
     }
 
-# Env overrides
-CONFIG.SYMBOL = os.getenv("FX_SYMBOL", CONFIG.SYMBOL).upper()
+# ENV-переопределения
+CONFIG.SYMBOL   = os.getenv("FX_SYMBOL", CONFIG.SYMBOL).upper()
 CONFIG.TF_ENTRY = os.getenv("TF_ENTRY", CONFIG.TF_ENTRY)
 CONFIG.TF_RANGE = os.getenv("TF_TREND", CONFIG.TF_RANGE)
 
@@ -105,7 +112,6 @@ async def maybe_await(func, *args, **kwargs):
         return await func(*args, **kwargs)
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, lambda: func(*args, **kwargs))
-
 
 SAFE_LOG_KEYS = {
     "Event_ID","Signal_ID","Leverage","Timestamp_UTC","Pair","Side","Event",
@@ -119,13 +125,10 @@ SAFE_LOG_KEYS = {
 }
 
 def _clean(v):
-    if v is None:
-        return ""
-    if isinstance(v, (np.generic,)):
-        v = v.item()
+    if v is None: return ""
+    if isinstance(v, np.generic): v = v.item()
     if isinstance(v, numbers.Real):
-        if not np.isfinite(v):
-            return ""
+        if not np.isfinite(v): return ""
         return float(v)
     return v
 
@@ -152,9 +155,25 @@ def plan_margins_bank_first(bank: float, levels: int, growth: float) -> list[flo
     base = bank * (growth - 1.0) / (growth**levels - 1.0)
     return [base * (growth**i) for i in range(levels)]
 
+def _pos_total_margin(pos):
+    ord_used = sum(pos.step_margins[:min(pos.steps_filled, getattr(pos, 'ord_levels', pos.steps_filled))])
+    res = pos.reserve_margin_usdt if getattr(pos, 'reserve_used', False) else 0.0
+    return ord_used + res
+
+def compute_net_pnl(pos, exit_p: float, fee_entry: float, fee_exit: float) -> tuple[float, float]:
+    sum_margin = _pos_total_margin(pos) or 1e-9
+    raw_pnl = (exit_p / pos.avg - 1.0) * (1 if pos.side == "LONG" else -1)
+    gross_usd = sum_margin * (raw_pnl * pos.leverage)
+    entry_notional = sum_margin * pos.leverage
+    exit_notional  = exit_p * pos.qty
+    fee_entry_usd = entry_notional * fee_entry
+    fee_exit_usd  = exit_notional  * fee_exit
+    net_usd = gross_usd - fee_entry_usd - fee_exit_usd
+    net_pct = (net_usd / sum_margin) * 100.0
+    return net_usd, net_pct
+
 def approx_liq_price_cross(avg: float, side: str, qty: float, equity: float, mmr: float, fees_paid: float = 0.0) -> float:
-    if qty <= 0 or equity <= 0:
-        return float('nan')
+    if qty <= 0 or equity <= 0: return float('nan')
     eq = max(0.0, equity - fees_paid)
     if side == "LONG":
         denom = max(qty * (1.0 - mmr), 1e-12)
@@ -164,13 +183,8 @@ def approx_liq_price_cross(avg: float, side: str, qty: float, equity: float, mmr
         return (avg * qty + eq) / denom
 
 def liq_distance_pct(side: str, px: float, liq: float) -> float:
-    if px is None or liq is None or px <= 0 or np.isnan(liq):
-        return float('nan')
+    if px is None or liq is None or px <= 0 or np.isnan(liq): return float('nan')
     return (liq / px - 1.0) * 100 if side == "SHORT" else (1.0 - liq / px) * 100
-
-def trend_reversal_confirmed(side: str, ind: dict) -> bool:
-    return (side=="SHORT" and ind["supertrend"] in ("up_to_down_near","down")) or \
-           (side=="LONG"  and ind["supertrend"] in ("down_to_up_near","up"))
 
 def chandelier_stop(side: str, price: float, atr: float, mult: float = 3.0):
     return price - mult*atr if side == "LONG" else price + mult*atr
@@ -187,15 +201,8 @@ def break_distance_pcts(px: float, up: float, dn: float) -> tuple[float, float]:
     dn_pct = max(0.0, (1.0 - dn / px) * 100.0)
     return up_pct, dn_pct
 
-def sl_moved_enough(prev: float|None, new: float, side: str, tick: float, min_steps: int) -> bool:
-    if prev is None:
-        return True
-    step = max(tick * max(1, min_steps), 1e-12)
-    return (new > prev + step) if side == "LONG" else (new < prev - step)
-
 def quantize_to_tick(x: float | None, tick: float) -> float | None:
-    if x is None or (isinstance(x, float) and np.isnan(x)):
-        return x
+    if x is None or (isinstance(x, float) and np.isnan(x)): return x
     return round(round(x / tick) * tick, 10)
 
 def compute_pct_targets(entry: float, side: str, rng: dict, tick: float, pcts: list[float]) -> list[float]:
@@ -216,7 +223,7 @@ def compute_pct_targets(entry: float, side: str, rng: dict, tick: float, pcts: l
     out = []
     for x in capped:
         q = quantize_to_tick(x, tick)
-        if q is not None and (not out or (side == "SHORT" and q > out[-1] + tick) or (side == "LONG" and q < out[-1] - tick)):
+        if q is not None and (not out or (side=="SHORT" and q > out[-1] + tick) or (side=="LONG" and q < out[-1] - tick)):
             out.append(q)
     return out
 
@@ -235,8 +242,7 @@ def merge_targets_sorted(side: str, tick: float, targets: list[dict]) -> list[di
         targets = sorted(targets, key=lambda t: t["price"], reverse=True)
     dedup = []
     for t in targets:
-        if not dedup:
-            dedup.append(t)
+        if not dedup: dedup.append(t)
         else:
             if (side=="SHORT" and t["price"] > dedup[-1]["price"] + tick) or \
                (side=="LONG"  and t["price"] < dedup[-1]["price"] - tick):
@@ -250,8 +256,7 @@ def compute_mixed_targets(entry: float, side: str, rng_strat: dict, rng_tac: dic
 
 def next_pct_target(pos):
     idx = pos.steps_filled - 1
-    if not getattr(pos, "ordinary_targets", None):
-        return None
+    if not getattr(pos, "ordinary_targets", None): return None
     return pos.ordinary_targets[idx] if 0 <= idx < len(pos.ordinary_targets) else None
 
 def choose_growth(ind: dict, rng_strat: dict, rng_tac: dict) -> float:
@@ -263,72 +268,11 @@ def choose_growth(ind: dict, rng_strat: dict, rng_tac: dict) -> float:
     low_vol = abs(ind.get("vol_z", 0.0)) <= CONFIG.AUTO_ALLOC["low_vol_z"]
     return CONFIG.AUTO_ALLOC["growth_A"] if (thin and low_vol) else CONFIG.AUTO_ALLOC["growth_B"]
 
-def _pos_total_margin(pos):
-    ord_used = sum(pos.step_margins[:min(pos.steps_filled, getattr(pos, 'ord_levels', pos.steps_filled))])
-    res = pos.reserve_margin_usdt if getattr(pos, 'reserve_used', False) else 0.0
-    return ord_used + res
-
-def compute_net_pnl(pos, exit_p: float, fee_entry: float, fee_exit: float) -> tuple[float, float]:
-    sum_margin = _pos_total_margin(pos) or 1e-9
-    raw_pnl = (exit_p / pos.avg - 1.0) * (1 if pos.side == "LONG" else -1)
-    gross_usd = sum_margin * (raw_pnl * pos.leverage)
-    entry_notional = sum_margin * pos.leverage
-    exit_notional  = exit_p * pos.qty
-    fee_entry_usd = entry_notional * fee_entry
-    fee_exit_usd  = exit_notional  * fee_exit
-    net_usd = gross_usd - fee_entry_usd - fee_exit_usd
-    net_pct = (net_usd / sum_margin) * 100.0
-    return net_usd, net_pct
-
-def last_candle_ohlc(df5: pd.DataFrame):
-    o = float(df5["open"].iloc[-1])
-    h = float(df5["high"].iloc[-1])
-    l = float(df5["low"].iloc[-1])
-    c = float(df5["close"].iloc[-1])
-    return o, h, l, c
-
-def detect_spike_direction(o: float, h: float, l: float, c: float, atr5m: float, vol_z: float) -> Optional[str]:
-    body = abs(c - o)
-    upper_wick = max(0.0, h - max(o, c))
-    lower_wick = max(0.0, min(o, c) - l)
-    rng = max(1e-12, h - l)
-
-    if vol_z < CONFIG.SPIKE["VOLZ_THR"]:
-        return None
-    if rng < CONFIG.SPIKE["ATR_MULT"] * max(1e-12, atr5m):
-        return None
-
-    if lower_wick >= CONFIG.SPIKE["WICK_RATIO"] * body:
-        return "down"
-    if upper_wick >= CONFIG.SPIKE["WICK_RATIO"] * body:
-        return "up"
-    return None
-
-def spike_retrace_ok_ref(direction: str, ref_ohlc: tuple[float,float,float,float], px_now: float) -> bool:
-    o, h, l, c = ref_ohlc
-    frac = CONFIG.SPIKE["RETRACE_FRAC"]
-    if direction == "down":
-        ceiling = max(o, c, h)
-        if ceiling <= l + 1e-12:
-            return False
-        progress = (px_now - l) / (ceiling - l)
-        return progress >= frac
-    elif direction == "up":
-        floor_ = min(o, c, l)
-        if h <= floor_ + 1e-12:
-            return False
-        progress = (h - px_now) / (h - floor_)
-        return progress >= frac
-    return False
-
 # ---------------------------------------------------------------------------
-# Indicators & ranges
+# Диапазоны/индикаторы
 # ---------------------------------------------------------------------------
 async def build_range_from_df(df: Optional[pd.DataFrame]):
-    if df is None or df.empty:
-        return None
-
-    df = df.copy()
+    if df is None or df.empty: return None
     df.columns = ["open","high","low","close","volume"]
     ema = ta.ema(df["close"], length=50)
     atr = ta.atr(df["high"], df["low"], df["close"], length=14)
@@ -345,21 +289,15 @@ async def build_range_from_df(df: Optional[pd.DataFrame]):
     return {"lower": lower, "upper": upper, "mid": mid, "atr1h": atr1h, "width": upper-lower}
 
 async def build_ranges(symbol: str):
-    # Раньше было два параллельных запроса одного и того же ТФ
-    max_bars = max(CONFIG.STRATEGIC_LOOKBACK_DAYS, CONFIG.TACTICAL_LOOKBACK_DAYS) * 24
-    full_df = await maybe_await(fetch_ohlcv_yf, symbol, CONFIG.TF_RANGE, limit=max_bars)
-
-    # разрезаем один датафрейм на стратегию и тактику
-    s_tail = CONFIG.STRATEGIC_LOOKBACK_DAYS * 24
-    t_tail = CONFIG.TACTICAL_LOOKBACK_DAYS * 24
-    s_df = full_df.tail(s_tail)
-    t_df = full_df.tail(t_tail)
-
+    # берём историю в «часовых» барах на TF_RANGE
+    s_df_task = asyncio.create_task(maybe_await(fetch_ohlcv_yf, symbol, CONFIG.TF_RANGE, CONFIG.STRATEGIC_LOOKBACK_DAYS * 24))
+    t_df_task = asyncio.create_task(maybe_await(fetch_ohlcv_yf, symbol, CONFIG.TF_RANGE, CONFIG.TACTICAL_LOOKBACK_DAYS * 24))
+    s_df, t_df = await asyncio.gather(s_df_task, t_df_task)
     s_task = asyncio.create_task(build_range_from_df(s_df))
     t_task = asyncio.create_task(build_range_from_df(t_df))
     strat, tac = await asyncio.gather(s_task, t_task)
     return strat, tac
-    
+
 def compute_indicators_5m(df: pd.DataFrame) -> dict:
     atr5m = ta.atr(df["high"], df["low"], df["close"], length=14).iloc[-1]
     rsi = ta.rsi(df["close"], length=CONFIG.RSI_LEN).iloc[-1]
@@ -397,7 +335,7 @@ def compute_indicators_5m(df: pd.DataFrame) -> dict:
     }
 
 # ---------------------------------------------------------------------------
-# Position State
+# Состояние позиции
 # ---------------------------------------------------------------------------
 class Position:
     def __init__(self, side: str, signal_id: str, leverage: int | None = None):
@@ -479,21 +417,63 @@ class Position:
         return margin, notional
 
 # ---------------------------------------------------------------------------
-# Main loop (box-aware)
+# Broadcasting helpers
 # ---------------------------------------------------------------------------
-async def scanner_main_loop(app: Application, broadcast, box: dict | None = None, **_):
+def _make_bcaster(default_chat_id: int | None):
+    async def _bc(app, text, target_chat_id=None):
+        cid = target_chat_id or default_chat_id
+        if cid is None:
+            log.warning("[broadcast-fallback] No chat id, message dropped")
+            return
+        try:
+            await app.bot.send_message(chat_id=cid, text=text, parse_mode="HTML")
+        except Exception as e:
+            log.error(f"[broadcast-fallback] send failed: {e}")
+    return _bc
+
+def _wrap_broadcast(bc, default_chat_id: int | None):
+    """Делает переданный broadcast совместимым с нашей сигнатурой."""
+    async def _wb(app, text, target_chat_id=None):
+        try:
+            # нормальный путь (наш main)
+            return await bc(app, text, target_chat_id=target_chat_id or default_chat_id)
+        except TypeError:
+            # если старый bc без kwargs
+            return await bc(app, text)
+        except Exception as e:
+            log.error(f"[broadcast wrapper] falling back: {e}")
+            fb = _make_bcaster(default_chat_id)
+            return await fb(app, text, target_chat_id=target_chat_id)
+    return _wb
+
+# ---------------------------------------------------------------------------
+# Main Loop
+# ---------------------------------------------------------------------------
+async def scanner_main_loop(
+    app: Application,
+    broadcast,
+    symbol_override: Optional[str] = None,
+    target_chat_id: Optional[int] = None,
+    botbox: Optional[dict] = None,
+    *args, **kwargs
+):
+    """
+    Основной цикл BMR-DCA. Совместим как с kwargs (symbol_override/target_chat_id/botbox),
+    так и с позиционным запуском (app, broadcast, botbox).
+    """
+    # Совместимость с вызовом через 3 позиционных аргумента: (app, broadcast, box)
+    if botbox is None and args:
+        # первый позиционный после broadcast считаем box'ом
+        botbox = args[0] if len(args) >= 1 and isinstance(args[0], dict) else None
+
+    # Заворачиваем broadcast, чтобы он понимал target_chat_id (и имел фолбэк)
+    broadcast = _wrap_broadcast(broadcast, target_chat_id)
+
     log.info("BMR-DCA loop starting…")
+    b = botbox if botbox is not None else app.bot_data
+    b.setdefault("position", None)
 
-    # Локальное хранилище состояния для ЭТОГО сканера
-    B = box if isinstance(box, dict) else app.bot_data
-    B.setdefault("bot_on", True)
-    B.setdefault("scan_paused", False)
-
-    # Пин-адресат
-    async def say(txt: str):
-        await broadcast(app, txt, target_chat_id=B.get("chat_id"))
-
-    # Sheets
+    # Google Sheets (необязательно)
     try:
         creds_json = os.environ.get("GOOGLE_CREDENTIALS")
         sheet_key  = os.environ.get("SHEET_ID")
@@ -501,75 +481,71 @@ async def scanner_main_loop(app: Application, broadcast, box: dict | None = None
             gc = gspread.service_account_from_dict(json.loads(creds_json))
             sheet = gc.open_by_key(sheet_key)
             await maybe_await(trade_executor.ensure_bmr_log_sheet, sheet, title="BMR_DCA_Log")
-    except Exception:
-        log.exception("Sheets init error")
+    except Exception as e:
+        log.error(f"Sheets init error: {e}", exc_info=True)
 
-    symbol = (B.get("symbol") or CONFIG.SYMBOL).upper()
+    symbol = (symbol_override or CONFIG.SYMBOL).upper()
     if symbol not in FX:
         log.critical(f"Unsupported FX symbol: {symbol}. Supported: {list(FX.keys())}")
         return
 
     tick = default_tick(symbol)
-    B["price_tick"] = tick
+    b["price_tick"] = tick
     log.info(f"Successfully initialized for Forex symbol {symbol} with tick size {tick}")
 
+    # Локальный хэлпер на рассылку
+    async def say(txt: str):
+        await broadcast(app, txt, target_chat_id=target_chat_id)
+
     rng_strat, rng_tac = None, None
-    last_flush = 0.0
+    last_flush = 0
     last_build_strat = 0.0
     last_build_tac = 0.0
 
-    while B.get("bot_on", False):
+    while b.get("bot_on", True):
         try:
-            bank = float(B.get("safety_bank_usdt", CONFIG.SAFETY_BANK_USDT))
-            fee_maker = float(B.get("fee_maker", CONFIG.FEE_MAKER))
-            fee_taker = float(B.get("fee_taker", CONFIG.FEE_TAKER))
+            bank = float(b.get("safety_bank_usdt", CONFIG.SAFETY_BANK_USDT))
+            fee_maker = float(b.get("fee_maker", CONFIG.FEE_MAKER))
+            fee_taker = float(b.get("fee_taker", CONFIG.FEE_TAKER))
 
             now = time.time()
-            manage_only = B.get("scan_paused", False)
-            pos: Position | None = B.get("position")
+            manage_only = b.get("scan_paused", False)
+            pos: Position | None = b.get("position")
 
             need_build_strat = (rng_strat is None) or ((now - last_build_strat > CONFIG.REBUILD_RANGE_EVERY_MIN*60) and (pos is None))
-            need_build_tac   = (rng_tac is None) or ((now - last_build_tac > CONFIG.REBUILD_TACTICAL_EVERY_MIN*60) and (pos is None))
+            need_build_tac   = (rng_tac   is None) or ((now - last_build_tac   > CONFIG.REBUILD_TACTICAL_EVERY_MIN*60) and (pos is None))
             if need_build_strat or need_build_tac:
                 s, t = await build_ranges(symbol)
                 if need_build_strat and s:
-                    rng_strat = s
-                    last_build_strat = now
-                    B["intro_done"] = False
+                    rng_strat = s; last_build_strat = now; b["intro_done"] = False
                     log.info(f"[RANGE-STRAT] lower={fmt(rng_strat['lower'])} upper={fmt(rng_strat['upper'])} width={fmt(rng_strat['width'])}")
                 if need_build_tac and t:
-                    rng_tac = t
-                    last_build_tac = now
-                    B["intro_done"] = False
+                    rng_tac = t; last_build_tac = now; b["intro_done"] = False
                     log.info(f"[RANGE-TAC]   lower={fmt(rng_tac['lower'])} upper={fmt(rng_tac['upper'])} width={fmt(rng_tac['width'])}")
 
             if not (rng_strat and rng_tac):
                 log.error("Range is not available. Cannot proceed.")
-                await asyncio.sleep(10)
-                continue
+                await asyncio.sleep(10); continue
 
-            # 5m OHLCV (bars, не limit)
+            # 5m данные — указываем limit (кол-во баров)
             bars_needed = max(60, CONFIG.VOL_WIN + CONFIG.ADX_LEN + 20)
-            ohlc5_df = await maybe_await(fetch_ohlcv_yf, symbol, CONFIG.TF_ENTRY, bars_needed)
+            ohlc5_df = await maybe_await(fetch_ohlcv_yf, symbol, CONFIG.TF_ENTRY, None, bars_needed)
             if ohlc5_df is None or ohlc5_df.empty:
                 log.warning("Could not fetch 5m OHLCV data. Skipping this cycle.")
-                await asyncio.sleep(2)
-                continue
+                await asyncio.sleep(2); continue
 
             df5 = ohlc5_df.copy()
             df5.columns = ["open","high","low","close","volume"]
-
             try:
                 ind = compute_indicators_5m(df5)
             except (ValueError, IndexError) as e:
                 log.warning(f"Indicator calculation failed: {e}. Skipping cycle.")
-                await asyncio.sleep(2)
-                continue
+                await asyncio.sleep(2); continue
 
             px = float(df5["close"].iloc[-1])
-            B["last_px"] = px
 
-            if (not B.get("intro_done")) and (pos is None):
+            # Интро-сообщение
+            if (not b.get("intro_done")) and (pos is None):
                 p30_t = rng_tac["lower"] + 0.30 * rng_tac["width"]
                 p70_t = rng_tac["lower"] + 0.70 * rng_tac["width"]
                 d_to_long  = max(0.0, px - p30_t)
@@ -579,25 +555,30 @@ async def scanner_main_loop(app: Application, broadcast, box: dict | None = None
                 brk_up, brk_dn = break_levels(rng_strat)
                 width_ratio = (rng_tac["width"] / max(rng_strat["width"], 1e-9)) * 100.0
                 await say(
-                    f"🎯 Пороги входа (<b>TAC 30/70</b>): LONG ≤ <code>{fmt(p30_t)}</code>, SHORT ≥ <code>{fmt(p70_t)}</code>\n"
-                    f"📏 Диапазоны:\n"
-                    f"• STRAT: [{fmt(rng_strat['lower'])} … {fmt(rng_strat['upper'])}] w={fmt(rng_strat['width'])}\n"
-                    f"• TAC (3d): [{fmt(rng_tac['lower'])} … {fmt(rng_tac['upper'])}] w={fmt(rng_tac['width'])} (≈{width_ratio:.0f}% от STRAT)\n"
-                    f"🔓 Пробой STRAT: ↑{fmt(brk_up)} | ↓{fmt(brk_dn)}\n"
-                    f"Текущая: {fmt(px)}. До LONG: {fmt(d_to_long)} ({pct_to_long:.2f}%), "
-                    f"до SHORT: {fmt(d_to_short)} ({pct_to_short:.2f}%)."
+                    "🎯 Пороги входа (<b>TAC 30/70</b>): LONG ≤ <code>{}</code>, SHORT ≥ <code>{}</code>\n"
+                    "📏 Диапазоны:\n"
+                    "• STRAT: [{} … {}] w={}\n"
+                    "• TAC (3d): [{} … {}] w={} (≈{:.0f}% от STRAT)\n"
+                    "🔓 Пробой STRAT: ↑{} | ↓{}\n"
+                    "Текущая: {}. До LONG: {} ({:.2f}%), до SHORT: {} ({:.2f}%).".format(
+                        fmt(p30_t), fmt(p70_t),
+                        fmt(rng_strat['lower']), fmt(rng_strat['upper']), fmt(rng_strat['width']),
+                        fmt(rng_tac['lower']),   fmt(rng_tac['upper']),   fmt(rng_tac['width']), width_ratio,
+                        fmt(brk_up), fmt(brk_dn),
+                        fmt(px), fmt(d_to_long), pct_to_long, fmt(d_to_short), pct_to_short
+                    )
                 )
-                B["intro_done"] = True
+                b["intro_done"] = True
 
-            pos = B.get("position")
+            pos = b.get("position")
 
-            if pos and B.get("force_close"):
+            # Ручное закрытие
+            if pos and b.get("force_close"):
                 exit_p = px
                 time_min = (time.time()-pos.open_ts)/60.0
                 net_usd, net_pct = compute_net_pnl(pos, exit_p, fee_taker, fee_maker)
-
                 await say(
-                    f"🧰 <b>MANUAL_CLOSE</b>\n"
+                    "🧰 <b>MANUAL_CLOSE</b>\n"
                     f"Цена выхода: <code>{fmt(exit_p)}</code>\n"
                     f"P&L (net)≈ {net_usd:+.2f} USD ({net_pct:+.2f}%)\n"
                     f"Время в сделке: {time_min:.1f} мин"
@@ -609,28 +590,35 @@ async def scanner_main_loop(app: Application, broadcast, box: dict | None = None
                     "PNL_Realized_USDT": net_usd, "PNL_Realized_Pct": net_pct,
                     "Time_In_Trade_min": time_min
                 })
-                B["force_close"] = False
+                b["force_close"] = False
                 pos.last_sl_notified_price = None
-                B["position"] = None
+                b["position"] = None
                 continue
 
+            # Пробой диапазона — заморозка обычных усреднений, включаем режим ретеста
             if pos:
                 brk_up, brk_dn = break_levels(rng_strat)
                 on_break = (px >= brk_up) or (px <= brk_dn)
                 if on_break and not pos.freeze_ordinary:
                     pos.freeze_ordinary = True
-                    o, h, l, c = last_candle_ohlc(df5)
-                    direction = detect_spike_direction(o, h, l, c, ind["atr5m"], ind["vol_z"])
-                    if direction is not None:
-                        pos.spike_flag = True
-                        pos.spike_direction = direction
-                        pos.spike_deadline_ts = time.time() + CONFIG.SPIKE["RETRACE_WINDOW_SEC"]
-                        pos.spike_ref_ohlc = (o, h, l, c)
+                    o, h, l, c = (float(df5[k].iloc[-1]) for k in ("open","high","low","close"))
+                    # «шип»?
+                    body = abs(c - o); upper_wick = max(0.0, h - max(o, c)); lower_wick = max(0.0, min(o, c) - l)
+                    rng_len = max(1e-12, h - l)
+                    pos.spike_flag = False; pos.spike_direction = None; pos.spike_deadline_ts = None; pos.spike_ref_ohlc = None
+                    if abs(ind["vol_z"]) >= CONFIG.SPIKE["VOLZ_THR"] and rng_len >= CONFIG.SPIKE["ATR_MULT"] * max(ind["atr5m"],1e-12):
+                        if lower_wick >= CONFIG.SPIKE["WICK_RATIO"] * body:
+                            pos.spike_flag = True; pos.spike_direction = "down"
+                        elif upper_wick >= CONFIG.SPIKE["WICK_RATIO"] * body:
+                            pos.spike_flag = True; pos.spike_direction = "up"
+                        if pos.spike_flag:
+                            pos.spike_deadline_ts = time.time() + CONFIG.SPIKE["RETRACE_WINDOW_SEC"]
+                            pos.spike_ref_ohlc = (o, h, l, c)
                     await say("📌 Пробой STRAT — обычные усреднения заморожены. Резерв держим на ретест.")
 
-            # Вход
-            if not pos and (B.get("manual_open") is not None or not manage_only):
-                manual = B.pop("manual_open", None)
+            # Открытие
+            if not pos and (b.get("manual_open") is not None or not manage_only):
+                manual = b.pop("manual_open", None)
                 if manual:
                     side_cand = manual.get("side")
                 else:
@@ -639,35 +627,23 @@ async def scanner_main_loop(app: Application, broadcast, box: dict | None = None
 
                 if side_cand:
                     pos = Position(side_cand, signal_id=f"{symbol.replace('/','')} {int(now)}")
-
-                    if manual and manual.get("leverage") is not None:
-                        pos.leverage = max(CONFIG.MIN_LEVERAGE, min(CONFIG.MAX_LEVERAGE, int(manual["leverage"])))
-                    else:
-                        pos.leverage = CONFIG.LEVERAGE
-
-                    if manual and manual.get("max_steps") is not None:
-                        ord_levels = max(1, min(CONFIG.DCA_LEVELS - 1, int(manual["max_steps"])))
-                    else:
-                        ord_levels = max(1, min(5, CONFIG.DCA_LEVELS - 1))
-
+                    pos.leverage = max(CONFIG.MIN_LEVERAGE, min(CONFIG.MAX_LEVERAGE, int(manual["leverage"]))) if (manual and manual.get("leverage") is not None) else CONFIG.LEVERAGE
+                    ord_levels  = max(1, min(CONFIG.DCA_LEVELS - 1, int(manual["max_steps"]))) if (manual and manual.get("max_steps") is not None) else max(1, min(5, CONFIG.DCA_LEVELS - 1))
                     growth = choose_growth(ind, rng_strat, rng_tac)
                     pos.plan_with_reserve(bank, growth, ord_levels)
-
                     pos.ordinary_targets = compute_mixed_targets(entry=px, side=pos.side, rng_strat=rng_strat, rng_tac=rng_tac, tick=tick)
 
                     margin, _ = pos.add_step(px)
                     pos.rebalance_tail_margins_excluding_reserve(bank)
-                    B["position"] = pos
+                    b["position"] = pos
 
                     cum_margin = _pos_total_margin(pos)
                     lots = margin_to_lots(symbol, margin, price=px, leverage=pos.leverage)
 
                     cum_notional = cum_margin * pos.leverage
                     fees_paid_est = cum_notional * fee_taker * CONFIG.LIQ_FEE_BUFFER
-                    liq = approx_liq_price_cross(
-                        avg=pos.avg, side=pos.side, qty=pos.qty,
-                        equity=bank, mmr=CONFIG.MAINT_MMR, fees_paid=fees_paid_est
-                    )
+                    liq = approx_liq_price_cross(avg=pos.avg, side=pos.side, qty=pos.qty,
+                                                 equity=bank, mmr=CONFIG.MAINT_MMR, fees_paid=fees_paid_est)
                     if not np.isfinite(liq) or liq <= 0: liq = None
                     dist_to_liq_pct = liq_distance_pct(pos.side, px, liq)
                     dist_txt = "N/A" if np.isnan(dist_to_liq_pct) else f"{dist_to_liq_pct:.2f}%"
@@ -719,28 +695,34 @@ async def scanner_main_loop(app: Application, broadcast, box: dict | None = None
                         "Range_Lower": rng_strat["lower"], "Range_Upper": rng_strat["upper"], "Range_Width": rng_strat["width"]
                     })
 
-            pos = B.get("position")
+            # Доборы
+            pos = b.get("position")
             if pos:
                 # Ретест по пробою
                 if pos.freeze_ordinary and pos.reserve_available and not manage_only:
                     need_retest_slow = (
                         ((pos.side == "SHORT" and px <= rng_strat["upper"] * (1 - CONFIG.REENTRY_BAND)) or
-                         (pos.side == "LONG" and px >= rng_strat["lower"] * (1 + CONFIG.REENTRY_BAND)))
-                        and trend_reversal_confirmed(pos.side, ind)
+                         (pos.side == "LONG"  and px >= rng_strat["lower"] * (1 + CONFIG.REENTRY_BAND)))
                     )
                     need_retest_spike = False
                     if pos.spike_flag and (pos.spike_deadline_ts is None or time.time() <= pos.spike_deadline_ts):
-                        if pos.spike_ref_ohlc is not None and spike_retrace_ok_ref(pos.spike_direction, pos.spike_ref_ohlc, px):
-                            if (pos.side == "LONG" and pos.spike_direction == "down") or (pos.side == "SHORT" and pos.spike_direction == "up"):
-                                need_retest_spike = True
-
+                        if pos.spike_ref_ohlc is not None:
+                            o, h, l, c = pos.spike_ref_ohlc
+                            if pos.spike_direction == "down":
+                                ceiling = max(o, c, h)
+                                if ceiling > l + 1e-12:
+                                    progress = (px - l) / (ceiling - l)
+                                    need_retest_spike = (progress >= CONFIG.SPIKE["RETRACE_FRAC"]) and (pos.side == "LONG")
+                            elif pos.spike_direction == "up":
+                                floor_ = min(o, c, l)
+                                if h > floor_ + 1e-12:
+                                    progress = (h - px) / (h - floor_)
+                                    need_retest_spike = (progress >= CONFIG.SPIKE["RETRACE_FRAC"]) and (pos.side == "SHORT")
                     if need_retest_slow or need_retest_spike:
                         now_ts = time.time()
                         if pos.last_add_ts is None or (now_ts - pos.last_add_ts) >= CONFIG.ADD_COOLDOWN_SEC:
                             margin, _ = pos.add_reserve_step(px)
-                            pos.spike_flag = False
-                            pos.spike_deadline_ts = None
-                            pos.spike_ref_ohlc = None
+                            pos.spike_flag = False; pos.spike_deadline_ts = None; pos.spike_ref_ohlc = None
 
                             lots = margin_to_lots(symbol, margin, price=px, leverage=pos.leverage)
                             cum_margin = _pos_total_margin(pos)
@@ -779,7 +761,6 @@ async def scanner_main_loop(app: Application, broadcast, box: dict | None = None
                 # Обычные усреднения
                 nxt = next_pct_target(pos)
                 trigger = (nxt is not None) and ((pos.side=="LONG" and px <= nxt["price"]) or (pos.side=="SHORT" and px >= nxt["price"]))
-
                 if (not pos.freeze_ordinary) and trigger and (pos.steps_filled < pos.ord_levels):
                     now_ts = time.time()
                     if pos.last_add_ts is None or (now_ts - pos.last_add_ts) >= CONFIG.ADD_COOLDOWN_SEC:
@@ -790,10 +771,8 @@ async def scanner_main_loop(app: Application, broadcast, box: dict | None = None
                         cum_margin = _pos_total_margin(pos)
                         cum_notional = cum_margin * pos.leverage
                         fees_paid_est = cum_notional * fee_taker * CONFIG.LIQ_FEE_BUFFER
-                        liq = approx_liq_price_cross(
-                            avg=pos.avg, side=pos.side, qty=pos.qty,
-                            equity=bank, mmr=CONFIG.MAINT_MMR, fees_paid=fees_paid_est
-                        )
+                        liq = approx_liq_price_cross(avg=pos.avg, side=pos.side, qty=pos.qty,
+                                                     equity=bank, mmr=CONFIG.MAINT_MMR, fees_paid=fees_paid_est)
                         if not np.isfinite(liq) or liq <= 0: liq = None
                         dist_to_liq_pct = liq_distance_pct(pos.side, px, liq)
                         dist_txt = "N/A" if np.isnan(dist_to_liq_pct) else f"{dist_to_liq_pct:.2f}%"
@@ -805,7 +784,6 @@ async def scanner_main_loop(app: Application, broadcast, box: dict | None = None
                         total_ord = max(0, min(pos.ord_levels - 1, len(pos.ordinary_targets)))
                         used_ord = max(0, min(total_ord, pos.steps_filled - 1 - (1 if pos.reserve_used else 0)))
                         remaining = max(0, total_ord - used_ord)
-
                         curr_label = pos.ordinary_targets[used_ord - 1]["label"] if used_ord >= 1 else ""
 
                         next_idx = used_ord + 1
@@ -846,31 +824,29 @@ async def scanner_main_loop(app: Application, broadcast, box: dict | None = None
                             "Range_Lower": rng_strat["lower"], "Range_Upper": rng_strat["upper"], "Range_Width": rng_strat["width"]
                         })
 
-                # Трейлинг
-                gain_to_tp = (px / max(pos.avg,1e-9) - 1.0) / CONFIG.TP_PCT if pos.side == "LONG" else \
-                             (pos.avg / max(px,1e-9) - 1.0) / CONFIG.TP_PCT
+                # Трейл
+                if pos.side == "LONG": gain_to_tp = max(0.0, (px / max(pos.avg,1e-9) - 1.0) / CONFIG.TP_PCT)
+                else:                   gain_to_tp = max(0.0, (pos.avg / max(px,1e-9) - 1.0) / CONFIG.TP_PCT)
 
                 for stage_idx, (arm, lock) in enumerate(CONFIG.TRAILING_STAGES):
-                    if pos.trail_stage >= stage_idx:
-                        continue
-                    if gain_to_tp < arm:
-                        break
+                    if pos.trail_stage >= stage_idx: continue
+                    if gain_to_tp < arm: break
                     lock_pct = lock * CONFIG.TP_PCT
                     locked = pos.avg*(1+lock_pct) if pos.side=="LONG" else pos.avg*(1-lock_pct)
                     chand = chandelier_stop(pos.side, px, ind["atr5m"])
                     new_sl = max(locked, chand) if pos.side=="LONG" else min(locked, chand)
 
-                    tick_ = B.get("price_tick", 1e-4)
-                    new_sl_q  = quantize_to_tick(new_sl, tick_)
-                    curr_sl_q = quantize_to_tick(pos.sl_price, tick_)
-                    last_notif_q = quantize_to_tick(pos.last_sl_notified_price, tick_)
+                    t = b.get("price_tick", 1e-4)
+                    new_sl_q  = quantize_to_tick(new_sl, t)
+                    curr_sl_q = quantize_to_tick(pos.sl_price, t)
+                    last_notif_q = quantize_to_tick(pos.last_sl_notified_price, t)
                     improves = (curr_sl_q is None) or \
                                (pos.side == "LONG"  and new_sl_q > curr_sl_q) or \
                                (pos.side == "SHORT" and new_sl_q < curr_sl_q)
                     if improves:
                         pos.sl_price = new_sl_q
                         pos.trail_stage = stage_idx
-                        if sl_moved_enough(last_notif_q, pos.sl_price, pos.side, tick_, CONFIG.SL_NOTIFY_MIN_TICK_STEP):
+                        if (last_notif_q is None) or (pos.side=="LONG" and new_sl_q > last_notif_q + t) or (pos.side=="SHORT" and new_sl_q < last_notif_q - t):
                             await say(f"🛡️ Трейлинг-SL (стадия {stage_idx+1}) → <code>{fmt(pos.sl_price)}</code>")
                             pos.last_sl_notified_price = pos.sl_price
                             await log_event_safely({
@@ -880,10 +856,9 @@ async def scanner_main_loop(app: Application, broadcast, box: dict | None = None
                                 "SL_Price": pos.sl_price, "Avg_Price": pos.avg, "Trail_Stage": stage_idx+1
                             })
 
-                # Выходы
+                # TP/SL выход
                 tp_hit = (pos.side=="LONG" and px>=pos.tp_price) or (pos.side=="SHORT" and px<=pos.tp_price)
                 sl_hit = pos.sl_price and ((pos.side=="LONG" and px<=pos.sl_price) or (pos.side=="SHORT" and px>=pos.sl_price))
-
                 if tp_hit or sl_hit:
                     reason = "TP_HIT" if tp_hit else "SL_HIT"
                     exit_p = pos.tp_price if tp_hit else pos.sl_price
@@ -902,12 +877,12 @@ async def scanner_main_loop(app: Application, broadcast, box: dict | None = None
                         "Timestamp_UTC": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
                         "Pair": symbol, "Side": pos.side, "Event": reason,
                         "PNL_Realized_USDT": net_usd, "PNL_Realized_Pct": net_pct,
-                        "Time_In_Trade_min": time_min,
-                        "ATR_5m": atr_now
+                        "Time_In_Trade_min": time_min, "ATR_5m": atr_now
                     })
                     pos.last_sl_notified_price = None
-                    B["position"] = None
+                    b["position"] = None
 
+            # Периодический флэш логов в Sheets
             if (time.time() - last_flush) >= 10:
                 try:
                     await maybe_await(trade_executor.flush_log_buffers)
@@ -921,30 +896,3 @@ async def scanner_main_loop(app: Application, broadcast, box: dict | None = None
             await asyncio.sleep(5)
 
     log.info("BMR-DCA loop gracefully stopped.")
-
-
-# --- helpers exported for /status ---
-def estimate_margin_metrics(pos, px: float, bank: float):
-    used = _pos_total_margin(pos)
-    notional = used * max(1, int(getattr(pos, "leverage", 1) or 1))
-    if getattr(pos, "qty", 0) <= 0 or getattr(pos, "avg", 0) <= 0:
-        unreal = 0.0
-    else:
-        sgn = 1.0 if pos.side == "LONG" else -1.0
-        unreal = (px / pos.avg - 1.0) * sgn * notional
-    equity = bank + unreal
-    free = equity - used
-    ml = (equity / used) * 100.0 if used > 1e-12 else float("inf")
-    return used, equity, free, ml
-
-def fmt2(x: float) -> str:
-    try:
-        if x is None: return "N/A"
-        if isinstance(x, float) and (x != x or x in (float("inf"), float("-inf"))):
-            return "N/A"
-        ax = abs(x)
-        if ax < 1:     return f"{x:.4f}"
-        if ax < 1000:  return f"{x:.2f}"
-        return f"{x:.0f}"
-    except Exception:
-        return "N/A"
