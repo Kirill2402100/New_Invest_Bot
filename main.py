@@ -3,8 +3,9 @@ import os
 import asyncio
 import logging
 from typing import Optional
+import inspect
 
-from telegram import Update, constants, BotCommand, BotCommandScopeAllGroupChats, BotCommandScopeAllPrivateChats
+from telegram import Update, constants, BotCommand, BotCommandScopeAllGroupChats, BotCommandScopeAllPrivateChats, BotCommandScopeChat
 from telegram.ext import Application, ApplicationBuilder, CommandHandler, ContextTypes, PicklePersistence
 
 # --- Logging FIRST ---
@@ -15,7 +16,6 @@ log = logging.getLogger("bot")
 # --- Imports with Fallback ---
 import scanner_bmr_dca as scanner_engine
 from scanner_bmr_dca import CONFIG
-
 try:
     from scanner_bmr_dca import estimate_margin_metrics, fmt2
 except ImportError:
@@ -32,12 +32,10 @@ except ImportError:
             return f"{x:.0f}"
         except Exception:
             return "N/A"
-
     def _pos_total_margin(pos):
         ord_used = sum(pos.step_margins[:min(pos.steps_filled, getattr(pos, 'ord_levels', pos.steps_filled))])
         res = pos.reserve_margin_usdt if getattr(pos, 'reserve_used', False) else 0.0
         return ord_used + res
-
     def estimate_margin_metrics(pos, px: float, bank: float):
         used = _pos_total_margin(pos)
         notional = used * max(1, int(getattr(pos, "leverage", 1) or 1))
@@ -52,11 +50,48 @@ except ImportError:
         return used, equity, free, ml
 
 # --- Configuration ---
-BOT_VERSION = "BMR-DCA FX v1.9 (Final)"
+BOT_VERSION = "BMR-DCA FX v2.1 (Robust Spawner)"
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN env var is not set")
+
+# --- Universal Scanner Spawner ---
+def _spawn_scanner_task(app: Application, symbol: Optional[str], chat_id: Optional[int], box: Optional[dict]):
+    fn = scanner_engine.scanner_main_loop
+    params = getattr(inspect, "signature", lambda f: None)(fn)
+    param_names = set(params.parameters.keys()) if params else set()
+
+    # 1) If the function supports keyword arguments, pass only those that are present
+    if param_names:
+        kwargs = {}
+        if "symbol_override" in param_names:
+            kwargs["symbol_override"] = symbol
+        if "target_chat_id" in param_names:
+            kwargs["target_chat_id"] = chat_id
+        if "botbox" in param_names:
+            kwargs["botbox"] = box
+        if kwargs:
+            log.info(f"Spawning scanner for {symbol or 'default'} with kwargs {list(kwargs.keys())}.")
+            return asyncio.create_task(fn(app, broadcast, **kwargs))
+
+    # 2) Try 5 positional arguments (old extended version)
+    try:
+        log.info(f"Spawning scanner for {symbol or 'default'} with 5 positional args.")
+        return asyncio.create_task(fn(app, broadcast, symbol, chat_id, box))
+    except TypeError:
+        pass
+
+    # 3) Try 3 positional arguments (app, broadcast, box)
+    try:
+        log.info(f"Spawning scanner for {symbol or 'default'} with 3 positional args.")
+        return asyncio.create_task(fn(app, broadcast, box))
+    except TypeError:
+        pass
+
+    # 4) Fallback: simple signature (app, broadcast)
+    log.warning(f"Spawning scanner for {symbol or 'default'} with 2 positional args (fallback).")
+    return asyncio.create_task(fn(app, broadcast))
 
 
 # --- Multi-Session Helpers ---
@@ -127,6 +162,14 @@ async def post_init(app: Application):
     await app.bot.set_my_commands(CMDS, scope=BotCommandScopeAllGroupChats())
     await app.bot.set_my_commands(CMDS, scope=BotCommandScopeAllPrivateChats())
     await app.bot.set_my_commands(CMDS)
+    
+    pairs = _parse_chat_symbols_env()
+    for chat_id, _ in pairs:
+        try:
+            await app.bot.set_my_commands(CMDS, scope=BotCommandScopeChat(chat_id))
+            log.info(f"Set commands specifically for chat {chat_id}")
+        except Exception as e:
+            log.warning(f"set_my_commands for chat {chat_id} failed: {e}")
 
 async def broadcast(app: Application, txt: str, target_chat_id: int | None = None):
     chat_ids = set(app.bot_data.get('chat_ids', set()))
@@ -150,8 +193,7 @@ async def start_symbol_loops(app: Application):
     if not pairs:
         log.warning("CHAT_SYMBOLS пуст — запускается одиночный цикл.")
         box = {"bot_on": True, "scan_paused": False}
-        # ИСПРАВЛЕНО: Совместимый вызов для одиночного режима
-        task = asyncio.create_task(scanner_engine.scanner_main_loop(app, broadcast, botbox=box))
+        task = _spawn_scanner_task(app, None, None, box)
         app.bot_data["_main_loop_task"] = task
         app.bot_data["_main_loop_box"] = box
         return
@@ -164,10 +206,7 @@ async def start_symbol_loops(app: Application):
             continue
 
         box = {"bot_on": True, "scan_paused": False}
-        # Позиционный вызов для мульти-режима
-        task = asyncio.create_task(
-            scanner_engine.scanner_main_loop(app, broadcast, symbol, chat_id, box)
-        )
+        task = _spawn_scanner_task(app, symbol, chat_id, box)
         app.bot_data["loops"][symbol] = {"task": task, "box": box, "chat_id": chat_id}
         log.info(f"Started loop for {symbol} -> chat {chat_id}")
 
@@ -213,7 +252,6 @@ async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         tasks_to_wait.append(app.bot_data["_main_loop_task"])
 
     log.info(f"Stopping {len(tasks_to_wait)} scanner loops...")
-    # ИСПРАВЛЕНО: Корректная отмена задач
     for t in tasks_to_wait:
         t.cancel()
     await asyncio.gather(*tasks_to_wait, return_exceptions=True)
@@ -256,13 +294,10 @@ async def cmd_open(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         log.info(f"Loop for {sym} is not running. Restarting it for /open command.")
         await update.message.reply_text(f"⚙️ Перезапускаю сканер для {sym}...")
         if box is app.bot_data.get("_main_loop_box"):
-            # ИСПРАВЛЕНО: Совместимый вызов для одиночного режима
-            task = asyncio.create_task(scanner_engine.scanner_main_loop(app, broadcast, botbox=box))
+            task = _spawn_scanner_task(app, None, None, box)
             app.bot_data["_main_loop_task"] = task
         else:
-            task = asyncio.create_task(
-                scanner_engine.scanner_main_loop(app, broadcast, sym, update.effective_chat.id, box)
-            )
+            task = _spawn_scanner_task(app, sym, update.effective_chat.id, box)
             loops = app.bot_data.setdefault("loops", {})
             if sym in loops:
                 loops[sym]["task"] = task
