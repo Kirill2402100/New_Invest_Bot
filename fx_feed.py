@@ -228,7 +228,8 @@ def _fetch_twelvedata(symbol: str, tf: str, limit: int) -> Optional[pd.DataFrame
             log.error("TwelveData HTTP %s: %s", r.status_code, r.text[:200])
             return None
         # бывает, что в теле приходит сообщение об исчерпании кредитов — оставим проверку наверху
-        df = pd.read_csv(pd.compat.StringIO(r.text))
+        from io import StringIO
+        df = pd.read_csv(StringIO(r.text))
         # ожидаемые колонки: datetime, open, high, low, close, volume
         df = df.rename(columns={"datetime":"time"})
         df["time"] = pd.to_datetime(df["time"], utc=True, errors="coerce")
