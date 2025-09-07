@@ -9,9 +9,9 @@ import pandas_ta as ta
 from telegram.ext import Application
 import gspread
 
-# ИЗМЕНЕНО: Добавлены импорты для Forex
+# ИЗМЕНЕНО: импорты для Forex
 from fx_mt5_adapter import FX, margin_to_lots, lots_to_margin, default_tick
-from fx_feed import fetch_ohlcv as fetch_ohlcv_yf
+from fx_feed import fetch_fx_ohlcv as fetch_ohlcv_yf  # <-- ВАЖНО: правильная функция
 
 import trade_executor
 
@@ -21,7 +21,6 @@ log = logging.getLogger("bmr_dca_engine")
 # CONFIG
 # ---------------------------------------------------------------------------
 class CONFIG:
-    # ИЗМЕНЕНО: Конфигурация для Forex
     SYMBOL = "USDJPY"
     LEVERAGE = 200
     FEE_MAKER = 0.0
@@ -31,7 +30,7 @@ class CONFIG:
     TF_RANGE = "1h"
     STRATEGIC_LOOKBACK_DAYS = 60
     TACTICAL_LOOKBACK_DAYS = 3
-    FETCH_TIMEOUT = 25 # Увеличено для yfinance
+    FETCH_TIMEOUT = 25
     BASE_STEP_MARGIN = 10.0
     DCA_LEVELS = 7
     DCA_GROWTH = 2.0
@@ -79,13 +78,13 @@ class CONFIG:
         "RETRACE_WINDOW_SEC": 120,
     }
 
-# ИЗМЕНЕНО: Символ и таймфреймы подтягиваются из переменных окружения
+# Символ и таймфреймы из ENV (если заданы)
 CONFIG.SYMBOL = os.getenv("FX_SYMBOL", CONFIG.SYMBOL).upper()
 CONFIG.TF_ENTRY = os.getenv("TF_ENTRY", CONFIG.TF_ENTRY)
 CONFIG.TF_RANGE = os.getenv("TF_TREND", CONFIG.TF_RANGE)
 
 # ---------------------------------------------------------------------------
-# Helper Functions
+# Helpers
 # ---------------------------------------------------------------------------
 async def maybe_await(func, *args, **kwargs):
     if inspect.iscoroutinefunction(func):
@@ -309,12 +308,11 @@ def spike_retrace_ok_ref(direction: str, ref_ohlc: tuple[float,float,float,float
     return False
 
 # ---------------------------------------------------------------------------
-# Core Logic Functions
+# Core Logic
 # ---------------------------------------------------------------------------
 async def build_range_from_df(df: Optional[pd.DataFrame]):
     if df is None or df.empty: return None
-    
-    df.columns = ["open","high","low","close","volume"] # Ensure column names
+    df.columns = ["open","high","low","close","volume"]
     ema = ta.ema(df["close"], length=50)
     atr = ta.atr(df["high"], df["low"], df["close"], length=14)
     lower = float(np.quantile(df["close"].dropna(), CONFIG.Q_LOWER))
@@ -330,10 +328,10 @@ async def build_range_from_df(df: Optional[pd.DataFrame]):
     return {"lower": lower, "upper": upper, "mid": mid, "atr1h": atr1h, "width": upper-lower}
 
 async def build_ranges(symbol: str):
+    # bars = количество баров, поэтому для 1h берём дни * 24
     s_df_task = asyncio.create_task(maybe_await(fetch_ohlcv_yf, symbol, CONFIG.TF_RANGE, CONFIG.STRATEGIC_LOOKBACK_DAYS * 24))
     t_df_task = asyncio.create_task(maybe_await(fetch_ohlcv_yf, symbol, CONFIG.TF_RANGE, CONFIG.TACTICAL_LOOKBACK_DAYS * 24))
     s_df, t_df = await asyncio.gather(s_df_task, t_df_task)
-    
     s_task = asyncio.create_task(build_range_from_df(s_df))
     t_task = asyncio.create_task(build_range_from_df(t_df))
     strat, tac = await asyncio.gather(s_task, t_task)
@@ -376,7 +374,7 @@ def compute_indicators_5m(df: pd.DataFrame) -> dict:
     }
 
 # ---------------------------------------------------------------------------
-# Position State Manager
+# Position State
 # ---------------------------------------------------------------------------
 class Position:
     def __init__(self, side: str, signal_id: str, leverage: int | None = None):
@@ -476,12 +474,11 @@ async def scanner_main_loop(app: Application, broadcast):
     
     symbol = CONFIG.SYMBOL
     if symbol not in FX:
-        log.critical(f"Unsupported FX symbol: {symbol}. Supported: {list(FX.keys())}")
+        log.ritical(f"Unsupported FX symbol: {symbol}. Supported: {list(FX.keys())}")
         return
     tick = default_tick(symbol)
     app.bot_data["price_tick"] = tick
     log.info(f"Successfully initialized for Forex symbol {symbol} with tick size {tick}")
-
 
     rng_strat, rng_tac = None, None
     last_flush = 0
@@ -518,14 +515,16 @@ async def scanner_main_loop(app: Application, broadcast):
                 await asyncio.sleep(10)
                 continue
 
-            ohlc5_df = await maybe_await(fetch_ohlcv_yf, symbol, CONFIG.TF_ENTRY, limit=max(60, CONFIG.VOL_WIN+CONFIG.ADX_LEN+20))
+            # ВАЖНО: используем bars=..., а не limit=
+            bars_needed = max(600, CONFIG.VOL_WIN + CONFIG.ADX_LEN + 30)
+            ohlc5_df = await maybe_await(fetch_ohlcv_yf, symbol, CONFIG.TF_ENTRY, bars_needed)
             if ohlc5_df is None or ohlc5_df.empty:
                 log.warning("Could not fetch 5m OHLCV data. Skipping this cycle.")
                 await asyncio.sleep(2)
                 continue
             
             df5 = ohlc5_df.copy()
-            df5.columns = ["open","high","low","close","volume"] # Ensure column names
+            df5.columns = ["open","high","low","close","volume"]
             try:
                 ind = compute_indicators_5m(df5)
             except (ValueError, IndexError) as e:
