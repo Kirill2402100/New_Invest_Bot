@@ -10,8 +10,8 @@ from telegram.ext import Application
 import gspread
 
 # ИЗМЕНЕНО: Добавлены импорты для Forex
-from fx_mt5_adapter import fetch_ohlcv_yf, FX, margin_to_lots, lots_to_margin, default_tick
-import yfinance as yf
+from fx_mt5_adapter import FX, margin_to_lots, lots_to_margin, default_tick
+from fx_feed import fetch_ohlcv as fetch_ohlcv_yf
 
 import trade_executor
 
