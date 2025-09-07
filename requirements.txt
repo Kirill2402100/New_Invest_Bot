@@ -9,5 +9,4 @@ gspread==6.1.2
 google-auth==2.29.0
 yfinance>=0.2.36
 pandas-datareader>=0.10.0
-MetaTrader5>=5.0.45      # если используешь MT5
 requests>=2.31.0
