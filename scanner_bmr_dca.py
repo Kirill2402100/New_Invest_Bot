@@ -787,94 +787,6 @@ async def scanner_main_loop(
                     lots = margin_to_lots(symbol, margin, price=px, leverage=pos.leverage)
 
                     cum_notional = cum_margin * pos.leverage
-                    fees_paid_est = cum_notional * fee_taker * CONFIG.LIQ_FEE_BUFFER
-                    liq = approx_liq_price_cross(avg=pos.avg, side=pos.side, qty=pos.qty,
-                                                 equity=bank, mmr=CONFIG.MAINT_MMR, fees_paid=fees_paid_est)
-                    if not np.isfinite(liq) or liq <= 0: liq = None
-                    dist_to_liq_pct = liq_distance_pct(pos.side, px, liq)
-                    dist_txt = "N/A" if np.isnan(dist_to_liq_pct) else f"{dist_to_liq_pct:.2f}%"
-                    liq_arrow = "↓" if pos.side == "LONG" else "↑"
-
-                    nxt = next_pct_target(pos)
-                    nxt_txt = "N/A" if nxt is None else f"{fmt(nxt['price'])} ({nxt['label']})"
-
-                    total_ord = max(0, min(pos.ord_levels - 1, len(pos.ordinary_targets)))
-                    used_ord = max(0, min(total_ord, pos.steps_filled - 1 - (1 if pos.reserve_used else 0)))
-                    remaining = max(0, total_ord - used_ord)
-
-                    nxt_margin = pos.step_margins[pos.steps_filled] if pos.steps_filled < pos.ord_levels else None
-                    if nxt_margin:
-                        nxt_lots = margin_to_lots(symbol, nxt_margin, price=px, leverage=pos.leverage)
-                        nxt_dep_txt = f"{nxt_margin:.2f} USD ≈ {nxt_lots:.2f} lot"
-                    else:
-                        nxt_dep_txt = "N/A"
-
-                    brk_up, brk_dn = break_levels(rng_strat)
-                    brk_up_pct, brk_dn_pct = break_distance_pcts(px, brk_up, brk_dn)
-                    brk_line = (f"Пробой: ↑<code>{fmt(brk_up)}</code> ({brk_up_pct:.2f}%) | "
-                                f"↓<code>{fmt(brk_dn)}</code> ({brk_dn_pct:.2f}%)")
-
-                    hdr = f"BMR-DCA {pos.side} ({symbol})" + (" [MANUAL]" if manual else "")
-                    fa_tag = ""
-                    if fa_risk == "Amber": fa_tag = "\n<i>FA: Amber — используем консервативный план.</i>"
-                    await say(
-                        f"⚡ <b>{hdr}</b>\n"
-                        f"Вход: <code>{fmt(px)}</code> | <b>{lots:.2f} lot</b>\n"
-                        f"Депозит (старт): <b>{cum_margin:.2f} USD</b> | Плечо: <b>{pos.leverage}x</b>\n"
-                        f"TP: <code>{fmt(pos.tp_price)}</code> (+{CONFIG.TP_PCT*100:.2f}%)\n"
-                        f"Ликвидация (est): {liq_arrow}<code>{fmt(liq)}</code> ({dist_txt})\n"
-                        f"{brk_line}\n"
-                        f"След. усреднение: <code>{nxt_txt}</code>\n"
-                        f"Плановый добор: <b>{nxt_dep_txt}</b> (осталось: {remaining} из {total_ord})\n"
-                        f"<i>Контролируй Margin level ≥ 20%</i>" + fa_tag
-                    )
-                    await log_event_safely({
-                        "Event_ID": f"OPEN_{pos.signal_id}", "Signal_ID": pos.signal_id, "Leverage": pos.leverage,
-                        "Timestamp_UTC": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
-                        "Pair": symbol, "Side": pos.side, "Event": "OPEN",
-                        "Step_No": pos.steps_filled, "Step_Margin_USDT": margin,
-                        "Cum_Margin_USDT": cum_margin, "Entry_Price": px, "Avg_Price": pos.avg,
-                        "TP_Pct": CONFIG.TP_PCT, "TP_Price": pos.tp_price, "Liq_Est_Price": liq,
-                        "Next_DCA_Price": (nxt and nxt["price"]) or "", "Next_DCA_Label": (nxt and nxt["label"]) or "",
-                        "Triggered_Label": ("MANUAL" if manual else ""),
-                        "Fee_Rate_Maker": fee_maker, "Fee_Rate_Taker": fee_taker,
-                        "Fee_Est_USDT": (cum_notional * fee_taker), "ATR_5m": ind["atr5m"], "ATR_1h": rng_strat["atr1h"],
-                        "RSI_5m": ind["rsi"], "ADX_5m": ind["adx"], "Supertrend": ind["supertrend"], "Vol_z": ind["vol_z"],
-                        "Range_Lower": rng_strat["lower"], "Range_Upper": rng_strat["upper"], "Range_Width": rng_strat["width"]
-                    })
-
-            # Доборы
-            pos = b.get("position")
-            if pos:
-                # Ретест по пробою
-                if pos.freeze_ordinary and pos.reserve_available and not manage_only_flag:
-                    need_retest_slow = (
-                        ((pos.side == "SHORT" and px <= rng_strat["upper"] * (1 - CONFIG.REENTRY_BAND)) or
-                         (pos.side == "LONG"  and px >= rng_strat["lower"] * (1 + CONFIG.REENTRY_BAND)))
-                    )
-                    need_retest_spike = False
-                    if pos.spike_flag and (pos.spike_deadline_ts is None or time.time() <= pos.spike_deadline_ts):
-                        if pos.spike_ref_ohlc is not None:
-                            o, h, l, c = pos.spike_ref_ohlc
-                            if pos.spike_direction == "down":
-                                ceiling = max(o, c, h)
-                                if ceiling > l + 1e-12:
-                                    progress = (px - l) / (ceiling - l)
-                                    need_retest_spike = (progress >= CONFIG.SPIKE["RETRACE_FRAC"]) and (pos.side == "LONG")
-                            elif pos.spike_direction == "up":
-                                floor_ = min(o, c, l)
-                                if h > floor_ + 1e-12:
-                                    progress = (h - px) / (h - floor_)
-                                    need_retest_spike = (progress >= CONFIG.SPIKE["RETRACE_FRAC"]) and (pos.side == "SHORT")
-                    if need_retest_slow or need_retest_spike:
-                        now_ts = time.time()
-                        if pos.last_add_ts is None or (now_ts - pos.last_add_ts) >= CONFIG.ADD_COOLDOWN_SEC:
-                            margin, _ = pos.add_reserve_step(px)
-                            pos.spike_flag = False; pos.spike_deadline_ts = None; pos.spike_ref_ohlc = None
-
-                            lots = margin_to_lots(symbol, margin, price=px, leverage=pos.leverage)
-                            cum_margin = _pos_total_margin(pos)
-                            cum_notional = cum_margin * pos.leverage
                             fees_paid_est = cum_notional * fee_taker * CONFIG.LIQ_FEE_BUFFER
                             liq = approx_liq_price_cross(
                                 avg=pos.avg, side=pos.side, qty=pos.qty,
@@ -888,23 +800,19 @@ async def scanner_main_loop(
 
                             brk_up, brk_dn = break_levels(rng_strat)
                             brk_up_pct, brk_dn_pct = break_distance_pcts(px, brk_up, brk_dn)
-                            brk_line = (f"Пробой: ↑<code>{fmt(brk_up)}</code> ({brk_up_pct:.2f}%) | "
-                                        f"↓<code>{fmt(brk_dn)}</code> ({brk_dn_pct:.2f}%)")
+                            brk_line = (
+                                f"Пробой: ↑<code>{fmt(brk_up)}</code> ({brk_up_pct:.2f}%) | "
+                                f"↓<code>{fmt(brk_dn)}</code> ({brk_dn_pct:.2f}%)"
+                            )
 
                             await say(
-                                "↩️ Ретест — резервный добор{}\n"
-                                "Цена: <code>{}</code> | <b>{:.2f} lot</b>\n"
-                                "Добор (резерв): <b>{:.2f} USD</b> | Депозит (тек): <b>{:.2f} USD</b>\n"
-                                "Средняя: <code>{}</code> | TP: <code>{}</code>\n"
-                                "Ликвидация (est): {}<code>{}</code> ({})\n"
-                                "{}\n"
-                                "<i>Контролируй Margin level ≥ 20%</i>".format(
-                                    " (шип)" if need_retest_spike else "",
-                                    fmt(px), lots, margin, cum_margin,
-                                    fmt(pos.avg), fmt(pos.tp_price),
-                                    liq_arrow, fmt(liq), dist_txt,
-                                    brk_line
-                                )
+                                f"↩️ Ретест — резервный добор ({'шип' if need_retest_spike else 'плавный'})\n"
+                                f"Цена: <code>{fmt(px)}</code> | <b>{lots:.2f} lot</b>\n"
+                                f"Добор (резерв): <b>{margin:.2f} USD</b> | Депозит (тек): <b>{cum_margin:.2f} USD</b>\n"
+                                f"Средняя: <code>{fmt(pos.avg)}</code> | TP: <code>{fmt(pos.tp_price)}</code>\n"
+                                f"Ликвидация (est): {liq_arrow}<code>{fmt(liq)}</code> ({dist_txt})\n"
+                                f"{brk_line}\n"
+                                f"<i>Контролируй Margin level ≥ 20%</i>"
                             )
                             await log_event_safely({
                                 "Event_ID": f"RETEST_ADD_{pos.signal_id}_{pos.steps_filled}",
@@ -917,7 +825,8 @@ async def scanner_main_loop(
 
                 # Обычные усреднения
                 nxt = next_pct_target(pos)
-                trigger = (nxt is not None) and ((pos.side=="LONG" and px <= nxt["price"]) or (pos.side=="SHORT" and px >= nxt["price"]))
+                trigger = (nxt is not None) and (
+                    (pos.side == "LONG" and px <= nxt["price"]) or (pos.side == "SHORT" and px >= nxt["price"]) )
                 if (not pos.freeze_ordinary) and trigger and (pos.steps_filled < pos.ord_levels):
                     now_ts = time.time()
                     if pos.last_add_ts is None or (now_ts - pos.last_add_ts) >= CONFIG.ADD_COOLDOWN_SEC:
@@ -928,9 +837,12 @@ async def scanner_main_loop(
                         cum_margin = _pos_total_margin(pos)
                         cum_notional = cum_margin * pos.leverage
                         fees_paid_est = cum_notional * fee_taker * CONFIG.LIQ_FEE_BUFFER
-                        liq = approx_liq_price_cross(avg=pos.avg, side=pos.side, qty=pos.qty,
-                                                     equity=bank, mmr=CONFIG.MAINT_MMR, fees_paid=fees_paid_est)
-                        if not np.isfinite(liq) or liq <= 0: liq = None
+                        liq = approx_liq_price_cross(
+                            avg=pos.avg, side=pos.side, qty=pos.qty,
+                            equity=bank, mmr=CONFIG.MAINT_MMR, fees_paid=fees_paid_est
+                        )
+                        if not np.isfinite(liq) or liq <= 0:
+                            liq = None
                         dist_to_liq_pct = liq_distance_pct(pos.side, px, liq)
                         dist_txt = "N/A" if np.isnan(dist_to_liq_pct) else f"{dist_to_liq_pct:.2f}%"
                         liq_arrow = "↓" if pos.side == "LONG" else "↑"
@@ -953,8 +865,10 @@ async def scanner_main_loop(
 
                         brk_up, brk_dn = break_levels(rng_strat)
                         brk_up_pct, brk_dn_pct = break_distance_pcts(px, brk_up, brk_dn)
-                        brk_line = (f"Пробой: ↑<code>{fmt(brk_up)}</code> ({brk_up_pct:.2f}%) | "
-                                    f"↓<code>{fmt(brk_dn)}</code> ({brk_dn_pct:.2f}%)")
+                        brk_line = (
+                            f"Пробой: ↑<code>{fmt(brk_up)}</code> ({brk_up_pct:.2f}%) | "
+                            f"↓<code>{fmt(brk_dn)}</code> ({brk_dn_pct:.2f}%)"
+                        )
 
                         await say(
                             f"➕ Усреднение #{pos.steps_filled} [{curr_label}]\n"
@@ -974,52 +888,63 @@ async def scanner_main_loop(
                             "Step_No": pos.steps_filled, "Step_Margin_USDT": margin,
                             "Cum_Margin_USDT": cum_margin, "Entry_Price": px, "Avg_Price": pos.avg,
                             "TP_Price": pos.tp_price, "SL_Price": pos.sl_price or "",
-                            "Liq_Est_Price": liq, "Next_DCA_Price": (nxt2 and nxt2["price"]) or "", "Next_DCA_Label": (nxt2 and nxt2["label"]) or "", "Triggered_Label": curr_label,
+                            "Liq_Est_Price": liq, "Next_DCA_Price": (nxt2 and nxt2["price"]) or "",
+                            "Next_DCA_Label": (nxt2 and nxt2["label"]) or "",
+                            "Triggered_Label": curr_label,
                             "Fee_Rate_Maker": fee_maker, "Fee_Rate_Taker": fee_taker,
                             "Fee_Est_USDT": (cum_notional * fee_taker), "ATR_5m": ind["atr5m"], "ATR_1h": rng_strat["atr1h"],
                             "RSI_5m": ind["rsi"], "ADX_5m": ind["adx"], "Supertrend": ind["supertrend"], "Vol_z": ind["vol_z"],
                             "Range_Lower": rng_strat["lower"], "Range_Upper": rng_strat["upper"], "Range_Width": rng_strat["width"]
                         })
 
-                # Трейл
-                if pos.side == "LONG": gain_to_tp = max(0.0, (px / max(pos.avg,1e-9) - 1.0) / CONFIG.TP_PCT)
-                else:                   gain_to_tp = max(0.0, (pos.avg / max(px,1e-9) - 1.0) / CONFIG.TP_PCT)
+                # Трейл-стоп
+                if pos.side == "LONG":
+                    gain_to_tp = max(0.0, (px / max(pos.avg, 1e-9) - 1.0) / CONFIG.TP_PCT)
+                else:
+                    gain_to_tp = max(0.0, (pos.avg / max(px, 1e-9) - 1.0) / CONFIG.TP_PCT)
 
                 for stage_idx, (arm, lock) in enumerate(CONFIG.TRAILING_STAGES):
-                    if pos.trail_stage >= stage_idx: continue
-                    if gain_to_tp < arm: break
+                    if pos.trail_stage >= stage_idx:
+                        continue
+                    if gain_to_tp < arm:
+                        break
                     lock_pct = lock * CONFIG.TP_PCT
-                    locked = pos.avg*(1+lock_pct) if pos.side=="LONG" else pos.avg*(1-lock_pct)
+                    locked = pos.avg * (1 + lock_pct) if pos.side == "LONG" else pos.avg * (1 - lock_pct)
                     chand = chandelier_stop(pos.side, px, ind["atr5m"])
-                    new_sl = max(locked, chand) if pos.side=="LONG" else min(locked, chand)
+                    new_sl = max(locked, chand) if pos.side == "LONG" else min(locked, chand)
 
                     t = b.get("price_tick", 1e-4)
                     new_sl_q  = quantize_to_tick(new_sl, t)
                     curr_sl_q = quantize_to_tick(pos.sl_price, t)
                     last_notif_q = quantize_to_tick(pos.last_sl_notified_price, t)
+
                     improves = (curr_sl_q is None) or \
-                               (pos.side == "LONG"  and new_sl_q > curr_sl_q) or \
+                               (pos.side == "LONG" and new_sl_q > curr_sl_q) or \
                                (pos.side == "SHORT" and new_sl_q < curr_sl_q)
                     if improves:
                         pos.sl_price = new_sl_q
                         pos.trail_stage = stage_idx
-                        if (last_notif_q is None) or (pos.side=="LONG" and new_sl_q > last_notif_q + t) or (pos.side=="SHORT" and new_sl_q < last_notif_q - t):
+                        if (last_notif_q is None) or \
+                           (pos.side == "LONG" and new_sl_q > (last_notif_q + t)) or \
+                           (pos.side == "SHORT" and new_sl_q < (last_notif_q - t)):
                             await say(f"🛡️ Трейлинг-SL (стадия {stage_idx+1}) → <code>{fmt(pos.sl_price)}</code>")
                             pos.last_sl_notified_price = pos.sl_price
                             await log_event_safely({
                                 "Event_ID": f"TRAIL_SET_{pos.signal_id}_{int(now)}", "Signal_ID": pos.signal_id,
                                 "Timestamp_UTC": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
                                 "Pair": symbol, "Side": pos.side, "Event": "TRAIL_SET",
-                                "SL_Price": pos.sl_price, "Avg_Price": pos.avg, "Trail_Stage": stage_idx+1
+                                "SL_Price": pos.sl_price, "Avg_Price": pos.avg, "Trail_Stage": stage_idx + 1
                             })
 
-                # TP/SL выход
-                tp_hit = (pos.side=="LONG" and px>=pos.tp_price) or (pos.side=="SHORT" and px<=pos.tp_price)
-                sl_hit = pos.sl_price and ((pos.side=="LONG" and px<=pos.sl_price) or (pos.side=="SHORT" and px>=pos.sl_price))
+                # TP / SL выход
+                tp_hit = (pos.side == "LONG" and px >= pos.tp_price) or (pos.side == "SHORT" and px <= pos.tp_price)
+                sl_hit = pos.sl_price and (
+                    (pos.side == "LONG" and px <= pos.sl_price) or (pos.side == "SHORT" and px >= pos.sl_price)
+                )
                 if tp_hit or sl_hit:
                     reason = "TP_HIT" if tp_hit else "SL_HIT"
                     exit_p = pos.tp_price if tp_hit else pos.sl_price
-                    time_min = (time.time()-pos.open_ts)/60.0
+                    time_min = (time.time() - pos.open_ts) / 60.0
                     net_usd, net_pct = compute_net_pnl(pos, exit_p, fee_taker, fee_maker)
                     atr_now = ind["atr5m"]
                     await say(
