@@ -4,25 +4,23 @@ import logging
 from telegram import Update, constants, BotCommand
 from telegram.ext import Application, ApplicationBuilder, CommandHandler, ContextTypes, PicklePersistence
 
+# Import the correct scanner engine
 import scanner_bmr_dca as scanner_engine
 from scanner_bmr_dca import CONFIG
 import trade_executor
 
-# --- Конфигурация ---
-BOT_VERSION = "BMR-DCA JPY v0.1"
+# --- Configuration ---
+BOT_VERSION = "BMR-DCA FX v1.0"
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN env var is not set")
 
-DEFAULT_BANK_USDT = 1000.0
-DEFAULT_BUFFER_OVER_EDGE = 0.30
-
 log = logging.getLogger("bot")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
-# --- Утилиты ---
+# --- Utilities ---
 def is_loop_running(app: Application) -> bool:
     task = getattr(app, "_main_loop_task", None)
     return task is not None and not task.done()
@@ -32,6 +30,21 @@ async def post_init(app: Application):
         await app.bot.delete_webhook(drop_pending_updates=True)
     except Exception as e:
         log.warning(f"delete_webhook failed: {e}")
+
+    # NEW: seed defaults from ENV
+    bd = app.bot_data
+    bd.setdefault('chat_ids', set())
+    env_ids = os.getenv("CHAT_IDS", "").strip()
+    if env_ids:
+        try:
+            bd['chat_ids'].update(int(x) for x in env_ids.replace(" ", "").split(",") if x)
+            log.info(f"Loaded chat IDs from ENV: {bd['chat_ids']}")
+        except Exception:
+            log.warning("CHAT_IDS env parse failed")
+
+    bd.setdefault('safety_bank_usdt', float(os.getenv("SAFETY_BANK_USDT", getattr(CONFIG, "SAFETY_BANK_USDT", 1000.0))))
+    bd.setdefault('fee_maker', float(os.getenv("FEE_MAKER", getattr(CONFIG, "FEE_MAKER", 0.0))))
+    bd.setdefault('fee_taker', float(os.getenv("FEE_TAKER", getattr(CONFIG, "FEE_TAKER", 0.0))))
 
     log.info("Бот запущен. Проверяем, нужно ли запускать основной цикл...")
     if app.bot_data.get('run_loop_on_startup', False):
@@ -48,8 +61,7 @@ async def post_init(app: Application):
         BotCommand("resume", "Возобновить поиск новых сигналов"),
         BotCommand("close", "Закрыть текущую позицию по рынку"),
         BotCommand("open", "Открыть позицию: /open long|short [lev] [steps]"),
-        BotCommand("setbank", "Установить общий банк позиции, USDT"),
-        BotCommand("setbuf", "Установить буфер за границей (напр. 0.3 или 30%)"),
+        BotCommand("setbank", "Установить общий банк позиции, USD"),
         BotCommand("setfees", "Установить комиссии, %: /setfees [maker] [taker]"),
         BotCommand("fees", "Показать текущие комиссии"),
     ])
@@ -61,9 +73,9 @@ async def broadcast(app: Application, txt: str):
             await app.bot.send_message(chat_id=cid, text=txt, parse_mode=constants.ParseMode.HTML)
         except Exception as e:
             log.error(f"Не удалось отправить сообщение в чат {cid}: {e}")
-            if "bot was blocked" in str(e):
+            if "bot was blocked" in str(e).lower() or "chat not found" in str(e).lower():
                 chat_ids.discard(cid)
-                log.info(f"Чат {cid} удален из списка рассылки (бот заблокирован).")
+                log.info(f"Чат {cid} удален из списка рассылки (бот заблокирован или чат не найден).")
     app.bot_data['chat_ids'] = chat_ids
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -102,6 +114,8 @@ async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     task = getattr(app, "_main_loop_task", None)
     if task:
         try:
+            await asyncio.sleep(0.1) # Give the loop a moment to check bot_on flag
+            task.cancel()
             await task
         except asyncio.CancelledError:
             pass
@@ -147,6 +161,7 @@ async def cmd_open(update: Update, context: ContextTypes.DEFAULT_TYPE):
         task = asyncio.create_task(scanner_engine.scanner_main_loop(app, broadcast))
         setattr(app, "_main_loop_task", task)
         await update.message.reply_text("🔌 Сканер был выключен — запускаю его…")
+        await asyncio.sleep(2) # Give it a moment to initialize
 
     if app.bot_data.get("position"):
         await update.message.reply_text("Уже есть открытая позиция. Сначала закройте её (/close).")
@@ -161,8 +176,7 @@ async def cmd_open(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Укажите сторону: long или short")
         return
 
-    lev = None
-    steps = None
+    lev, steps = None, None
     if len(context.args) >= 2:
         try: lev = int(context.args[1])
         except Exception: lev = None
@@ -179,7 +193,7 @@ async def cmd_open(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(
         f"Ок, открываю {side} по рынку текущей ценой. "
-        f"{'(левередж: '+str(lev)+') ' if lev else ''}"
+        f"{'(плечо: '+str(lev)+') ' if lev else ''}"
         f"{'(макс. шагов: '+str(steps)+')' if steps else ''}"
     )
 
@@ -188,20 +202,9 @@ async def cmd_setbank(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         val = float(ctx.args[0])
         if val <= 0: raise ValueError
         ctx.bot_data["safety_bank_usdt"] = val
-        await update.message.reply_text(f"💰 Банк на позицию установлен: {val:.2f} USDT")
+        await update.message.reply_text(f"💰 Банк на позицию установлен: {val:.2f} USD")
     except (IndexError, ValueError):
         await update.message.reply_text("Использование: /setbank 1000")
-
-async def cmd_setbuf(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    try:
-        raw = ctx.args[0].strip().replace('%','')
-        v = float(raw)
-        buf = v/100.0 if v > 1 else v
-        if not (0.0 < buf < 0.9): raise ValueError
-        ctx.bot_data["buffer_over_edge"] = buf
-        await update.message.reply_text(f"🛡️ Буфер за границей установлен: {buf:.2%}")
-    except (IndexError, ValueError):
-        await update.message.reply_text("Использование: /setbuf 0.30 (или 30%)")
 
 def _parse_fee_arg(x: str) -> float:
     s = x.strip()
@@ -234,8 +237,8 @@ async def cmd_setfees(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ Неверные значения. Пример: /setfees 0.02 0.02 (это 0.02% на сторону)")
 
 async def cmd_fees(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    fm = float(ctx.bot_data.get("fee_maker", getattr(CONFIG, "FEE_MAKER", 0.0002)))
-    ft = float(ctx.bot_data.get("fee_taker", getattr(CONFIG, "FEE_TAKER", 0.0002)))
+    fm = float(ctx.bot_data.get("fee_maker", getattr(CONFIG, "FEE_MAKER", 0.0)))
+    ft = float(ctx.bot_data.get("fee_taker", getattr(CONFIG, "FEE_TAKER", 0.0)))
     await update.message.reply_text(f"Текущие комиссии: maker={fm*100:.4f}%  taker={ft*100:.4f}% (round-trip ≈ {(fm+ft)*100:.4f}%)")
 
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -256,14 +259,17 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         sl_show = f"{pos.sl_price:.6f}" if pos.sl_price is not None else "N/A"
         tp_show = f"{pos.tp_price:.6f}" if getattr(pos, "tp_price", None) else "N/A"
         avg_show = f"{pos.avg:.6f}" if getattr(pos, "avg", None) else "N/A"
-        max_steps = getattr(pos, "max_steps", (len(getattr(pos, "step_margins", [])) or cfg.DCA_LEVELS))
+
+        reserved_used = bool(getattr(pos, "reserve_used", False))
+        reserved_available = bool(getattr(pos, "reserve_available", False) and not reserved_used)
+
+        max_steps = getattr(pos, "max_steps", (getattr(pos, "ord_levels", 0) + (1 if reserved_available else 0)))
+        
+        ordinary_left = max(0, getattr(pos, "ord_levels", 0) - min(getattr(pos, "steps_filled", 0), getattr(pos, "ord_levels", 0)))
+        reserve_left = 1 if reserved_available else 0
+
         lev_show = getattr(pos, "leverage", getattr(cfg, "LEVERAGE", "N/A"))
-        
-        remaining_total = max(0, getattr(pos, "max_steps", 0) - getattr(pos, "steps_filled", 0))
-        reserved = getattr(pos, "reserved_one", False)
-        reserved_left = 1 if (reserved and remaining_total > 0) else 0
-        ordinary_left = max(0, remaining_total - reserved_left)
-        
+
         position_status = (
             f"• <b>Сигнал ID:</b> {pos.signal_id}\n"
             f"• <b>Сторона:</b> {pos.side}\n"
@@ -271,23 +277,21 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"• <b>Ступеней:</b> {pos.steps_filled} / {max_steps}\n"
             f"• <b>Средняя цена:</b> <code>{avg_show}</code>\n"
             f"• <b>TP/SL:</b> <code>{tp_show}</code> / <code>{sl_show}</code>\n"
-            f"• <b>Резерв активирован:</b> {'Да' if reserved else 'Нет'}\n"
-            f"• <b>Осталось (обычных | резерв):</b> {ordinary_left} | {reserved_left}"
+            f"• <b>Резерв:</b> {'использован' if reserved_used else ('доступен' if reserved_available else 'нет')}\n"
+            f"• <b>Осталось (обычных | резерв):</b> {ordinary_left} | {reserve_left}"
         )
     
-    bank = bot_data.get("safety_bank_usdt", getattr(cfg, "SAFETY_BANK_USDT", DEFAULT_BANK_USDT))
-    buf  = bot_data.get("buffer_over_edge", getattr(cfg, "BUFFER_OVER_EDGE", DEFAULT_BUFFER_OVER_EDGE))
-    fm = bot_data.get("fee_maker", getattr(cfg, "FEE_MAKER", 0.0002))
-    ft = bot_data.get("fee_taker", getattr(cfg, "FEE_TAKER", 0.0002))
+    bank = bot_data.get("safety_bank_usdt", getattr(cfg, "SAFETY_BANK_USDT", 1500.0))
+    fm = bot_data.get("fee_maker", getattr(cfg, "FEE_MAKER", 0.0))
+    ft = bot_data.get("fee_taker", getattr(cfg, "FEE_TAKER", 0.0))
     
-    dca_info = f"• DCA: max_steps={CONFIG.DCA_LEVELS} (резерв {'вкл' if active_position and getattr(active_position, 'reserved_one', False) else 'выкл'})\n"
+    dca_info = f"• DCA: max_ord_steps={getattr(active_position, 'ord_levels', 'N/A')}, growth={getattr(active_position, 'growth', 'N/A')}\n"
 
     msg = (
         f"<b>Состояние бота {BOT_VERSION}</b>\n\n"
         f"<b>Статус сканера:</b> {scanner_status}\n\n"
         f"<b><u>Риск/банк:</u></b>\n"
-        f"• Банк позиции: <b>{bank:.2f} USDT</b>\n"
-        f"• Буфер за границей: <b>{buf:.2%}</b> (неактивно в MARGIN-режиме)\n"
+        f"• Банк позиции: <b>{bank:.2f} USD</b>\n"
         f"• Комиссии: maker <b>{fm*100:.4f}%</b> / taker <b>{ft*100:.4f}%</b> (RT≈ {(fm+ft)*100:.4f}%)\n"
         f"{dca_info}\n"
         f"<b><u>Активная позиция:</u></b>\n{position_status}"
@@ -297,7 +301,6 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 if __name__ == "__main__":
-    # ИСПРАВЛЕНО: Убран лишний аргумент для совместимости с PTB v20+
     persistence = PicklePersistence(filepath="bot_persistence")
     app = ApplicationBuilder().token(BOT_TOKEN).persistence(persistence).post_init(post_init).build()
 
@@ -308,11 +311,10 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("pause", cmd_pause))
     app.add_handler(CommandHandler("resume", cmd_resume))
     app.add_handler(CommandHandler("setbank", cmd_setbank))
-    app.add_handler(CommandHandler("setbuf", cmd_setbuf))
     app.add_handler(CommandHandler("close", cmd_close))
     app.add_handler(CommandHandler("open", cmd_open))
     app.add_handler(CommandHandler("setfees", cmd_setfees))
     app.add_handler(CommandHandler("fees", cmd_fees))
-
+    
     log.info(f"Bot {BOT_VERSION} starting...")
     app.run_polling()
