@@ -1,4 +1,4 @@
-# scanner_bmr_dca.py — patched
+# scanner_bmr_dca.py — patched, full
 # - безопасная нормализация символа (str|dict|list)
 # - автосоздание листов BMR_DCA_<SYMBOL> и дублирование логов туда
 # - интеграция ФА-бота (risk/bias/ttl/updated_at) + периодическое обновление
@@ -17,7 +17,7 @@ from telegram.ext import Application
 import gspread
 
 # === Forex адаптеры и фид ===
-from fx_mt5_adapter import FX, margin_to_lots, default_tick  # lots_to_margin не обязателен здесь
+from fx_mt5_adapter import FX, margin_to_lots, default_tick
 from fx_feed import fetch_ohlcv as fetch_ohlcv_yf
 
 import trade_executor
@@ -106,6 +106,10 @@ class CONFIG:
 
     # ФА-политика
     FA_REFRESH_SEC = 300  # перечитывать раз в 5 минут
+
+    # Для расчёта целевых цен усреднений
+    TACTICAL_PCTS = [0.25, 0.50, 0.75]
+    STRATEGIC_PCTS = [0.33, 0.66, 1.00]
 
 # ENV-переопределения
 CONFIG.SYMBOL   = os.getenv("FX_SYMBOL", CONFIG.SYMBOL)
@@ -872,9 +876,12 @@ async def scanner_main_loop(
                             cum_margin = _pos_total_margin(pos)
                             cum_notional = cum_margin * pos.leverage
                             fees_paid_est = cum_notional * fee_taker * CONFIG.LIQ_FEE_BUFFER
-                            liq = approx_liq_price_cross(avg=pos.avg, side=pos.side, qty=pos.qty,
-                                                         equity=bank, mmr=CONFIG.MAINT_MMR, fees_paid=fees_paid_est)
-                            if not np.isfinite(liq) or liq <= 0: liq = None
+                            liq = approx_liq_price_cross(
+                                avg=pos.avg, side=pos.side, qty=pos.qty,
+                                equity=bank, mmr=CONFIG.MAINT_MMR, fees_paid=fees_paid_est
+                            )
+                            if not np.isfinite(liq) or liq <= 0:
+                                liq = None
                             dist_to_liq_pct = liq_distance_pct(pos.side, px, liq)
                             dist_txt = "N/A" if np.isnan(dist_to_liq_pct) else f"{dist_to_liq_pct:.2f}%"
                             liq_arrow = "↓" if pos.side == "LONG" else "↑"
@@ -885,13 +892,19 @@ async def scanner_main_loop(
                                         f"↓<code>{fmt(brk_dn)}</code> ({brk_dn_pct:.2f}%)")
 
                             await say(
-                                f"↩️ Ретест — резервный добор ({'шип' if need_retest_spike else 'плавный'})\n"
-                                f"Цена: <code>{fmt(px)}</code> | <b>{lots:.2f} lot</b>\n"
-                                f"Добор (резерв): <b>{margin:.2f} USD</b> | Депозит (тек): <b>{cum_margin:.2f} USD</b>\n"
-                                f"Средняя: <code>{fmt(pos.avg)}</code> | TP: <code>{fmt(pos.tp_price)}</code>\n"
-                                f"Ликвидация (est): {liq_arrow}<code>{fmt(liq)}</code> ({dist_txt})\n"
-                                f"{brk_line}\n"
-                                f"<i>Контролируй Margin level ≥ 20%</i>"
+                                "↩️ Ретест — резервный добор{}\n"
+                                "Цена: <code>{}</code> | <b>{:.2f} lot</b>\n"
+                                "Добор (резерв): <b>{:.2f} USD</b> | Депозит (тек): <b>{:.2f} USD</b>\n"
+                                "Средняя: <code>{}</code> | TP: <code>{}</code>\n"
+                                "Ликвидация (est): {}<code>{}</code> ({})\n"
+                                "{}\n"
+                                "<i>Контролируй Margin level ≥ 20%</i>".format(
+                                    " (шип)" if need_retest_spike else "",
+                                    fmt(px), lots, margin, cum_margin,
+                                    fmt(pos.avg), fmt(pos.tp_price),
+                                    liq_arrow, fmt(liq), dist_txt,
+                                    brk_line
+                                )
                             )
                             await log_event_safely({
                                 "Event_ID": f"RETEST_ADD_{pos.signal_id}_{pos.steps_filled}",
