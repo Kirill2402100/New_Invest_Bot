@@ -116,3 +116,17 @@ def fetch_fx_ohlcv(sym_or_pair: str, interval: str="1min", bars: int=2000) -> pd
         return df
 
     raise RuntimeError(f"FX feed failed for {pair} (providers exhausted)")
+    # ---- алиасы интервалов (чтобы "5m" -> "5min", "1h" оставался "1h" и т.д.)
+_INTERVAL_ALIASES = {
+    "1m": "1min", "5m": "5min", "15m": "15min", "30m": "30min",
+    "1h": "1h", "2h": "2h", "4h": "4h", "1d": "1day", "1D": "1day"
+}
+def _norm_interval(iv: str) -> str:
+    return _INTERVAL_ALIASES.get(iv.strip(), iv)
+
+# (по желанию) можно внутри _fetch_td/_fetch_av использовать _norm_interval(interval)
+
+def fetch_ohlcv(sym_or_pair: str, interval: str = "1m", limit: int = 2000):
+    """Совместимый алиас для scanner_bmr_dca: принимает limit, а не bars."""
+    interval = _norm_interval(interval)
+    return fetch_fx_ohlcv(sym_or_pair, interval=interval, bars=limit)
