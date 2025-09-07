@@ -12,7 +12,6 @@ from datetime import datetime, timezone
 
 import numpy as np
 import pandas as pd
-import pandas_ta as ta
 from telegram.ext import Application
 import gspread
 
@@ -23,6 +22,66 @@ from fx_feed import fetch_ohlcv as fetch_ohlcv_yf
 import trade_executor
 
 log = logging.getLogger("bmr_dca_engine")
+
+# === Мини-TA без внешних зависимостей (EMA/ATR/RSI/ADX/Supertrend) ===
+def _ema(s: pd.Series, length: int) -> pd.Series:
+    return s.ewm(span=length, adjust=False, min_periods=length).mean()
+
+def _rma(s: pd.Series, length: int) -> pd.Series:
+    alpha = 1.0 / max(length, 1)
+    return s.ewm(alpha=alpha, adjust=False, min_periods=length).mean()
+
+def ta_atr(h: pd.Series, l: pd.Series, c: pd.Series, length: int = 14) -> pd.Series:
+    cp = c.shift(1)
+    tr = pd.concat([(h - l), (h - cp).abs(), (l - cp).abs()], axis=1).max(axis=1)
+    return _rma(tr, length)
+
+def ta_rsi(c: pd.Series, length: int = 14) -> pd.Series:
+    d = c.diff()
+    up = d.clip(lower=0.0)
+    dn = (-d).clip(lower=0.0)
+    rs = _rma(up, length) / _rma(dn, length).replace(0, np.nan)
+    return 100.0 - (100.0 / (1.0 + rs))
+
+def ta_adx(h: pd.Series, l: pd.Series, c: pd.Series, length: int = 14) -> pd.Series:
+    up = h.diff()
+    dn = -l.diff()
+    plus_dm  = pd.Series(np.where((up > dn) & (up > 0),  up, 0.0), index=h.index)
+    minus_dm = pd.Series(np.where((dn > up) & (dn > 0), dn, 0.0), index=h.index)
+    cp = c.shift(1)
+    tr_raw = pd.concat([(h - l), (h - cp).abs(), (l - cp).abs()], axis=1).max(axis=1)
+    tr = _rma(tr_raw, length).replace(0, np.nan)
+    plus_di  = 100.0 * _rma(plus_dm,  length) / tr
+    minus_di = 100.0 * _rma(minus_dm, length) / tr
+    dx  = ((plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)) * 100.0
+    return _rma(dx, length)
+
+def ta_supertrend(h: pd.Series, l: pd.Series, c: pd.Series, length: int = 10, multiplier: float = 3.0) -> pd.DataFrame:
+    atr = ta_atr(h, l, c, length)
+    hl2 = (h + l) / 2.0
+    upper = hl2 + multiplier * atr
+    lower = hl2 - multiplier * atr
+
+    f_upper = upper.copy()
+    f_lower = lower.copy()
+    for i in range(1, len(c)):
+        f_upper.iloc[i] = min(upper.iloc[i], f_upper.iloc[i-1]) if c.iloc[i-1] > f_upper.iloc[i-1] else upper.iloc[i]
+        f_lower.iloc[i] = max(lower.iloc[i], f_lower.iloc[i-1]) if c.iloc[i-1] < f_lower.iloc[i-1] else lower.iloc[i]
+
+    direction = pd.Series(index=c.index, dtype=int)
+    direction.iloc[0] = 1
+    for i in range(1, len(c)):
+        if c.iloc[i] > f_upper.iloc[i-1]:
+            direction.iloc[i] = 1
+        elif c.iloc[i] < f_lower.iloc[i-1]:
+            direction.iloc[i] = -1
+        else:
+            direction.iloc[i] = direction.iloc[i-1]
+            if direction.iloc[i] == 1 and f_lower.iloc[i] < f_lower.iloc[i-1]:
+                f_lower.iloc[i] = f_lower.iloc[i-1]
+            if direction.iloc[i] == -1 and f_upper.iloc[i] > f_upper.iloc[i-1]:
+                f_upper.iloc[i] = f_upper.iloc[i-1]
+    return pd.DataFrame({"direction": direction, "upper": f_upper, "lower": f_lower})
 
 # ---------------------------------------------------------------------------
 # CONFIG
@@ -45,13 +104,13 @@ class CONFIG:
     TF_RANGE = "1h"
 
     # Сколько истории собирать под диапазоны
-    STRATEGIC_LOOKBACK_DAYS = 60   # для TF_RANGE
-    TACTICAL_LOOKBACK_DAYS  = 3    # для TF_RANGE
+    STRATEGIC_LOOKBACK_DAYS = 60    # для TF_RANGE
+    TACTICAL_LOOKBACK_DAYS  = 3     # для TF_RANGE
 
     # Таймауты/интервалы
     FETCH_TIMEOUT = 25
     SCAN_INTERVAL_SEC = 3
-    REBUILD_RANGE_EVERY_MIN   = 15
+    REBUILD_RANGE_EVERY_MIN    = 15
     REBUILD_TACTICAL_EVERY_MIN = 5
 
     # Диапазон/квантили/индикаторы
@@ -112,7 +171,7 @@ class CONFIG:
     STRATEGIC_PCTS = [0.33, 0.66, 1.00]
 
 # ENV-переопределения
-CONFIG.SYMBOL   = os.getenv("FX_SYMBOL", CONFIG.SYMBOL)
+CONFIG.SYMBOL    = os.getenv("FX_SYMBOL", CONFIG.SYMBOL)
 CONFIG.TF_ENTRY = os.getenv("TF_ENTRY", CONFIG.TF_ENTRY)
 CONFIG.TF_RANGE = os.getenv("TF_TREND", CONFIG.TF_RANGE)
 
@@ -373,8 +432,8 @@ def choose_growth(ind: dict, rng_strat: dict, rng_tac: dict) -> float:
 async def build_range_from_df(df: Optional[pd.DataFrame]):
     if df is None or df.empty: return None
     df.columns = ["open","high","low","close","volume"]
-    ema = ta.ema(df["close"], length=50)
-    atr = ta.atr(df["high"], df["low"], df["close"], length=14)
+    ema = _ema(df["close"], length=50)
+    atr = ta_atr(df["high"], df["low"], df["close"], length=14)
     lower = float(np.quantile(df["close"].dropna(), CONFIG.Q_LOWER))
     upper = float(np.quantile(df["close"].dropna(), CONFIG.Q_UPPER))
     if pd.notna(ema.iloc[-1]) and pd.notna(atr.iloc[-1]):
@@ -400,25 +459,15 @@ async def build_ranges(symbol: str):
     return strat, tac
 
 def compute_indicators_5m(df: pd.DataFrame) -> dict:
-    atr5m = ta.atr(df["high"], df["low"], df["close"], length=14).iloc[-1]
-    rsi = ta.rsi(df["close"], length=CONFIG.RSI_LEN).iloc[-1]
-    adx_df = ta.adx(df["high"], df["low"], df["close"], length=CONFIG.ADX_LEN)
-    adx_cols = adx_df.filter(like=f"ADX_{CONFIG.ADX_LEN}").columns
-    if len(adx_cols) > 0:
-        adx = adx_df[adx_cols[0]].iloc[-1]
-    else:
-        raise ValueError(f"Could not find ADX column for length {CONFIG.ADX_LEN}")
-
-    ema20 = ta.ema(df["close"], length=20).iloc[-1]
+    atr5m = ta_atr(df["high"], df["low"], df["close"], length=14).iloc[-1]
+    rsi   = ta_rsi(df["close"], length=CONFIG.RSI_LEN).iloc[-1]
+    adx   = ta_adx(df["high"], df["low"], df["close"], length=CONFIG.ADX_LEN).iloc[-1]
+    ema20 = _ema(df["close"], length=20).iloc[-1]
     vol_z = (df["volume"].iloc[-1] - df["volume"].rolling(CONFIG.VOL_WIN).mean().iloc[-1]) / \
             max(df["volume"].rolling(CONFIG.VOL_WIN).std().iloc[-1], 1e-9)
-    st = ta.supertrend(df["high"], df["low"], df["close"], length=10, multiplier=3.0)
-    d_col = next((c for c in st.columns if c.startswith("SUPERTd_")), None)
-    if d_col is None:
-        raise ValueError("Supertrend direction column not found")
-
-    dir_now  = int(st[d_col].iloc[-1])
-    dir_prev = int(st[d_col].iloc[-2])
+    st = ta_supertrend(df["high"], df["low"], df["close"], length=10, multiplier=3.0)
+    dir_now  = int(st["direction"].iloc[-1])
+    dir_prev = int(st["direction"].iloc[-2])
     st_state = (
         "down_to_up_near" if (dir_prev == -1 and dir_now == 1) else
         "up_to_down_near" if (dir_prev == 1 and dir_now == -1) else
@@ -787,41 +836,105 @@ async def scanner_main_loop(
                     lots = margin_to_lots(symbol, margin, price=px, leverage=pos.leverage)
 
                     cum_notional = cum_margin * pos.leverage
-                            fees_paid_est = cum_notional * fee_taker * CONFIG.LIQ_FEE_BUFFER
-                            liq = approx_liq_price_cross(
-                                avg=pos.avg, side=pos.side, qty=pos.qty,
-                                equity=bank, mmr=CONFIG.MAINT_MMR, fees_paid=fees_paid_est
-                            )
-                            if not np.isfinite(liq) or liq <= 0:
-                                liq = None
-                            dist_to_liq_pct = liq_distance_pct(pos.side, px, liq)
-                            dist_txt = "N/A" if np.isnan(dist_to_liq_pct) else f"{dist_to_liq_pct:.2f}%"
-                            liq_arrow = "↓" if pos.side == "LONG" else "↑"
+                    fees_paid_est = cum_notional * fee_taker * CONFIG.LIQ_FEE_BUFFER
+                    liq = approx_liq_price_cross(
+                        avg=pos.avg, side=pos.side, qty=pos.qty,
+                        equity=bank, mmr=CONFIG.MAINT_MMR, fees_paid=fees_paid_est
+                    )
+                    if not np.isfinite(liq) or liq <= 0:
+                        liq = None
+                    dist_to_liq_pct = liq_distance_pct(pos.side, px, liq)
+                    dist_txt = "N/A" if np.isnan(dist_to_liq_pct) else f"{dist_to_liq_pct:.2f}%"
+                    liq_arrow = "↓" if pos.side == "LONG" else "↑"
 
-                            brk_up, brk_dn = break_levels(rng_strat)
-                            brk_up_pct, brk_dn_pct = break_distance_pcts(px, brk_up, brk_dn)
-                            brk_line = (
-                                f"Пробой: ↑<code>{fmt(brk_up)}</code> ({brk_up_pct:.2f}%) | "
-                                f"↓<code>{fmt(brk_dn)}</code> ({brk_dn_pct:.2f}%)"
-                            )
+                    brk_up, brk_dn = break_levels(rng_strat)
+                    brk_up_pct, brk_dn_pct = break_distance_pcts(px, brk_up, brk_dn)
+                    brk_line = (
+                        f"Пробой: ↑<code>{fmt(brk_up)}</code> ({brk_up_pct:.2f}%) | "
+                        f"↓<code>{fmt(brk_dn)}</code> ({brk_dn_pct:.2f}%)"
+                    )
 
-                            await say(
-                                f"↩️ Ретест — резервный добор ({'шип' if need_retest_spike else 'плавный'})\n"
-                                f"Цена: <code>{fmt(px)}</code> | <b>{lots:.2f} lot</b>\n"
-                                f"Добор (резерв): <b>{margin:.2f} USD</b> | Депозит (тек): <b>{cum_margin:.2f} USD</b>\n"
-                                f"Средняя: <code>{fmt(pos.avg)}</code> | TP: <code>{fmt(pos.tp_price)}</code>\n"
-                                f"Ликвидация (est): {liq_arrow}<code>{fmt(liq)}</code> ({dist_txt})\n"
-                                f"{brk_line}\n"
-                                f"<i>Контролируй Margin level ≥ 20%</i>"
-                            )
-                            await log_event_safely({
-                                "Event_ID": f"RETEST_ADD_{pos.signal_id}_{pos.steps_filled}",
-                                "Signal_ID": pos.signal_id,
-                                "Timestamp_UTC": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
-                                "Pair": symbol, "Side": pos.side, "Event": "RETEST_ADD",
-                                "Step_No": pos.steps_filled, "Step_Margin_USDT": margin,
-                                "Entry_Price": px, "Avg_Price": pos.avg
-                            })
+                    await say(
+                        f"↩️ Ретест — резервный добор ({'шип' if need_retest_spike else 'плавный'})\n"
+                        f"Цена: <code>{fmt(px)}</code> | <b>{lots:.2f} lot</b>\n"
+                        f"Добор (резерв): <b>{margin:.2f} USD</b> | Депозит (тек): <b>{cum_margin:.2f} USD</b>\n"
+                        f"Средняя: <code>{fmt(pos.avg)}</code> | TP: <code>{fmt(pos.tp_price)}</code>\n"
+                        f"Ликвидация (est): {liq_arrow}<code>{fmt(liq)}</code> ({dist_txt})\n"
+                        f"{brk_line}\n"
+                        f"<i>Контролируй Margin level ≥ 20%</i>"
+                    )
+                    await log_event_safely({
+                        "Event_ID": f"RETEST_ADD_{pos.signal_id}_{pos.steps_filled}",
+                        "Signal_ID": pos.signal_id,
+                        "Timestamp_UTC": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+                        "Pair": symbol, "Side": pos.side, "Event": "RETEST_ADD",
+                        "Step_No": pos.steps_filled, "Step_Margin_USDT": margin,
+                        "Entry_Price": px, "Avg_Price": pos.avg
+                    })
+
+            if pos:
+                # Резервное усреднение при ретесте
+                now_ts = time.time()
+                need_retest_spike = (pos.spike_flag) and (pos.spike_deadline_ts and now_ts <= pos.spike_deadline_ts)
+                need_retest_plain = (not pos.spike_flag) and (pos.freeze_ordinary)
+                if need_retest_spike and pos.spike_ref_ohlc:
+                    o, h, l, c = pos.spike_ref_ohlc
+                    spike_top, spike_bottom = (h, l) if pos.spike_direction == "down" else (h, l)
+                    retrace_target = spike_top - CONFIG.SPIKE["RETRACE_FRAC"] * (spike_top - spike_bottom)
+                    retrace_hit = (px <= retrace_target)
+                else:
+                    retrace_hit = False
+
+                need_retest_plain_hit = False
+                if need_retest_plain:
+                    band = CONFIG.REENTRY_BAND
+                    brk_up, brk_dn = break_levels(rng_strat)
+                    reentry_up = brk_up * (1.0 - band)
+                    reentry_dn = brk_dn * (1.0 + band)
+                    if px <= reentry_up and px >= reentry_dn:
+                        need_retest_plain_hit = True
+
+                if (retrace_hit or need_retest_plain_hit) and pos.reserve_available and (not pos.reserve_used):
+                    if pos.last_add_ts is None or (now_ts - pos.last_add_ts) >= CONFIG.ADD_COOLDOWN_SEC:
+                        margin, _ = pos.add_reserve_step(px)
+                        cum_margin = _pos_total_margin(pos)
+                        lots = margin_to_lots(symbol, margin, price=px, leverage=pos.leverage)
+                        cum_notional = cum_margin * pos.leverage
+                        fees_paid_est = cum_notional * fee_taker * CONFIG.LIQ_FEE_BUFFER
+                        liq = approx_liq_price_cross(
+                            avg=pos.avg, side=pos.side, qty=pos.qty,
+                            equity=bank, mmr=CONFIG.MAINT_MMR, fees_paid=fees_paid_est
+                        )
+                        if not np.isfinite(liq) or liq <= 0:
+                            liq = None
+                        dist_to_liq_pct = liq_distance_pct(pos.side, px, liq)
+                        dist_txt = "N/A" if np.isnan(dist_to_liq_pct) else f"{dist_to_liq_pct:.2f}%"
+                        liq_arrow = "↓" if pos.side == "LONG" else "↑"
+
+                        brk_up, brk_dn = break_levels(rng_strat)
+                        brk_up_pct, brk_dn_pct = break_distance_pcts(px, brk_up, brk_dn)
+                        brk_line = (
+                            f"Пробой: ↑<code>{fmt(brk_up)}</code> ({brk_up_pct:.2f}%) | "
+                            f"↓<code>{fmt(brk_dn)}</code> ({brk_dn_pct:.2f}%)"
+                        )
+
+                        await say(
+                            f"↩️ Ретест — резервный добор ({'шип' if need_retest_spike else 'плавный'})\n"
+                            f"Цена: <code>{fmt(px)}</code> | <b>{lots:.2f} lot</b>\n"
+                            f"Добор (резерв): <b>{margin:.2f} USD</b> | Депозит (тек): <b>{cum_margin:.2f} USD</b>\n"
+                            f"Средняя: <code>{fmt(pos.avg)}</code> | TP: <code>{fmt(pos.tp_price)}</code>\n"
+                            f"Ликвидация (est): {liq_arrow}<code>{fmt(liq)}</code> ({dist_txt})\n"
+                            f"{brk_line}\n"
+                            f"<i>Контролируй Margin level ≥ 20%</i>"
+                        )
+                        await log_event_safely({
+                            "Event_ID": f"RETEST_ADD_{pos.signal_id}_{pos.steps_filled}",
+                            "Signal_ID": pos.signal_id,
+                            "Timestamp_UTC": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+                            "Pair": symbol, "Side": pos.side, "Event": "RETEST_ADD",
+                            "Step_No": pos.steps_filled, "Step_Margin_USDT": margin,
+                            "Entry_Price": px, "Avg_Price": pos.avg
+                        })
 
                 # Обычные усреднения
                 nxt = next_pct_target(pos)
