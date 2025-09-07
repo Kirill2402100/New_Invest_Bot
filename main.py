@@ -4,10 +4,10 @@ import asyncio
 import logging
 from typing import Optional
 
-from telegram import Update, constants, BotCommand
+from telegram import Update, constants, BotCommand, BotCommandScopeAllGroupChats, BotCommandScopeAllPrivateChats
 from telegram.ext import Application, ApplicationBuilder, CommandHandler, ContextTypes, PicklePersistence
 
-# --- Logging FIRST (до фоллбек-импорта) ---
+# --- Logging FIRST ---
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logging.getLogger("httpx").setLevel(logging.WARNING)
 log = logging.getLogger("bot")
@@ -52,7 +52,7 @@ except ImportError:
         return used, equity, free, ml
 
 # --- Configuration ---
-BOT_VERSION = "BMR-DCA FX v1.7 (Stable)"
+BOT_VERSION = "BMR-DCA FX v1.9 (Final)"
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
 if not BOT_TOKEN:
@@ -63,12 +63,10 @@ if not BOT_TOKEN:
 def _parse_chat_symbols_env() -> list[tuple[int, str]]:
     raw = os.getenv("CHAT_SYMBOLS", "").strip()
     pairs = []
-    if not raw:
-        return pairs
+    if not raw: return pairs
     for token in raw.split(","):
         token = token.strip()
-        if not token or ":" not in token:
-            continue
+        if not token or ":" not in token: continue
         cid_str, sym = token.split(":", 1)
         try:
             pairs.append((int(cid_str.strip()), sym.strip().upper()))
@@ -116,16 +114,19 @@ async def post_init(app: Application):
 
     bd.setdefault('safety_bank_usdt', float(os.getenv("SAFETY_BANK_USDT", CONFIG.SAFETY_BANK_USDT)))
 
-    await app.bot.set_my_commands([
+    CMDS = [
         BotCommand("start", "Запустить/перезапустить бота"),
-        BotCommand("run", "Запустить сканеры по символам"),
+        BotCommand("run", "Запустить сканеры из CHAT_SYMBOLS"),
         BotCommand("stop", "Остановить все сканеры"),
         BotCommand("status", "Показать статус для вашего символа"),
         BotCommand("mychatid", "Узнать ваш chat_id"),
         BotCommand("open", "Открыть позицию: /open long|short [lev] [steps]"),
         BotCommand("close", "Закрыть текущую позицию"),
         BotCommand("setbank", "Установить банк для вашего символа"),
-    ])
+    ]
+    await app.bot.set_my_commands(CMDS, scope=BotCommandScopeAllGroupChats())
+    await app.bot.set_my_commands(CMDS, scope=BotCommandScopeAllPrivateChats())
+    await app.bot.set_my_commands(CMDS)
 
 async def broadcast(app: Application, txt: str, target_chat_id: int | None = None):
     chat_ids = set(app.bot_data.get('chat_ids', set()))
@@ -149,6 +150,7 @@ async def start_symbol_loops(app: Application):
     if not pairs:
         log.warning("CHAT_SYMBOLS пуст — запускается одиночный цикл.")
         box = {"bot_on": True, "scan_paused": False}
+        # ИСПРАВЛЕНО: Совместимый вызов для одиночного режима
         task = asyncio.create_task(scanner_engine.scanner_main_loop(app, broadcast, botbox=box))
         app.bot_data["_main_loop_task"] = task
         app.bot_data["_main_loop_box"] = box
@@ -162,14 +164,17 @@ async def start_symbol_loops(app: Application):
             continue
 
         box = {"bot_on": True, "scan_paused": False}
+        # Позиционный вызов для мульти-режима
         task = asyncio.create_task(
-            scanner_engine.scanner_main_loop(app, broadcast, symbol_override=symbol, target_chat_id=chat_id, botbox=box)
+            scanner_engine.scanner_main_loop(app, broadcast, symbol, chat_id, box)
         )
         app.bot_data["loops"][symbol] = {"task": task, "box": box, "chat_id": chat_id}
         log.info(f"Started loop for {symbol} -> chat {chat_id}")
 
-# --- Command Handlers ---
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
+    log.exception("Unhandled error in handler", exc_info=context.error)
 
+# --- Command Handlers ---
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     ctx.bot_data.setdefault('chat_ids', set()).add(chat_id)
@@ -208,6 +213,7 @@ async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         tasks_to_wait.append(app.bot_data["_main_loop_task"])
 
     log.info(f"Stopping {len(tasks_to_wait)} scanner loops...")
+    # ИСПРАВЛЕНО: Корректная отмена задач
     for t in tasks_to_wait:
         t.cancel()
     await asyncio.gather(*tasks_to_wait, return_exceptions=True)
@@ -250,11 +256,12 @@ async def cmd_open(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         log.info(f"Loop for {sym} is not running. Restarting it for /open command.")
         await update.message.reply_text(f"⚙️ Перезапускаю сканер для {sym}...")
         if box is app.bot_data.get("_main_loop_box"):
+            # ИСПРАВЛЕНО: Совместимый вызов для одиночного режима
             task = asyncio.create_task(scanner_engine.scanner_main_loop(app, broadcast, botbox=box))
             app.bot_data["_main_loop_task"] = task
         else:
             task = asyncio.create_task(
-                scanner_engine.scanner_main_loop(app, broadcast, symbol_override=sym, target_chat_id=update.effective_chat.id, botbox=box)
+                scanner_engine.scanner_main_loop(app, broadcast, sym, update.effective_chat.id, box)
             )
             loops = app.bot_data.setdefault("loops", {})
             if sym in loops:
@@ -354,6 +361,8 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 if __name__ == "__main__":
     persistence = PicklePersistence(filepath="bot_persistence")
     app = ApplicationBuilder().token(BOT_TOKEN).persistence(persistence).post_init(post_init).build()
+
+    app.add_error_handler(on_error)
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("run", cmd_run))
