@@ -1,290 +1,325 @@
 # fx_feed.py
 from __future__ import annotations
 
-import os, time, logging, math
-from typing import Optional, Tuple
+import os
+import math
+import logging
+from typing import Optional, Tuple, Dict
+
+import numpy as np
 import pandas as pd
 
 log = logging.getLogger("fx_feed")
 
-# -------------------------------
-# КЭШ (на символ+TF)
-# -------------------------------
-_CACHE: dict[Tuple[str, str], dict] = {}
+# --- Публичный API этого файла ---
+__all__ = ["fetch_ohlcv"]
 
-def _ttl_for_tf(tf: str) -> int:
-    tf = tf.lower()
-    if tf in ("1m", "2m", "5m", "15m"):        return 20     # сек
-    if tf in ("30m", "45m", "1h", "2h", "4h"): return 120
-    if tf in ("1d", "1w", "1wk"):              return 600
-    return 60
+# ----------------------------------------------------------------------
+# Символьные маппинги под разные источники
+# ----------------------------------------------------------------------
+def _normalize_symbol(sym: str) -> Dict[str, str]:
+    """Принимает 'EURUSD'/'EUR/USD' и т.п. Возвращает обозначения под провайдеры."""
+    s = (sym or "").upper().replace("/", "")
+    if len(s) != 6:
+        # Фолбэк для экзотики — попробуем как есть
+        s = (sym or "").upper().replace("/", "")
+    base, quote = s[:3], s[3:]
+    return {
+        "mt5": f"{base}{quote}",
+        "yahoo": f"{base}{quote}=X",            # EURUSD=X
+        "stooq": f"{base}{quote}".lower(),      # eurusd
+        "twelve": f"{base}/{quote}",            # EUR/USD
+    }
 
-def _from_cache(symbol: str, tf: str, need_rows: int) -> Optional[pd.DataFrame]:
-    k = (symbol.upper(), tf)
-    it = _CACHE.get(k)
-    if not it: return None
-    if (time.time() - it["ts"]) > it["ttl"]: return None
-    df: pd.DataFrame = it["df"]
-    if len(df) >= need_rows:
-        return df.tail(need_rows).copy()
-    return None
+# ----------------------------------------------------------------------
+# Нормализация датафреймов: столбцы/индекс/типы
+# ----------------------------------------------------------------------
+_NEED_COLS = ["open", "high", "low", "close", "volume"]
 
-def _to_cache(symbol: str, tf: str, df: pd.DataFrame):
-    _CACHE[(symbol.upper(), tf)] = {"ts": time.time(), "ttl": _ttl_for_tf(tf), "df": df.copy()}
+def _lower_cols(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df.columns = [str(c).lower() for c in df.columns]
+    return df
 
-# -------------------------------
-# НОРМАЛИЗАЦИЯ
-# -------------------------------
-def _norm_symbol(sym: str) -> str:
-    return str(sym or "").replace("/", "").replace("\\", "").replace("-", "").upper()
+def _flatten_multiindex(df: pd.DataFrame) -> pd.DataFrame:
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = [tuple(c)[0] if isinstance(c, tuple) else c for c in df.columns]
+    return df
 
-def _yahoo_symbol(sym: str) -> str:
-    s = _norm_symbol(sym)
-    return f"{s}=X" if not s.endswith("=X") else s
+def _to_utc_index(df: pd.DataFrame, time_col: Optional[str] = None) -> pd.DataFrame:
+    df = df.copy()
+    if time_col and time_col in df.columns:
+        df[time_col] = pd.to_datetime(df[time_col], utc=True, errors="coerce")
+        df = df.dropna(subset=[time_col]).sort_values(time_col).set_index(time_col)
+    elif not isinstance(df.index, pd.DatetimeIndex):
+        # Пробуем привести индекс
+        try:
+            idx = pd.to_datetime(df.index, utc=True, errors="coerce")
+            df.index = idx
+            df = df[~df.index.isna()]
+        except Exception:
+            pass
+    else:
+        # уже DatetimeIndex → убеждаемся, что UTC
+        if df.index.tz is None:
+            df.index = df.index.tz_localize("UTC")
+        else:
+            df.index = df.index.tz_convert("UTC")
+    return df
 
-def _td_symbol(sym: str) -> str:
-    s = str(sym or "").upper().replace(" ", "")
-    if "/" in s: return s
-    # EURUSD -> EUR/USD
-    return f"{s[:3]}/{s[3:]}" if len(s) == 6 else s
-
-def _ensure_ohlcv(df: pd.DataFrame, limit: int) -> pd.DataFrame:
-    """Приводим к [open, high, low, close, volume] + UTC DatetimeIndex"""
-    if df is None or df.empty:
-        return pd.DataFrame(columns=["open","high","low","close","volume"])
-    df = df.rename(columns={
-        "Open":"open","High":"high","Low":"low","Close":"close","Adj Close":"close",
-        "Volume":"volume","tick_volume":"volume","real_volume":"volume"
-    })
-    # гарантируем нужные колонки
-    cols = ["open","high","low","close","volume"]
-    df = df[[c for c in cols if c in df.columns]]
-    for c in cols:
+def _ensure_cols(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    # у Yahoo встречается 'adj close'
+    if "close" not in df.columns and "adj close" in df.columns:
+        df["close"] = df["adj close"]
+    for c in _NEED_COLS:
         if c not in df.columns:
             df[c] = 0.0
-    # индекс во времени
-    if "time" in df.columns and not isinstance(df.index, pd.DatetimeIndex):
-        df["time"] = pd.to_datetime(df["time"], utc=True)
-        df = df.set_index("time")
-    if not isinstance(df.index, pd.DatetimeIndex):
-        # попробуем привести
-        try: df.index = pd.to_datetime(df.index, utc=True)
-        except Exception: pass
+    df = df[_NEED_COLS]
+    # типы
+    for c in _NEED_COLS:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    df = df.dropna(how="any")
+    return df
+
+def _normalize_ohlcv_df(df: pd.DataFrame, time_col: Optional[str] = None) -> pd.DataFrame:
+    if df is None or df.empty:
+        raise RuntimeError("empty dataframe")
+    df = _flatten_multiindex(df)
+    df = _lower_cols(df)
+    # мэппинги разных провайдеров
+    rename_map = {
+        "date": "time", "datetime": "time", "timestamp": "time",
+        "open*": "open", "high*": "high", "low*": "low", "close*": "close",
+    }
+    # .rename с паттернами нам не нужен, просто базовое приведение
+    if "datetime" in df.columns and "time" not in df.columns:
+        df = df.rename(columns={"datetime": "time"})
+    if "timestamp" in df.columns and "time" not in df.columns:
+        df = df.rename(columns={"timestamp": "time"})
+    if "date" in df.columns and "time" not in df.columns:
+        df = df.rename(columns={"date": "time"})
+    df = _to_utc_index(df, time_col="time" if "time" in df.columns else None)
+    df = _ensure_cols(df)
+    # защитимся от индекса без сортировки
     df = df.sort_index()
-    df = df.dropna(subset=["open","high","low","close"], how="any")
-    return df.tail(limit)
+    return df
 
-# -------------------------------
-# MT5
-# -------------------------------
-_MT5_INITED = False
-def _fetch_mt5(symbol: str, tf: str, limit: int) -> Optional[pd.DataFrame]:
-    """MetaTrader5: реальные/тик-volume. Возвращает None если нет MT5 или не удалось."""
-    global _MT5_INITED
+# ----------------------------------------------------------------------
+# Провайдеры
+# ----------------------------------------------------------------------
+def _fetch_mt5(symbol: str, tf: str, limit: int) -> pd.DataFrame:
+    """Локальный адаптер MetaTrader 5. Работает только если есть модуль/коннект."""
     try:
-        import MetaTrader5 as mt5
-    except Exception:
-        return None
-
-    # Инициализация один раз
-    if not _MT5_INITED:
-        try:
-            # если логин/сервер/пароль нужны — держи их в ENV (опционально)
-            login = os.getenv("MT5_LOGIN"); password = os.getenv("MT5_PASSWORD"); server = os.getenv("MT5_SERVER")
-            if login and password and server:
-                ok = mt5.initialize(login=int(login), password=password, server=server)
-            else:
-                ok = mt5.initialize()
-            if not ok:
-                log.warning("MT5 init failed: %s", mt5.last_error())
-                return None
-            _MT5_INITED = True
-        except Exception as e:
-            log.warning("MT5 init error: %s", e)
-            return None
-
-    tf_map = {
-        "1m": mt5.TIMEFRAME_M1, "2m": mt5.TIMEFRAME_M2, "3m": mt5.TIMEFRAME_M3, "5m": mt5.TIMEFRAME_M5,
-        "15m": mt5.TIMEFRAME_M15, "30m": mt5.TIMEFRAME_M30, "1h": mt5.TIMEFRAME_H1, "4h": mt5.TIMEFRAME_H4,
-        "1d": mt5.TIMEFRAME_D1
-    }
-    tfi = tf_map.get(tf.lower())
-    if tfi is None:
-        return None
-
-    sym = _norm_symbol(symbol)
-    try:
-        rates = mt5.copy_rates_from_pos(sym, tfi, 0, max(50, int(limit)))
-        if rates is None or len(rates) == 0:
-            return None
-        df = pd.DataFrame(rates)
-        df["time"] = pd.to_datetime(df["time"], unit="s", utc=True)
-        df = df.rename(columns={"real_volume":"volume", "tick_volume":"volume"})
-        df = df[["time","open","high","low","close","volume"]]
-        return _ensure_ohlcv(df, limit)
+        from fx_mt5_adapter import fetch_ohlcv as mt5_fetch  # type: ignore
     except Exception as e:
-        log.warning("MT5 fetch failed for %s %s: %s", sym, tf, e)
-        return None
+        raise RuntimeError(f"MT5 unavailable: {e}")
+    df = mt5_fetch(symbol, tf, limit)
+    return _normalize_ohlcv_df(df)
 
-# -------------------------------
-# Yahoo Finance (yfinance)
-# -------------------------------
-def _yahoo_period_for(tf: str, limit: int) -> str:
-    # Выбираем минимально достаточный period
+# ---- Yahoo (yfinance) ------------------------------------------------
+_YF_INTERVALS = {
+    "1m": "1m", "2m": "2m", "5m": "5m", "15m": "15m", "30m": "30m",
+    "1h": "60m", "60m": "60m",
+    "1d": "1d",
+}
+
+def _yf_period_for(limit: int, tf: str) -> str:
+    """Примерная длина периода для yfinance. Для 5m/60m лимитируют 60/730 дней."""
     tf = tf.lower()
-    minutes = {"1m":1, "2m":2, "5m":5, "15m":15, "30m":30, "60m":60, "1h":60}
-    if tf in minutes:
-        need_min = limit * minutes[tf]
-        need_days = need_min / (60*24)
-        # Допустимые периоды
-        candidates = ["1d","5d","7d","14d","30d","60d","90d","6mo","1y","2y"]
-        values = {
-            "1d":1, "5d":5, "7d":7, "14d":14, "30d":30, "60d":60, "90d":90, "6mo":180, "1y":365, "2y":730
-        }
-        for p in candidates:
-            if values[p] >= need_days - 1e-9:
-                return p
-        return "2y"
-    # час/день
-    if tf in ("1h","90m","60m"):
-        # для часов хватает 30d для сотен баров
-        return "60d"
-    return "2y"
+    # минут в баре
+    mins = {"1m":1, "2m":2, "5m":5, "15m":15, "30m":30, "60m":60, "1h":60, "1d":60*24}.get(tf, 60)
+    days_needed = max(1, math.ceil(limit * mins / (60*24)))
+    # допустимые периоды Yahoo
+    # для внутридня: до 60д на 1–30m, и до 730д на 60m/1h
+    if tf in ("1m","2m","5m","15m","30m"):
+        return "60d" if days_needed > 30 else ("30d" if days_needed > 7 else "7d")
+    if tf in ("60m","1h"):
+        if days_needed <= 7: return "7d"
+        if days_needed <= 30: return "30d"
+        if days_needed <= 60: return "60d"
+        return "730d"
+    # дневка
+    if days_needed <= 30: return "1mo"
+    if days_needed <= 90: return "3mo"
+    if days_needed <= 365: return "1y"
+    if days_needed <= 365*2: return "2y"
+    return "5y"
 
-def _fetch_yahoo(symbol: str, tf: str, limit: int) -> Optional[pd.DataFrame]:
+def _fetch_yahoo(symbol_y: str, tf: str, limit: int) -> pd.DataFrame:
     try:
-        import yfinance as yf
-    except Exception:
-        return None
-
-    interval_map = {"1m":"1m","2m":"2m","5m":"5m","15m":"15m","30m":"30m","1h":"1h","60m":"60m","1d":"1d"}
-    interval = interval_map.get(tf.lower())
-    if interval is None:
-        return None
-
-    ticker = _yahoo_symbol(symbol)
-    try:
-        period = _yahoo_period_for(interval, limit)
-        df = yf.download(tickers=ticker, interval=interval, period=period, auto_adjust=False, progress=False, prepost=False, threads=False)
-        if df is None or df.empty:
-            return None
-        # у FX volume часто весь ноль — это ок
-        df = df.rename_axis("time").reset_index()
-        df = _ensure_ohlcv(df, limit)
-        return df
+        import yfinance as yf  # type: ignore
     except Exception as e:
-        log.warning("Yahoo fetch failed for %s %s: %s", ticker, tf, e)
-        return None
+        raise RuntimeError(f"yfinance not available: {e}")
 
-# -------------------------------
-# Stooq (daily only)
-# -------------------------------
-def _fetch_stooq(symbol: str, tf: str, limit: int) -> Optional[pd.DataFrame]:
-    if tf.lower() not in ("1d", "1day", "d", "day"):
-        return None
+    interval = _YF_INTERVALS.get(tf.lower())
+    if not interval:
+        raise RuntimeError(f"Yahoo unsupported timeframe: {tf}")
+
+    period = _yf_period_for(limit, tf)
+    df = yf.download(
+        tickers=symbol_y,
+        interval=interval,
+        period=period,
+        auto_adjust=False,
+        actions=False,
+        progress=False,
+        threads=False,
+    )
     try:
-        from pandas_datareader import data as pdr
-    except Exception:
-        return None
-    # Stooq использует EURUSD, USDJPY (без суффиксов)
-    ticker = _norm_symbol(symbol)
-    try:
-        df = pdr.DataReader(ticker, "stooq")
-        if df is None or df.empty:
-            return None
-        df = df.sort_index()
-        df = df.rename_axis("time").reset_index()
-        df = _ensure_ohlcv(df, limit)
-        return df
+        df = _normalize_ohlcv_df(df)
     except Exception as e:
-        log.warning("Stooq fetch failed for %s: %s", ticker, e)
-        return None
+        log.warning("Yahoo normalize failed for %s %s: %s", symbol_y, tf, e)
+        raise
+    # ограничим по limit
+    df = df.tail(int(limit))
+    if df.empty:
+        raise RuntimeError("Yahoo returned empty after tail()")
+    return df
 
-# -------------------------------
-# Twelve Data (последний резерв)
-# -------------------------------
-def _fetch_twelvedata(symbol: str, tf: str, limit: int) -> Optional[pd.DataFrame]:
-    api_key = os.getenv("TWELVE_DATA_KEY") or os.getenv("TWELVEDATA_API_KEY")
-    if not api_key:
-        return None
-    import requests
-    tf_map = {"1m":"1min","5m":"5min","15m":"15min","30m":"30min","1h":"1h","1d":"1day"}
-    interval = tf_map.get(tf.lower())
-    if interval is None:
-        return None
-    sym = _td_symbol(symbol)
-    params = {
-        "symbol": sym,
-        "interval": interval,
-        "outputsize": max(50, int(limit)),
-        "apikey": api_key,
-        "format": "CSV",
-        "order": "ASC"
+# ---- Stooq (только дневные данные) -----------------------------------
+def _fetch_stooq(symbol_s: str, tf: str, limit: int) -> pd.DataFrame:
+    if tf.lower() != "1d":
+        raise RuntimeError("Stooq supports only '1d'")
+    url = f"https://stooq.com/q/d/l/?s={symbol_s}&i=d"
+    df = pd.read_csv(url)
+    # Возможные варианты заголовков
+    rename = {
+        "Date": "time", "date": "time",
+        "Open": "open", "High": "high", "Low": "low", "Close": "close", "Volume": "volume",
+        "open": "open", "high": "high", "low": "low", "close": "close", "volume": "volume",
     }
+    df = df.rename(columns=rename)
+    df = _normalize_ohlcv_df(df, time_col="time")
+    df = df.tail(int(limit))
+    if df.empty:
+        raise RuntimeError("Stooq returned empty")
+    return df
+
+# ---- TwelveData -------------------------------------------------------
+_TD_INTERVALS = {
+    "1m": "1min", "5m": "5min", "15m": "15min", "30m": "30min",
+    "1h": "1h", "60m": "1h",
+    "1d": "1day",
+}
+
+def _fetch_twelvedata(symbol_t: str, tf: str, limit: int) -> pd.DataFrame:
+    import requests  # stdlib-compatible, есть в окружении
+
+    api_key = os.getenv("TWELVEDATA_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("TwelveData key is missing (TWELVEDATA_API_KEY)")
+
+    interval = _TD_INTERVALS.get(tf.lower())
+    if not interval:
+        raise RuntimeError(f"TwelveData unsupported timeframe: {tf}")
+
     url = "https://api.twelvedata.com/time_series"
-    try:
-        r = requests.get(url, params=params, timeout=15)
-        if r.status_code != 200:
-            log.error("TwelveData HTTP %s: %s", r.status_code, r.text[:200])
-            return None
-        # бывает, что в теле приходит сообщение об исчерпании кредитов — оставим проверку наверху
+    params = {
+        "symbol": symbol_t,
+        "interval": interval,
+        "outputsize": int(limit) * 2,  # небольшой запас
+        "format": "JSON",
+        "apikey": api_key,
+        "timezone": "UTC",
+        "order": "ASC",
+    }
+    r = requests.get(url, params=params, timeout=20)
+    r.raise_for_status()
+    ct = r.headers.get("content-type", "").lower()
+
+    if "json" in ct:
+        data = r.json()
+        # Ошибка API?
+        if isinstance(data, dict) and data.get("status") == "error":
+            raise RuntimeError(f"TwelveData error: {data.get('message')}")
+        rows = (data or {}).get("values") if isinstance(data, dict) else data
+        df = pd.DataFrame(rows)
+    else:
+        # внезапно CSV
         from io import StringIO
         df = pd.read_csv(StringIO(r.text))
-        # ожидаемые колонки: datetime, open, high, low, close, volume
-        df = df.rename(columns={"datetime":"time"})
-        df["time"] = pd.to_datetime(df["time"], utc=True, errors="coerce")
-        df = _ensure_ohlcv(df, limit)
-        # Проверка на ошибку-сообщение (в CSV может быть одна колонка "code"/"message")
-        if df.empty and "code" in r.text.lower():
-            log.error("TwelveData error payload: %s", r.text[:200])
-            return None
-        return df
-    except Exception as e:
-        log.warning("TwelveData fetch failed for %s %s: %s", sym, tf, e)
-        return None
 
-# -------------------------------
-# ПУБЛИЧНЫЙ API
-# -------------------------------
+    if df is None or df.empty:
+        raise RuntimeError("TwelveData empty dataframe")
+
+    # у TD колонка времени называется 'datetime'
+    if "datetime" in df.columns and "time" not in df.columns:
+        df = df.rename(columns={"datetime": "time"})
+    if "timestamp" in df.columns and "time" not in df.columns:
+        df = df.rename(columns={"timestamp": "time"})
+
+    df = _normalize_ohlcv_df(df, time_col="time" if "time" in df.columns else None)
+    df = df.tail(int(limit))
+    if df.empty:
+        raise RuntimeError("TwelveData returned empty after tail()")
+    return df
+
+# ----------------------------------------------------------------------
+# Роутер: MT5 -> Yahoo -> Stooq -> TwelveData
+# ----------------------------------------------------------------------
+def _fetch_with_provider_chain(symbol: str, tf: str, limit: int) -> Tuple[pd.DataFrame, str]:
+    """Возвращает (df, provider_name) либо кидает исключение после исчерпания провайдеров."""
+    names = []
+    sym = _normalize_symbol(symbol)
+    errors = []
+
+    # 1) MT5
+    try:
+        df = _fetch_mt5(sym["mt5"], tf, limit)
+        return df, "MT5"
+    except Exception as e:
+        errors.append(f"MT5: {e}")
+        names.append("MT5")
+
+    # 2) Yahoo
+    try:
+        df = _fetch_yahoo(sym["yahoo"], tf, limit)
+        return df, "Yahoo"
+    except Exception as e:
+        log.warning("Yahoo fetch failed for %s %s: %s", sym["yahoo"], tf, e)
+        errors.append(f"Yahoo: {e}")
+        names.append("Yahoo")
+
+    # 3) Stooq (только дневные)
+    try:
+        if tf.lower() == "1d":
+            df = _fetch_stooq(sym["stooq"], tf, limit)
+            return df, "Stooq"
+        else:
+            errors.append("Stooq: unsupported timeframe")
+            names.append("Stooq")
+    except Exception as e:
+        log.warning("Stooq fetch failed for %s %s: %s", sym["stooq"], tf, e)
+        errors.append(f"Stooq: {e}")
+        names.append("Stooq")
+
+    # 4) TwelveData
+    try:
+        df = _fetch_twelvedata(sym["twelve"], tf, limit)
+        return df, "TwelveData"
+    except Exception as e:
+        log.warning("TwelveData fetch failed for %s %s: %s", sym["twelve"], tf, e)
+        errors.append(f"TwelveData: {e}")
+        names.append("TwelveData")
+
+    # Исчерпали
+    provs = ", ".join(names) if names else "no providers"
+    raise RuntimeError(f"FX feed failed for {symbol} (providers exhausted: {provs}). Errors: {errors}")
+
+# ----------------------------------------------------------------------
+# Публичная функция
+# ----------------------------------------------------------------------
 def fetch_ohlcv(symbol: str, tf: str, limit: int) -> pd.DataFrame:
     """
-    Возвращает DataFrame с колонками [open, high, low, close, volume] и DatetimeIndex (UTC).
-    Провайдеры по приоритету: MT5 -> Yahoo -> Stooq -> TwelveData.
-    Встроенный кэш на tf.
+    Унифицированный доступ к OHLCV.
+    Возвращает DataFrame с индексом DatetimeIndex(UTC) и колонками:
+    ['open','high','low','close','volume'].
+
+    :param symbol: 'EURUSD' / 'EUR/USD' / 'USDJPY' и т.п.
+    :param tf: '5m' | '1h' | '1d' (и др. см. маппинги провайдеров)
+    :param limit: желаемое количество баров (хвост)
     """
-    if not symbol or not tf or limit <= 0:
-        return pd.DataFrame(columns=["open","high","low","close","volume"])
-
-    symbol_u = _norm_symbol(symbol)
-    tf_l = tf.lower()
-    limit = int(limit)
-
-    # кэш
-    cached = _from_cache(symbol_u, tf_l, limit)
-    if cached is not None and not cached.empty:
-        return cached
-
-    providers = [
-        ("MT5", _fetch_mt5),
-        ("Yahoo", _fetch_yahoo),
-        ("Stooq", _fetch_stooq),
-        ("TwelveData", _fetch_twelvedata),
-    ]
-
-    last_df = None
-    errors = []
-    for name, fn in providers:
-        df = fn(symbol_u, tf_l, limit)
-        if df is not None and not df.empty:
-            _to_cache(symbol_u, tf_l, df)
-            if name != "MT5":
-                log.debug("[fx_feed] %s served %s %s (%d rows)", name, symbol_u, tf_l, len(df))
-            else:
-                log.debug("[fx_feed] MT5 served %s %s (%d rows)", symbol_u, tf_l, len(df))
-            return df.tail(limit)
-        errors.append(name)
-
-    # если добрались сюда — все провайдеры пустые
-    msg = f"FX feed failed for {symbol_u} (providers exhausted: {', '.join(errors)})"
-    log.error(msg)
-    raise RuntimeError(msg)
+    df, provider = _fetch_with_provider_chain(symbol, tf, int(limit))
+    log.info("FX feed: %s %s via %s -> %d bars", symbol, tf, provider, len(df))
+    return df
