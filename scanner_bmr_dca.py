@@ -1,4 +1,9 @@
-# scanner_bmr_dca.py
+# scanner_bmr_dca.py — patched
+# - безопасная нормализация символа (str|dict|list)
+# - автосоздание листов BMR_DCA_<SYMBOL> и дублирование логов туда
+# - интеграция ФА-бота (risk/bias/ttl/updated_at) + периодическое обновление
+# - совместимость с fetch_ohlcv(symbol, tf, limit) из fx_feed
+
 from __future__ import annotations
 
 import asyncio, time, logging, json, os, inspect, numbers
@@ -12,7 +17,7 @@ from telegram.ext import Application
 import gspread
 
 # === Forex адаптеры и фид ===
-from fx_mt5_adapter import FX, margin_to_lots, lots_to_margin, default_tick
+from fx_mt5_adapter import FX, margin_to_lots, default_tick  # lots_to_margin не обязателен здесь
 from fx_feed import fetch_ohlcv as fetch_ohlcv_yf
 
 import trade_executor
@@ -99,13 +104,16 @@ class CONFIG:
         "RETRACE_WINDOW_SEC": 120,
     }
 
+    # ФА-политика
+    FA_REFRESH_SEC = 300  # перечитывать раз в 5 минут
+
 # ENV-переопределения
-CONFIG.SYMBOL   = os.getenv("FX_SYMBOL", CONFIG.SYMBOL).upper()
+CONFIG.SYMBOL   = os.getenv("FX_SYMBOL", CONFIG.SYMBOL)
 CONFIG.TF_ENTRY = os.getenv("TF_ENTRY", CONFIG.TF_ENTRY)
 CONFIG.TF_RANGE = os.getenv("TF_TREND", CONFIG.TF_RANGE)
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Helpers & Sheets
 # ---------------------------------------------------------------------------
 async def maybe_await(func, *args, **kwargs):
     if inspect.iscoroutinefunction(func):
@@ -135,11 +143,98 @@ def _clean(v):
 def _clean_payload(d: dict) -> dict:
     return {k: _clean(v) for k, v in d.items() if k in SAFE_LOG_KEYS}
 
+# ---- NORMALIZER ----
+
+def _norm_symbol(x) -> str:
+    # Принимает str | dict | list/tuple и возвращает строку тикера UPPERCASE
+    if isinstance(x, dict):
+        for k in ("symbol", "pair", "name"):
+            if x.get(k):
+                return str(x[k]).upper()
+        if len(x) == 1:
+            return str(next(iter(x.values()))).upper()
+        return str(next(iter(x.keys()), "")).upper()
+    if isinstance(x, (list, tuple, set)):
+        for it in x:
+            if it:
+                return _norm_symbol(it)
+        return ""
+    return str(x or "").upper()
+
+# ---- SHEETS HELPERS ----
+
+def _ensure_ws(sh, name: str, headers: list[str]):
+    try:
+        ws = sh.worksheet(name)
+    except gspread.WorksheetNotFound:
+        ws = sh.add_worksheet(title=name, rows=2000, cols=max(20, len(headers)))
+        if headers:
+            ws.append_row(headers)
+    return ws
+
 async def log_event_safely(payload: dict):
+    # 1) пишем через trade_executor в общий лог (как раньше)
     try:
         await maybe_await(trade_executor.bmr_log_event, _clean_payload(payload))
     except Exception:
-        log.exception("[SHEETS] log_event_safely failed")
+        log.exception("[SHEETS] bmr_log_event failed")
+    # 2) дублируем в лист по символу
+    try:
+        creds_json = os.environ.get("GOOGLE_CREDENTIALS")
+        sheet_key  = os.environ.get("SHEET_ID")
+        if not (creds_json and sheet_key):
+            return
+        sym = str(payload.get("Pair") or payload.get("pair") or "").upper()
+        if not sym:
+            return
+        gc = gspread.service_account_from_dict(json.loads(creds_json))
+        sh = gc.open_by_key(sheet_key)
+        ws2 = _ensure_ws(sh, f"BMR_DCA_{sym}", list(SAFE_LOG_KEYS))
+        row = [_clean(payload.get(k)) for k in SAFE_LOG_KEYS]
+        ws2.append_row(row)
+    except Exception:
+        log.exception("[SHEETS] per-symbol log failed")
+
+# ---- FA POLICY ----
+
+def read_fa_policy(symbol: str) -> dict:
+    """Читает политику из листа FA_Signals: pair, risk(Green/Amber/Red), bias(neutral/long-only/short-only),
+    ttl (мин), updated_at (ISO). При просрочке TTL возвращает {}.
+    """
+    try:
+        creds_json = os.environ.get("GOOGLE_CREDENTIALS")
+        sheet_key  = os.environ.get("SHEET_ID")
+        if not (creds_json and sheet_key):
+            return {}
+        gc = gspread.service_account_from_dict(json.loads(creds_json))
+        sh = gc.open_by_key(sheet_key)
+        try:
+            ws = sh.worksheet("FA_Signals")
+        except gspread.WorksheetNotFound:
+            return {}
+        rows = ws.get_all_records()
+        for r in rows:
+            if str(r.get("pair", "")).upper() == symbol.upper():
+                risk = (str(r.get("risk", "") or "Green").capitalize())
+                bias = (str(r.get("bias", "") or "neutral").lower())
+                ttl  = int(r.get("ttl") or 0)
+                updated_at = str(r.get("updated_at") or "").strip()
+                if ttl and updated_at:
+                    try:
+                        ts = pd.to_datetime(updated_at, utc=True)
+                        if pd.Timestamp.utcnow() > ts + pd.Timedelta(minutes=ttl):
+                            return {}
+                    except Exception:
+                        pass
+                return {"risk": risk, "bias": bias, "ttl": ttl, "updated_at": updated_at}
+        return {}
+    except Exception:
+        log.exception("read_fa_policy failed")
+        return {}
+
+# ---------------------------------------------------------------------------
+# Formatting & maths
+# ---------------------------------------------------------------------------
 
 def fmt(p: float) -> str:
     if p is None or pd.isna(p): return "N/A"
@@ -289,9 +384,11 @@ async def build_range_from_df(df: Optional[pd.DataFrame]):
     return {"lower": lower, "upper": upper, "mid": mid, "atr1h": atr1h, "width": upper-lower}
 
 async def build_ranges(symbol: str):
-    # берём историю в «часовых» барах на TF_RANGE
-    s_df_task = asyncio.create_task(maybe_await(fetch_ohlcv_yf, symbol, CONFIG.TF_RANGE, CONFIG.STRATEGIC_LOOKBACK_DAYS * 24))
-    t_df_task = asyncio.create_task(maybe_await(fetch_ohlcv_yf, symbol, CONFIG.TF_RANGE, CONFIG.TACTICAL_LOOKBACK_DAYS * 24))
+    # В нашем fx_feed: fetch_ohlcv(symbol, tf, limit)
+    s_limit = CONFIG.STRATEGIC_LOOKBACK_DAYS * 24  # бары 1h
+    t_limit = CONFIG.TACTICAL_LOOKBACK_DAYS  * 24
+    s_df_task = asyncio.create_task(maybe_await(fetch_ohlcv_yf, symbol, CONFIG.TF_RANGE, s_limit))
+    t_df_task = asyncio.create_task(maybe_await(fetch_ohlcv_yf, symbol, CONFIG.TF_RANGE, t_limit))
     s_df, t_df = await asyncio.gather(s_df_task, t_df_task)
     s_task = asyncio.create_task(build_range_from_df(s_df))
     t_task = asyncio.create_task(build_range_from_df(t_df))
@@ -419,6 +516,7 @@ class Position:
 # ---------------------------------------------------------------------------
 # Broadcasting helpers
 # ---------------------------------------------------------------------------
+
 def _make_bcaster(default_chat_id: int | None):
     async def _bc(app, text, target_chat_id=None):
         cid = target_chat_id or default_chat_id
@@ -430,6 +528,7 @@ def _make_bcaster(default_chat_id: int | None):
         except Exception as e:
             log.error(f"[broadcast-fallback] send failed: {e}")
     return _bc
+
 
 def _wrap_broadcast(bc, default_chat_id: int | None):
     """Делает переданный broadcast совместимым с нашей сигнатурой."""
@@ -463,7 +562,6 @@ async def scanner_main_loop(
     """
     # Совместимость с вызовом через 3 позиционных аргумента: (app, broadcast, box)
     if botbox is None and args:
-        # первый позиционный после broadcast считаем box'ом
         botbox = args[0] if len(args) >= 1 and isinstance(args[0], dict) else None
 
     # Заворачиваем broadcast, чтобы он понимал target_chat_id (и имел фолбэк)
@@ -484,7 +582,8 @@ async def scanner_main_loop(
     except Exception as e:
         log.error(f"Sheets init error: {e}", exc_info=True)
 
-    symbol = (symbol_override or CONFIG.SYMBOL).upper()
+    # ---- SYMBOL ----
+    symbol = _norm_symbol(symbol_override or CONFIG.SYMBOL)
     if symbol not in FX:
         log.critical(f"Unsupported FX symbol: {symbol}. Supported: {list(FX.keys())}")
         return
@@ -493,9 +592,24 @@ async def scanner_main_loop(
     b["price_tick"] = tick
     log.info(f"Successfully initialized for Forex symbol {symbol} with tick size {tick}")
 
+    # Подготовим листы для символа (если есть доступ)
+    try:
+        creds_json = os.environ.get("GOOGLE_CREDENTIALS")
+        sheet_key  = os.environ.get("SHEET_ID")
+        if creds_json and sheet_key:
+            gc = gspread.service_account_from_dict(json.loads(creds_json))
+            sh = gc.open_by_key(sheet_key)
+            _ensure_ws(sh, f"BMR_DCA_{symbol}", list(SAFE_LOG_KEYS))
+    except Exception:
+        log.exception("ensure symbol sheet failed")
+
     # Локальный хэлпер на рассылку
     async def say(txt: str):
         await broadcast(app, txt, target_chat_id=target_chat_id)
+
+    # ФА-политика
+    fa = read_fa_policy(symbol)
+    last_fa_read = 0.0
 
     rng_strat, rng_tac = None, None
     last_flush = 0
@@ -509,7 +623,18 @@ async def scanner_main_loop(
             fee_taker = float(b.get("fee_taker", CONFIG.FEE_TAKER))
 
             now = time.time()
-            manage_only = b.get("scan_paused", False)
+
+            # периодически перечитываем ФА
+            if now - last_fa_read > CONFIG.FA_REFRESH_SEC:
+                fa = read_fa_policy(symbol)
+                last_fa_read = now
+
+            # применяем FA: risk Red -> управляем, но не открываем; Amber -> консервативней
+            fa_risk = (fa.get("risk") or "Green").capitalize()
+            fa_bias = (fa.get("bias") or "neutral").lower()
+
+            manage_only_flag = b.get("scan_paused", False) or (fa_risk == "Red")
+
             pos: Position | None = b.get("position")
 
             need_build_strat = (rng_strat is None) or ((now - last_build_strat > CONFIG.REBUILD_RANGE_EVERY_MIN*60) and (pos is None))
@@ -527,9 +652,9 @@ async def scanner_main_loop(
                 log.error("Range is not available. Cannot proceed.")
                 await asyncio.sleep(10); continue
 
-            # 5m данные — указываем limit (кол-во баров)
+            # 5m данные — ограничим кол-во баров
             bars_needed = max(60, CONFIG.VOL_WIN + CONFIG.ADX_LEN + 20)
-            ohlc5_df = await maybe_await(fetch_ohlcv_yf, symbol, CONFIG.TF_ENTRY, None, bars_needed)
+            ohlc5_df = await maybe_await(fetch_ohlcv_yf, symbol, CONFIG.TF_ENTRY, bars_needed)
             if ohlc5_df is None or ohlc5_df.empty:
                 log.warning("Could not fetch 5m OHLCV data. Skipping this cycle.")
                 await asyncio.sleep(2); continue
@@ -554,18 +679,22 @@ async def scanner_main_loop(
                 pct_to_short = (d_to_short / max(px, 1e-9)) * 100
                 brk_up, brk_dn = break_levels(rng_strat)
                 width_ratio = (rng_tac["width"] / max(rng_strat["width"], 1e-9)) * 100.0
+                fa_line = ""
+                if fa_risk != "Green" or fa_bias != "neutral":
+                    fa_line = f"\nFA: risk=<b>{fa_risk}</b>, bias=<b>{fa_bias}</b>"
                 await say(
                     "🎯 Пороги входа (<b>TAC 30/70</b>): LONG ≤ <code>{}</code>, SHORT ≥ <code>{}</code>\n"
                     "📏 Диапазоны:\n"
                     "• STRAT: [{} … {}] w={}\n"
                     "• TAC (3d): [{} … {}] w={} (≈{:.0f}% от STRAT)\n"
                     "🔓 Пробой STRAT: ↑{} | ↓{}\n"
-                    "Текущая: {}. До LONG: {} ({:.2f}%), до SHORT: {} ({:.2f}%).".format(
+                    "Текущая: {}. До LONG: {} ({:.2f}%), до SHORT: {} ({:.2f}%).{}".format(
                         fmt(p30_t), fmt(p70_t),
                         fmt(rng_strat['lower']), fmt(rng_strat['upper']), fmt(rng_strat['width']),
                         fmt(rng_tac['lower']),   fmt(rng_tac['upper']),   fmt(rng_tac['width']), width_ratio,
                         fmt(brk_up), fmt(brk_dn),
-                        fmt(px), fmt(d_to_long), pct_to_long, fmt(d_to_short), pct_to_short
+                        fmt(px), fmt(d_to_long), pct_to_long, fmt(d_to_short), pct_to_short,
+                        fa_line
                     )
                 )
                 b["intro_done"] = True
@@ -617,7 +746,7 @@ async def scanner_main_loop(
                     await say("📌 Пробой STRAT — обычные усреднения заморожены. Резерв держим на ретест.")
 
             # Открытие
-            if not pos and (b.get("manual_open") is not None or not manage_only):
+            if not pos and (b.get("manual_open") is not None or not manage_only_flag):
                 manual = b.pop("manual_open", None)
                 if manual:
                     side_cand = manual.get("side")
@@ -625,11 +754,24 @@ async def scanner_main_loop(
                     pos_in = max(0.0, min(1.0, (px - rng_tac["lower"]) / max(rng_tac["width"], 1e-9)))
                     side_cand = "LONG" if pos_in <= 0.30 else ("SHORT" if pos_in >= 0.70 else None)
 
+                # Учитываем FA bias
+                if side_cand:
+                    if fa_bias == "long-only" and side_cand != "LONG":
+                        side_cand = None
+                    if fa_bias == "short-only" and side_cand != "SHORT":
+                        side_cand = None
+
                 if side_cand:
                     pos = Position(side_cand, signal_id=f"{symbol.replace('/','')} {int(now)}")
                     pos.leverage = max(CONFIG.MIN_LEVERAGE, min(CONFIG.MAX_LEVERAGE, int(manual["leverage"]))) if (manual and manual.get("leverage") is not None) else CONFIG.LEVERAGE
                     ord_levels  = max(1, min(CONFIG.DCA_LEVELS - 1, int(manual["max_steps"]))) if (manual and manual.get("max_steps") is not None) else max(1, min(5, CONFIG.DCA_LEVELS - 1))
                     growth = choose_growth(ind, rng_strat, rng_tac)
+
+                    # Amber → консервативнее: меньше уровней и рост ближе к A
+                    if fa_risk == "Amber":
+                        ord_levels = max(1, ord_levels - 1)
+                        growth = min(growth, CONFIG.AUTO_ALLOC["growth_A"])
+
                     pos.plan_with_reserve(bank, growth, ord_levels)
                     pos.ordinary_targets = compute_mixed_targets(entry=px, side=pos.side, rng_strat=rng_strat, rng_tac=rng_tac, tick=tick)
 
@@ -669,6 +811,8 @@ async def scanner_main_loop(
                                 f"↓<code>{fmt(brk_dn)}</code> ({brk_dn_pct:.2f}%)")
 
                     hdr = f"BMR-DCA {pos.side} ({symbol})" + (" [MANUAL]" if manual else "")
+                    fa_tag = ""
+                    if fa_risk == "Amber": fa_tag = "\n<i>FA: Amber — используем консервативный план.</i>"
                     await say(
                         f"⚡ <b>{hdr}</b>\n"
                         f"Вход: <code>{fmt(px)}</code> | <b>{lots:.2f} lot</b>\n"
@@ -678,7 +822,7 @@ async def scanner_main_loop(
                         f"{brk_line}\n"
                         f"След. усреднение: <code>{nxt_txt}</code>\n"
                         f"Плановый добор: <b>{nxt_dep_txt}</b> (осталось: {remaining} из {total_ord})\n"
-                        f"<i>Контролируй Margin level ≥ 20%</i>"
+                        f"<i>Контролируй Margin level ≥ 20%</i>" + fa_tag
                     )
                     await log_event_safely({
                         "Event_ID": f"OPEN_{pos.signal_id}", "Signal_ID": pos.signal_id, "Leverage": pos.leverage,
@@ -690,7 +834,7 @@ async def scanner_main_loop(
                         "Next_DCA_Price": (nxt and nxt["price"]) or "", "Next_DCA_Label": (nxt and nxt["label"]) or "",
                         "Triggered_Label": ("MANUAL" if manual else ""),
                         "Fee_Rate_Maker": fee_maker, "Fee_Rate_Taker": fee_taker,
-                        "Fee_Est_USDT": fees_paid_est / CONFIG.LIQ_FEE_BUFFER, "ATR_5m": ind["atr5m"], "ATR_1h": rng_strat["atr1h"],
+                        "Fee_Est_USDT": (cum_notional * fee_taker), "ATR_5m": ind["atr5m"], "ATR_1h": rng_strat["atr1h"],
                         "RSI_5m": ind["rsi"], "ADX_5m": ind["adx"], "Supertrend": ind["supertrend"], "Vol_z": ind["vol_z"],
                         "Range_Lower": rng_strat["lower"], "Range_Upper": rng_strat["upper"], "Range_Width": rng_strat["width"]
                     })
@@ -699,7 +843,7 @@ async def scanner_main_loop(
             pos = b.get("position")
             if pos:
                 # Ретест по пробою
-                if pos.freeze_ordinary and pos.reserve_available and not manage_only:
+                if pos.freeze_ordinary and pos.reserve_available and not manage_only_flag:
                     need_retest_slow = (
                         ((pos.side == "SHORT" and px <= rng_strat["upper"] * (1 - CONFIG.REENTRY_BAND)) or
                          (pos.side == "LONG"  and px >= rng_strat["lower"] * (1 + CONFIG.REENTRY_BAND)))
@@ -819,7 +963,7 @@ async def scanner_main_loop(
                             "TP_Price": pos.tp_price, "SL_Price": pos.sl_price or "",
                             "Liq_Est_Price": liq, "Next_DCA_Price": (nxt2 and nxt2["price"]) or "", "Next_DCA_Label": (nxt2 and nxt2["label"]) or "", "Triggered_Label": curr_label,
                             "Fee_Rate_Maker": fee_maker, "Fee_Rate_Taker": fee_taker,
-                            "Fee_Est_USDT": fees_paid_est / CONFIG.LIQ_FEE_BUFFER, "ATR_5m": ind["atr5m"], "ATR_1h": rng_strat["atr1h"],
+                            "Fee_Est_USDT": (cum_notional * fee_taker), "ATR_5m": ind["atr5m"], "ATR_1h": rng_strat["atr1h"],
                             "RSI_5m": ind["rsi"], "ADX_5m": ind["adx"], "Supertrend": ind["supertrend"], "Vol_z": ind["vol_z"],
                             "Range_Lower": rng_strat["lower"], "Range_Upper": rng_strat["upper"], "Range_Width": rng_strat["width"]
                         })
