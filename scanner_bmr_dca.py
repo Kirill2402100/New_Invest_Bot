@@ -474,7 +474,7 @@ async def scanner_main_loop(app: Application, broadcast):
     
     symbol = CONFIG.SYMBOL
     if symbol not in FX:
-        log.ritical(f"Unsupported FX symbol: {symbol}. Supported: {list(FX.keys())}")
+        log.critical(f"Unsupported FX symbol: {symbol}. Supported: {list(FX.keys())}")
         return
     tick = default_tick(symbol)
     app.bot_data["price_tick"] = tick
