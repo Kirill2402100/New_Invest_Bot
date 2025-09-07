@@ -1,20 +1,18 @@
-# Используем официальный образ Python 3.11
 FROM python:3.11-slim
 
-# Устанавливаем рабочую директорию внутри контейнера
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
+
+# нужно для установки "pandas-ta @ git+..."
+RUN apt-get update && apt-get install -y --no-install-recommends git \
+    && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
-
-# Копируем файл с зависимостями
 COPY requirements.txt .
+RUN pip install --upgrade pip && pip install -r requirements.txt
 
-# Устанавливаем зависимости из requirements.txt
-RUN pip install --no-cache-dir -r requirements.txt
-
-# Копируем все остальные файлы проекта в контейнер
 COPY . .
-
-# Чтобы логи сразу шли в Railway и не буферизировались
-ENV PYTHONUNBUFFERED=1
-
-# ИСПРАВЛЕНО: Запуск вашего приложения с правильным именем файла
+# Проверь точку входа! Если в Procfile было "worker: python -u main.py",
+# то здесь должно быть то же самое:
 CMD ["python", "-u", "main.py"]
