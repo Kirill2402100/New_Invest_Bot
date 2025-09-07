@@ -4,14 +4,21 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1
 
-# нужно для установки "pandas-ta @ git+..."
-RUN pip install --upgrade pip && pip install --no-cache-dir -r requirements.txt
+# (необязательно, но полезно для TLS)
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-COPY requirements.txt .
-RUN pip install --upgrade pip && pip install -r requirements.txt
 
+# 1) сначала кладём requirements.txt
+COPY requirements.txt .
+
+# 2) затем ставим зависимости
+RUN pip install --upgrade pip && pip install --no-cache-dir -r requirements.txt
+
+# 3) потом весь остальной код
 COPY . .
-# Проверь точку входа! Если в Procfile было "worker: python -u main.py",
-# то здесь должно быть то же самое:
+
+# точка входа
 CMD ["python", "-u", "main.py"]
