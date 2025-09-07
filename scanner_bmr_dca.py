@@ -174,7 +174,7 @@ class CONFIG:
 # ENV-переопределения
 CONFIG.SYMBOL    = os.getenv("FX_SYMBOL", CONFIG.SYMBOL)
 CONFIG.TF_ENTRY = os.getenv("TF_ENTRY", CONFIG.TF_ENTRY)
-CONFIG.TF_RANGE = os.getenv("TF_TREND", CONFIG.TF_RANGE)
+CONFIG.TF_RANGE = os.getenv("TF_RANGE", os.getenv("TF_TREND", CONFIG.TF_RANGE))
 
 # ---------------------------------------------------------------------------
 # Helpers & Sheets
@@ -310,11 +310,19 @@ def read_fa_policy(symbol: str) -> dict:
                 if ttl and updated_at:
                     try:
                         ts = pd.to_datetime(updated_at, utc=True)
-                        if pd.Timestamp.utcnow() > ts + pd.Timedelta(minutes=ttl):
+                        if pd.Timestamp.now(tz="UTC") > ts + pd.Timedelta(minutes=ttl):
                             return {}
                     except Exception:
                         pass
-                return {"risk": risk, "bias": bias, "ttl": ttl, "updated_at": updated_at}
+                
+                scan_lock_until = str(r.get("scan_lock_until") or "").strip()
+                reserve_off = str(r.get("reserve_off") or "").strip().lower() in ("1","true","yes","on")
+                try: dca_scale = float(r.get("dca_scale") or 1.0)
+                except: dca_scale = 1.0
+                return {
+                   "risk": risk, "bias": bias, "ttl": ttl, "updated_at": updated_at,
+                   "scan_lock_until": scan_lock_until, "reserve_off": reserve_off, "dca_scale": dca_scale
+                }
         return {}
     except Exception:
         log.exception("read_fa_policy failed")
@@ -349,7 +357,8 @@ def plan_margins_bank_first(bank: float, levels: int, growth: float) -> list[flo
     return [base * (growth**i) for i in range(levels)]
 
 def _pos_total_margin(pos):
-    ord_used = sum(pos.step_margins[:min(pos.steps_filled, getattr(pos, 'ord_levels', pos.steps_filled))])
+    used_ord_count = max(0, pos.steps_filled - (1 if getattr(pos, "reserve_used", False) else 0))
+    ord_used = sum(pos.step_margins[:min(used_ord_count, len(pos.step_margins))])
     res = pos.reserve_margin_usdt if getattr(pos, 'reserve_used', False) else 0.0
     return ord_used + res
 
@@ -448,8 +457,10 @@ def compute_mixed_targets(entry: float, side: str, rng_strat: dict, rng_tac: dic
     return merge_targets_sorted(side, tick, tacs + strs)
 
 def next_pct_target(pos):
-    idx = pos.steps_filled - 1
-    if not getattr(pos, "ordinary_targets", None): return None
+    if not getattr(pos, "ordinary_targets", None):
+        return None
+    ord_used_incl_open = pos.steps_filled - (1 if pos.reserve_used else 0)
+    idx = ord_used_incl_open - 1
     return pos.ordinary_targets[idx] if 0 <= idx < len(pos.ordinary_targets) else None
 
 def choose_growth(ind: dict, rng_strat: dict, rng_tac: dict) -> float:
@@ -570,6 +581,7 @@ class Position:
         self.spike_direction: str | None = None
         self.spike_deadline_ts: float | None = None
         self.spike_ref_ohlc: Optional[tuple[float, float, float, float]] = None
+        self.alloc_bank_planned: float = 0.0
 
     def plan_with_reserve(self, bank: float, growth: float, ord_levels: int):
         self.growth = growth
@@ -585,14 +597,15 @@ class Position:
 
     def rebalance_tail_margins_excluding_reserve(self, bank: float):
         total_target = bank * CONFIG.CUM_DEPOSIT_FRAC_AT_FULL
-        used_ord = sum(self.step_margins[:self.steps_filled]) if self.step_margins else 0.0
-        remaining_budget_for_ord = max(0.0, total_target - used_ord - self.reserve_margin_usdt)
-        remaining_levels = max(0, self.ord_levels - self.steps_filled)
+        used_ord_count = max(0, self.steps_filled - (1 if self.reserve_used else 0))
+        used_ord_sum = sum(self.step_margins[:min(used_ord_count, len(self.step_margins))]) if self.step_margins else 0.0
+        remaining_budget_for_ord = max(0.0, total_target - used_ord_sum - self.reserve_margin_usdt)
+        remaining_levels = max(0, self.ord_levels - used_ord_count)
         if remaining_levels <= 0:
             return
         tail = plan_margins_bank_first(remaining_budget_for_ord, remaining_levels, self.growth)
-        self.step_margins = (self.step_margins[:self.steps_filled] or []) + tail
-        self.max_steps = self.steps_filled + remaining_levels + (1 if (self.reserve_available and not self.reserve_used) else 0)
+        self.step_margins = (self.step_margins[:used_ord_count] or []) + tail
+        self.max_steps = used_ord_count + remaining_levels + (1 if (self.reserve_available and not self.reserve_used) else 0)
 
     def add_step(self, price: float):
         margin = self.step_margins[self.steps_filled]
@@ -746,20 +759,23 @@ async def scanner_main_loop(
                 fa = read_fa_policy(symbol)
                 last_fa_read = now
 
+                # тихое окно от фунд-бота
+                scan_until = pd.to_datetime(fa.get("scan_lock_until"), utc=True) if fa.get("scan_lock_until") else None
+                b["fa_scan_lock"] = bool(scan_until and pd.Timestamp.now(tz="UTC") < scan_until)
+                b["fa_scan_until_ts"] = float(scan_until.timestamp()) if scan_until is not None else None
+
             # применяем FA: risk Red -> управляем, но не открываем; Amber -> консервативней
             fa_risk = (fa.get("risk") or "Green").capitalize()
             fa_bias = (fa.get("bias") or "neutral").lower()
             b["fa_risk"] = fa_risk # hook
             b["fa_bias"] = fa_bias # hook
+            
+            # масштаб доборов/резерв
+            dca_scale = max(0.0, min(1.0, float(fa.get("dca_scale") or 1.0)))
+            reserve_off = bool(fa.get("reserve_off"))
 
-            pos: Position | None = b.get("position")
-            if pos and getattr(pos, "owner_key", None) not in (None, b["owner_key"]):
-                # На всякий случай не трогаем чужую позицию
-                await asyncio.sleep(1)
-                continue
-
-            need_build_strat = (rng_strat is None) or ((now - last_build_strat > CONFIG.REBUILD_RANGE_EVERY_MIN*60) and (pos is None))
-            need_build_tac   = (rng_tac   is None) or ((now - last_build_tac   > CONFIG.REBUILD_TACTICAL_EVERY_MIN*60) and (pos is None))
+            need_build_strat = (rng_strat is None) or ((now - last_build_strat > CONFIG.REBUILD_RANGE_EVERY_MIN*60) and (b.get("position") is None))
+            need_build_tac   = (rng_tac   is None) or ((now - last_build_tac   > CONFIG.REBUILD_TACTICAL_EVERY_MIN*60) and (b.get("position") is None))
             if need_build_strat or need_build_tac:
                 s, t = await build_ranges(symbol)
                 if need_build_strat and s:
@@ -780,15 +796,31 @@ async def scanner_main_loop(
                 log.warning("Could not fetch 5m OHLCV data. Skipping this cycle.")
                 await asyncio.sleep(2); continue
 
-            if not _is_df_fresh(ohlc5_df, max_age_min=15):
-                # рынок «стоит»: не открываем новые, но позволяем менеджмент активной позиции
+            fa_ts = b.get("fa_scan_until_ts")
+            if fa_ts is not None and time.time() < fa_ts:
+                b["scan_paused"] = True
+            elif not _is_df_fresh(ohlc5_df, max_age_min=15):
                 b["scan_paused"] = True
             else:
-                # возвращаем обычный режим, если не включён внешней политикой
-                b.setdefault("fa_scan_lock", False)  # hook под фонд
                 b["scan_paused"] = bool(b.get("fa_scan_lock", False))
             
             manage_only_flag = b.get("scan_paused", False) or (fa_risk == "Red")
+            
+            pos: Position | None = b.get("position")
+            if pos and getattr(pos, "owner_key", None) not in (None, b["owner_key"]):
+                await asyncio.sleep(1); continue # На всякий случай не трогаем чужую позицию
+
+            if pos and b.get("fsm_state") == int(FSM.MANAGING) and pos.steps_filled > 0:
+                if bool(fa.get("reserve_off")) and pos.reserve_available and not pos.reserve_used:
+                    pos.reserve_available = False
+                    pos.reserve_margin_usdt = 0.0
+                    pos.max_steps = max(pos.steps_filled, pos.ord_levels)
+
+                new_alloc_bank = bank * float(fa.get("dca_scale") or 1.0)
+                if new_alloc_bank > 0 and pos.steps_filled < pos.ord_levels:
+                    if pos.alloc_bank_planned <= 0 or abs(new_alloc_bank - pos.alloc_bank_planned) / max(pos.alloc_bank_planned, 1e-9) > 0.05:
+                        pos.rebalance_tail_margins_excluding_reserve(new_alloc_bank)
+                        pos.alloc_bank_planned = new_alloc_bank
 
             df5 = ohlc5_df.copy()
             df5.columns = ["open","high","low","close","volume"]
@@ -836,7 +868,7 @@ async def scanner_main_loop(
                     await asyncio.sleep(1); continue
                 exit_p = px
                 time_min = (time.time()-pos.open_ts)/60.0
-                net_usd, net_pct = compute_net_pnl(pos, exit_p, fee_taker, fee_maker)
+                net_usd, net_pct = compute_net_pnl(pos, exit_p, fee_taker, fee_taker)
                 await say(
                     "🧰 <b>MANUAL_CLOSE</b>\n"
                     f"Цена выхода: <code>{fmt(exit_p)}</code>\n"
@@ -898,10 +930,7 @@ async def scanner_main_loop(
                         side_cand = None
 
                 if side_cand:
-                    lev = CONFIG.LEVERAGE
-                    if manual and (manual.get("leverage") is not None) and str(manual["leverage"]).strip():
-                        lev = max(CONFIG.MIN_LEVERAGE, min(CONFIG.MAX_LEVERAGE, int(manual["leverage"])))
-                    pos = Position(side_cand, signal_id=f"{symbol.replace('/','')} {int(now)}", leverage=lev, owner_key=b["owner_key"])
+                    pos = Position(side_cand, signal_id=f"{symbol.replace('/','')} {int(now)}", leverage=CONFIG.LEVERAGE, owner_key=b["owner_key"])
                     
                     ord_levels  = max(1, min(CONFIG.DCA_LEVELS - 1, int(manual["max_steps"]))) if (manual and manual.get("max_steps") is not None) else max(1, min(5, CONFIG.DCA_LEVELS - 1))
                     growth = choose_growth(ind, rng_strat, rng_tac)
@@ -911,11 +940,18 @@ async def scanner_main_loop(
                         ord_levels = max(1, ord_levels - 1)
                         growth = min(growth, CONFIG.AUTO_ALLOC["growth_A"])
 
-                    pos.plan_with_reserve(bank, growth, ord_levels)
+                    alloc_bank = bank * dca_scale
+                    pos.plan_with_reserve(alloc_bank, growth, ord_levels)
+                    pos.alloc_bank_planned = alloc_bank
+                    if reserve_off:
+                        pos.reserve_available = False
+                        pos.reserve_margin_usdt = 0.0
+                        pos.max_steps = pos.ord_levels
+                    
                     pos.ordinary_targets = compute_mixed_targets(entry=px, side=pos.side, rng_strat=rng_strat, rng_tac=rng_tac, tick=tick)
 
                     margin, _ = pos.add_step(px)
-                    pos.rebalance_tail_margins_excluding_reserve(bank)
+                    pos.rebalance_tail_margins_excluding_reserve(alloc_bank)
                     b["position"] = pos
                     b["fsm_state"] = int(FSM.OPENED)
 
@@ -986,6 +1022,7 @@ async def scanner_main_loop(
                             })
 
                 # Обычные усреднения (включая OPEN)
+                used_ord = pos.steps_filled - (1 if pos.reserve_used else 0)
                 nxt = next_pct_target(pos)
                 is_open_event = b.get("fsm_state") == int(FSM.OPENED) and pos.steps_filled == 1
                 is_add_event = b.get("fsm_state") == int(FSM.MANAGING) and (nxt is not None) and (
@@ -993,13 +1030,21 @@ async def scanner_main_loop(
 
                 now_ts = time.time()
                 allowed_now = is_open_event or (pos.last_add_ts is None) or ((now_ts - pos.last_add_ts) >= CONFIG.ADD_COOLDOWN_SEC)
-                if (is_open_event or is_add_event) and (not pos.freeze_ordinary) and (pos.steps_filled < pos.ord_levels) and allowed_now:
-                    if is_add_event: # Для OPEN шаг уже добавлен
+                if (is_open_event or is_add_event) and (not pos.freeze_ordinary) and (used_ord < pos.ord_levels) and allowed_now:
+                    if is_add_event:
+                        alloc_bank = bank * dca_scale
                         margin, _ = pos.add_step(px)
-                        pos.rebalance_tail_margins_excluding_reserve(bank)
-                    else: # Для OPEN-события маржу уже знаем
+                        pos.rebalance_tail_margins_excluding_reserve(alloc_bank)
+                    else:
                         margin = pos.step_margins[0]
 
+                    used_ord_after = pos.steps_filled - (1 if pos.reserve_used else 0)
+                    nxt2 = next_pct_target(pos)
+                    total_ord = max(0, min(pos.ord_levels, len(pos.ordinary_targets)))
+                    remaining = max(0, total_ord - used_ord_after)
+                    next_idx = used_ord_after
+                    nxt2_margin = pos.step_margins[next_idx] if next_idx < len(pos.step_margins) else None
+                    
                     lots = margin_to_lots(symbol, margin, price=px, leverage=pos.leverage)
                     cum_margin = _pos_total_margin(pos)
                     cum_notional = cum_margin * pos.leverage
@@ -1009,20 +1054,14 @@ async def scanner_main_loop(
                     dist_txt = "N/A" if np.isnan(dist_to_liq_pct) else f"{dist_to_liq_pct:.2f}%"
                     liq_arrow = "↓" if pos.side == "LONG" else "↑"
 
-                    nxt2 = next_pct_target(pos)
                     nxt2_txt = "N/A" if nxt2 is None else f"{fmt(nxt2['price'])} ({nxt2['label']})"
-                    total_ord = max(0, min(pos.ord_levels, len(pos.ordinary_targets)))
-                    used_ord = max(0, pos.steps_filled - (1 if pos.reserve_used else 0))
-                    remaining = max(0, total_ord - used_ord)
                     
                     if is_open_event:
                         curr_label = "OPEN"
                     else:
-                        idx = max(0, min(len(pos.ordinary_targets)-1, used_ord-1))
+                        idx = max(0, min(len(pos.ordinary_targets)-1, used_ord_after - 1))
                         curr_label = (pos.ordinary_targets[idx]["label"] if 0 <= idx < len(pos.ordinary_targets) else "")
 
-                    next_idx = used_ord
-                    nxt2_margin = pos.step_margins[next_idx] if next_idx < len(pos.step_margins) else None
                     nxt2_dep_txt = "N/A"
                     if nxt2_margin and nxt2:
                         nxt_lots = margin_to_lots(symbol, nxt2_margin, price=nxt2['price'], leverage=pos.leverage)
@@ -1032,7 +1071,7 @@ async def scanner_main_loop(
                     brk_up_pct, brk_dn_pct = break_distance_pcts(px, brk_up, brk_dn)
                     brk_line = f"Пробой: ↑<code>{fmt(brk_up)}</code> ({brk_up_pct:.2f}%) | ↓<code>{fmt(brk_dn)}</code> ({brk_dn_pct:.2f}%)"
 
-                    event_type_str = "▶️ OPEN" if is_open_event else f"➕ Усреднение #{pos.steps_filled}"
+                    event_type_str = "▶️ OPEN" if is_open_event else f"➕ Усреднение #{used_ord_after}"
                     await say(
                         f"{event_type_str} [{curr_label}]\n"
                         f"Цена: <code>{fmt(px)}</code> | <b>{lots:.2f} lot</b>\n"
@@ -1115,7 +1154,7 @@ async def scanner_main_loop(
                         reason = "TP_HIT" if tp_hit else "SL_HIT"
                         exit_p = pos.tp_price if tp_hit else pos.sl_price
                         time_min = (time.time() - pos.open_ts) / 60.0
-                        net_usd, net_pct = compute_net_pnl(pos, exit_p, fee_taker, fee_maker)
+                        net_usd, net_pct = compute_net_pnl(pos, exit_p, fee_taker, fee_taker)
                         atr_now = ind["atr5m"]
                         await say(
                             f"{'✅' if net_usd > 0 else '❌'} <b>{reason}</b>\n"
