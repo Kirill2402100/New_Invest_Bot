@@ -3,6 +3,8 @@
 # - автосоздание листов BMR_DCA_<SYMBOL> и дублирование логов туда
 # - интеграция ФА-бота (risk/bias/ttl/updated_at) + периодическое обновление
 # - совместимость с fetch_ohlcv(symbol, tf, limit) из fx_feed
+# - [NEW] TTL-кэш 5m OHLCV (уменьшает нагрузку/лимиты)
+# - [NEW] тихая настройка yfinance TzCache (убирает спам в логах)
 
 from __future__ import annotations
 
@@ -15,6 +17,20 @@ import numpy as np
 import pandas as pd
 from telegram.ext import Application
 import gspread
+
+# --- optional: приглушаем yfinance TzCache INFO ---
+try:
+    os.makedirs("/tmp/py-yfinance", exist_ok=True)
+    try:
+        import yfinance as _yf  # noqa: F401
+        try:
+            _yf.set_tz_cache_location("/tmp/py-yfinance")
+        except Exception:
+            pass
+    except Exception:
+        pass
+except Exception:
+    pass
 
 # === Forex адаптеры и фид ===
 from fx_mt5_adapter import FX, margin_to_lots, default_tick
@@ -171,6 +187,11 @@ class CONFIG:
     TACTICAL_PCTS = [0.25, 0.50, 0.75]
     STRATEGIC_PCTS = [0.33, 0.66, 1.00]
 
+    # [NEW] TTL для кэша 5m OHLCV
+    ENTRY_CACHE_TTL_SEC = 25
+    # Максимум записей в локальном кэше per-бот/символ
+    ENTRY_CACHE_MAX_KEYS = 8
+
 # ENV-переопределения
 CONFIG.SYMBOL    = os.getenv("FX_SYMBOL", CONFIG.SYMBOL)
 CONFIG.TF_ENTRY = os.getenv("TF_ENTRY", CONFIG.TF_ENTRY)
@@ -314,7 +335,7 @@ def read_fa_policy(symbol: str) -> dict:
                             return {}
                     except Exception:
                         pass
-                
+
                 scan_lock_until = str(r.get("scan_lock_until") or "").strip()
                 reserve_off = str(r.get("reserve_off") or "").strip().lower() in ("1","true","yes","on")
                 try: dca_scale = float(r.get("dca_scale") or 1.0)
@@ -667,6 +688,35 @@ def _wrap_broadcast(bc, default_chat_id: int | None):
     return _wb
 
 # ---------------------------------------------------------------------------
+# [NEW] Локальный TTL-кэш для OHLCV 5m
+# ---------------------------------------------------------------------------
+async def _fetch_ohlcv_cached(symbol: str, tf: str, limit: int, bslot: dict, ttl_sec: int) -> Optional[pd.DataFrame]:
+    """
+    Простой кэш в памяти (per-символ/чат) на ttl_sec.
+    Ключ: (symbol, tf, limit). Храним ts и df. При переполнении — выкидываем самый старый.
+    """
+    cache = bslot.setdefault("_df_cache", {})
+    now = time.time()
+    key = (symbol, tf, int(limit))
+
+    item = cache.get(key)
+    if item and (now - item.get("ts", 0)) < ttl_sec:
+        df_cached = item.get("df")
+        if isinstance(df_cached, pd.DataFrame) and not df_cached.empty:
+            return df_cached
+
+    df = await maybe_await(fetch_ohlcv_yf, symbol, tf, limit)
+    if isinstance(df, pd.DataFrame) and not df.empty:
+        cache[key] = {"ts": now, "df": df}
+        # простая эвикция
+        if len(cache) > CONFIG.ENTRY_CACHE_MAX_KEYS:
+            # удалить самый старый
+            oldest_key = min(cache.items(), key=lambda kv: kv[1].get("ts", 0))[0]
+            if oldest_key in cache:
+                cache.pop(oldest_key, None)
+    return df
+
+# ---------------------------------------------------------------------------
 # Main Loop
 # ---------------------------------------------------------------------------
 async def scanner_main_loop(
@@ -791,7 +841,10 @@ async def scanner_main_loop(
 
             # 5m данные — ограничим кол-во баров
             bars_needed = max(60, CONFIG.VOL_WIN + CONFIG.ADX_LEN + 20)
-            ohlc5_df = await maybe_await(fetch_ohlcv_yf, symbol, CONFIG.TF_ENTRY, bars_needed)
+
+            # [NEW] используем TTL-кэш вместо постоянных вызовов
+            ohlc5_df = await _fetch_ohlcv_cached(symbol, CONFIG.TF_ENTRY, bars_needed, b, CONFIG.ENTRY_CACHE_TTL_SEC)
+
             if ohlc5_df is None or ohlc5_df.empty:
                 log.warning("Could not fetch 5m OHLCV data. Skipping this cycle.")
                 await asyncio.sleep(2); continue
