@@ -28,7 +28,6 @@ def _normalize_symbol(sym: str) -> Dict[str, str]:
 _NEED_COLS = ["open", "high", "low", "close", "volume"]
 
 def _as_dataframe(obj) -> pd.DataFrame:
-    """Гарантируем DataFrame (Series->DF, dict/ndarray->DF)."""
     if isinstance(obj, pd.DataFrame):
         return obj
     if isinstance(obj, pd.Series):
@@ -39,10 +38,9 @@ def _as_dataframe(obj) -> pd.DataFrame:
         raise RuntimeError("provider returned non-tabular data")
 
 def _flatten_multiindex(df: pd.DataFrame) -> pd.DataFrame:
-    """Для yfinance с одним тикером может прилететь MultiIndex колонок ('Open', 'EURUSD=X')."""
     if isinstance(df.columns, pd.MultiIndex):
-        # Берём первый уровень ('Open','High',...) и игнорируем тикер
-        df.columns = [str(c[0]) if isinstance(c, tuple) else str(c) for c in df.columns.values]
+        # Берём первый уровень ('Open','High',...) — игнорируем тикер
+        df.columns = [str(c[0]) if isinstance(c, tuple) else str(c) for c in df.columns.to_list()]
     return df
 
 def _lower_cols(df: pd.DataFrame) -> pd.DataFrame:
@@ -53,7 +51,6 @@ def _lower_cols(df: pd.DataFrame) -> pd.DataFrame:
 def _to_utc_index(df: pd.DataFrame, time_col: Optional[str] = None) -> pd.DataFrame:
     df = df.copy()
 
-    # Если явная колонка времени — используем её
     if time_col is None:
         for cand in ("time", "datetime", "timestamp", "date"):
             if cand in df.columns:
@@ -61,18 +58,15 @@ def _to_utc_index(df: pd.DataFrame, time_col: Optional[str] = None) -> pd.DataFr
                 break
 
     if time_col:
-        # Иногда провайдер отдаёт время строками/без таймзоны
         df[time_col] = pd.to_datetime(df[time_col], utc=True, errors="coerce")
         df = df.dropna(subset=[time_col]).sort_values(time_col).set_index(time_col)
     else:
-        # Индекс уже временнОй?
         if isinstance(df.index, pd.DatetimeIndex):
             if df.index.tz is None:
                 df.index = df.index.tz_localize("UTC")
             else:
                 df.index = df.index.tz_convert("UTC")
         else:
-            # Fallback: попробовать через reset_index()
             try:
                 idx = pd.to_datetime(df.index, utc=True, errors="coerce")
                 if idx.notna().any():
@@ -84,28 +78,23 @@ def _to_utc_index(df: pd.DataFrame, time_col: Optional[str] = None) -> pd.DataFr
             except Exception:
                 df = df.reset_index(drop=False)
                 return _to_utc_index(df, time_col="index")
-
     return df
 
 def _ensure_cols(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
 
-    # yfinance может прислать 'adj close'
     if "close" not in df.columns and "adj close" in df.columns:
         df["close"] = df["adj close"]
 
-    # volume может отсутствовать для FX — создаём нули
     if "volume" not in df.columns:
         df["volume"] = 0.0
 
-    # Добираем недостающие
     for c in _NEED_COLS:
         if c not in df.columns:
             df[c] = 0.0
 
     df = df[_NEED_COLS]
 
-    # Приводим типы и чистим NaN/Inf
     for c in _NEED_COLS:
         df[c] = pd.to_numeric(df[c], errors="coerce")
     df = df.replace([np.inf, -np.inf], np.nan).dropna(how="any")
@@ -113,7 +102,6 @@ def _ensure_cols(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         raise RuntimeError("empty after column sanitize")
 
-    # Сортировка и уникальность индекса
     df = df.sort_index()
     if not isinstance(df.index, pd.DatetimeIndex):
         raise RuntimeError("index is not DatetimeIndex after normalization")
@@ -124,7 +112,7 @@ def _normalize_ohlcv_df(raw_df) -> pd.DataFrame:
     df = _as_dataframe(raw_df)
     df = _flatten_multiindex(df)
     df = _lower_cols(df)
-    df = _to_utc_index(df)           # сам найдёт колонку времени/или индекс
+    df = _to_utc_index(df)
     df = _ensure_cols(df)
     return df
 
@@ -171,6 +159,7 @@ def _fetch_yahoo(symbol_y: str, tf: str, limit: int) -> pd.DataFrame:
 
     period = _yf_period_for(limit, tf)
 
+    # 1) забираем сырые данные
     df_raw = yf.download(
         tickers=symbol_y,
         interval=interval,
@@ -179,12 +168,55 @@ def _fetch_yahoo(symbol_y: str, tf: str, limit: int) -> pd.DataFrame:
         actions=False,
         progress=False,
         threads=False,
-        group_by="column",   # гарантируем не-MultiIndex для одиночного тикера
+        group_by="column",  # избавляемся от мультииндекса в большинстве случаев
     )
+
+    if not isinstance(df_raw, (pd.Series, pd.DataFrame)):
+        raise RuntimeError("Yahoo returned non-DataFrame")
+
+    if isinstance(df_raw, pd.DataFrame) and df_raw.empty:
+        raise RuntimeError("Yahoo returned empty DataFrame")
+
+    # 2)унифицируем: всегда делаем явную колонку времени
+    if isinstance(df_raw, pd.Series):
+        df_raw = df_raw.to_frame().T
+
+    # на всякий случай расплющим возможный MultiIndex колонок (у некоторых версий yfinance он всё равно бывает)
+    if isinstance(df_raw.columns, pd.MultiIndex):
+        df_raw.columns = [c[0] if isinstance(c, tuple) else c for c in df_raw.columns.to_list()]
+
+    df_raw = df_raw.copy()
+    df_raw.columns = [str(c) for c in df_raw.columns]
+
+    # reset_index -> 'time'
+    df_raw = df_raw.reset_index(drop=False)
+    # разные версии дают 'Datetime' или 'Date'
+    for cand in ("Datetime", "Date", "date", "datetime", "index"):
+        if cand in df_raw.columns:
+            df_raw = df_raw.rename(columns={cand: "time"})
+            break
+
+    # переименуем OHLCV case-insensitive
+    rename_map = {}
+    for name in list(df_raw.columns):
+        low = name.lower()
+        if low in ("open", "high", "low", "close", "adj close", "adjclose", "adj_close", "volume"):
+            rename_map[name] = low
+    if rename_map:
+        df_raw = df_raw.rename(columns=rename_map)
+
+    # если нет 'close', но есть 'adj close' — используем его
+    if "close" not in df_raw.columns and "adj close" in df_raw.columns:
+        df_raw["close"] = df_raw["adj close"]
+
+    # 3) общая нормализация (создаст DatetimeIndex UTC, доберёт недостающие колонки)
     df = _normalize_ohlcv_df(df_raw)
+
+    # 4) подрезаем
     df = df.tail(int(limit))
     if df.empty:
         raise RuntimeError("Yahoo returned empty after tail()")
+
     return df
 
 def _fetch_stooq(symbol_s: str, tf: str, limit: int) -> pd.DataFrame:
@@ -242,7 +274,6 @@ def _fetch_twelvedata(symbol_t: str, tf: str, limit: int) -> pd.DataFrame:
         from io import StringIO
         df_raw = pd.read_csv(StringIO(r.text))
 
-    # TD обычно присылает 'datetime'
     if "datetime" in df_raw.columns and "time" not in df_raw.columns:
         df_raw = df_raw.rename(columns={"datetime": "time"})
     if "timestamp" in df_raw.columns and "time" not in df_raw.columns:
@@ -259,20 +290,17 @@ def _fetch_with_provider_chain(symbol: str, tf: str, limit: int) -> Tuple[pd.Dat
     sym = _normalize_symbol(symbol)
     errors = []
 
-    # 1) MT5
     try:
         return _fetch_mt5(sym["mt5"], tf, limit), "MT5"
     except Exception as e:
         errors.append(f"MT5: {e}")
 
-    # 2) Yahoo
     try:
         return _fetch_yahoo(sym["yahoo"], tf, limit), "Yahoo"
     except Exception as e:
         log.warning("Yahoo fetch failed for %s %s: %s", sym["yahoo"], tf, e)
         errors.append(f"Yahoo: {e}")
 
-    # 3) Stooq (только дневка)
     try:
         if tf.lower() == "1d":
             return _fetch_stooq(sym["stooq"], tf, limit), "Stooq"
@@ -282,7 +310,6 @@ def _fetch_with_provider_chain(symbol: str, tf: str, limit: int) -> Tuple[pd.Dat
         log.warning("Stooq fetch failed for %s %s: %s", sym["stooq"], tf, e)
         errors.append(f"Stooq: {e}")
 
-    # 4) TwelveData
     try:
         return _fetch_twelvedata(sym["twelve"], tf, limit), "TwelveData"
     except Exception as e:
