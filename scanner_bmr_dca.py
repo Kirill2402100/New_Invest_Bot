@@ -3,8 +3,6 @@
 # - автосоздание листов BMR_DCA_<SYMBOL> и дублирование логов туда
 # - интеграция ФА-бота (risk/bias/ttl/updated_at) + периодическое обновление
 # - совместимость с fetch_ohlcv(symbol, tf, limit) из fx_feed
-# - [NEW] TTL-кэш 5m OHLCV (уменьшает нагрузку/лимиты)
-# - [NEW] тихая настройка yfinance TzCache (убирает спам в логах)
 
 from __future__ import annotations
 
@@ -17,20 +15,6 @@ import numpy as np
 import pandas as pd
 from telegram.ext import Application
 import gspread
-
-# --- optional: приглушаем yfinance TzCache INFO ---
-try:
-    os.makedirs("/tmp/py-yfinance", exist_ok=True)
-    try:
-        import yfinance as _yf  # noqa: F401
-        try:
-            _yf.set_tz_cache_location("/tmp/py-yfinance")
-        except Exception:
-            pass
-    except Exception:
-        pass
-except Exception:
-    pass
 
 # === Forex адаптеры и фид ===
 from fx_mt5_adapter import FX, margin_to_lots, default_tick
@@ -183,14 +167,11 @@ class CONFIG:
     # ФА-политика
     FA_REFRESH_SEC = 300  # перечитывать раз в 5 минут
 
-    # Для расчёта целевых цен усреднений
-    TACTICAL_PCTS = [0.25, 0.50, 0.75]
-    STRATEGIC_PCTS = [0.33, 0.66, 1.00]
+    # Анти-слипание ценовых уровней
+    DCA_MIN_GAP_TICKS = 2       # минимум 2 тика между целями
 
-    # [NEW] TTL для кэша 5m OHLCV
-    ENTRY_CACHE_TTL_SEC = 25
-    # Максимум записей в локальном кэше per-бот/символ
-    ENTRY_CACHE_MAX_KEYS = 8
+    # Показываем ML-цену при целевом Margin Level
+    ML_TARGET_PCT = 20.0        # "ML цена (20%)"
 
 # ENV-переопределения
 CONFIG.SYMBOL    = os.getenv("FX_SYMBOL", CONFIG.SYMBOL)
@@ -335,7 +316,7 @@ def read_fa_policy(symbol: str) -> dict:
                             return {}
                     except Exception:
                         pass
-
+                
                 scan_lock_until = str(r.get("scan_lock_until") or "").strip()
                 reserve_off = str(r.get("reserve_off") or "").strip().lower() in ("1","true","yes","on")
                 try: dca_scale = float(r.get("dca_scale") or 1.0)
@@ -359,14 +340,24 @@ def fmt(p: float) -> str:
     if p < 1.0:  return f"{p:.5f}"
     return f"{p:.4f}"
 
-def margin_line(pos, bank: float) -> str:
+def margin_line(pos, bank: float, px: float | None = None, fees_est: float = 0.0) -> str:
+    """
+    Показывает used/free и ML% (по equity, с учётом буфера).
+    Если px не передан — ML% приблизим как bank/used.
+    """
     used = _pos_total_margin(pos)
-    free = max(bank - used, 0.0)
     if used <= 0:
-        ml_txt = "∞"
+        return f"Маржа: used 0.00 | свободная {bank:.2f} | ML≈ ∞"
+
+    if px is None:
+        ml_pct = (bank / used) * 100.0
+        free = max(bank - used, 0.0)
     else:
-        ml = (bank / used) * 100.0
-        ml_txt = f"{ml:.0f}%"
+        eq = equity_at_price(pos, px, bank, fees_est)
+        ml_pct = (eq / used) * 100.0
+        free = max(eq - used, 0.0)
+
+    ml_txt = "∞" if not np.isfinite(ml_pct) or ml_pct > 9999 else f"{ml_pct:.0f}%"
     return f"Маржа: used {used:.2f} | свободная {free:.2f} | ML≈ {ml_txt}"
 
 def plan_margins_bank_first(bank: float, levels: int, growth: float) -> list[float]:
@@ -395,19 +386,55 @@ def compute_net_pnl(pos, exit_p: float, fee_entry: float, fee_exit: float) -> tu
     net_pct = (net_usd / sum_margin) * 100.0
     return net_usd, net_pct
 
-def approx_liq_price_cross(avg: float, side: str, qty: float, equity: float, mmr: float, fees_paid: float = 0.0) -> float:
-    if qty <= 0 or equity <= 0: return float('nan')
-    eq = max(0.0, equity - fees_paid)
-    if side == "LONG":
-        denom = max(qty * (1.0 - mmr), 1e-12)
-        return (avg * qty - eq) / denom
-    else:
-        denom = max(qty * (1.0 + mmr), 1e-12)
-        return (avg * qty + eq) / denom
+def _pnl_at_price(pos, price: float, used_margin: float) -> float:
+    """PnL в USD при цене price (без комиссий)."""
+    if used_margin <= 0 or price is None or pos.avg <= 0:
+        return 0.0
+    L = max(1, int(getattr(pos, "leverage", 1) or 1))
+    if pos.side == "LONG":
+        return used_margin * L * (price / pos.avg - 1.0)
+    else:  # SHORT
+        return used_margin * L * (pos.avg / max(price, 1e-12) - 1.0)
 
-def liq_distance_pct(side: str, px: float, liq: float) -> float:
-    if px is None or liq is None or px <= 0 or np.isnan(liq): return float('nan')
-    return (liq / px - 1.0) * 100 if side == "SHORT" else (1.0 - liq / px) * 100
+def equity_at_price(pos, price: float, bank: float, fees_est: float) -> float:
+    """Equity = банк (включая 30% буфер) + PnL - комиссии."""
+    used = _pos_total_margin(pos)
+    pnl  = _pnl_at_price(pos, price, used)
+    return bank + pnl - max(fees_est, 0.0)
+
+def ml_percent_now(pos, price: float, bank: float, fees_est: float) -> float:
+    used = _pos_total_margin(pos)
+    if used <= 0: 
+        return float('inf')
+    return (equity_at_price(pos, price, bank, fees_est) / used) * 100.0
+
+def ml_price_at(pos, target_ml_pct: float, bank: float, fees_est: float) -> float:
+    """
+    Цена, при которой ML = target_ml_pct.
+    ML = Equity / UsedMargin, Equity = bank + PnL - fees_est.
+    Решаем относительно цены.
+    """
+    UM = _pos_total_margin(pos)
+    if UM <= 0 or pos.avg <= 0:
+        return float('nan')
+    L = max(1, int(getattr(pos, "leverage", 1) or 1))
+    target_equity = (target_ml_pct / 100.0) * UM
+    base = (target_equity - (bank - max(fees_est, 0.0))) / (UM * L)
+
+    if pos.side == "LONG":
+        # price/avg - 1 = base  ->  price = avg * (1 + base)
+        return pos.avg * (1.0 + base)
+    else:
+        # avg/price - 1 = base  ->  price = avg / (1 + base)
+        denom = 1.0 + base
+        if denom <= 0:
+            return float('nan')
+        return pos.avg / denom
+
+def ml_distance_pct(side: str, px: float, ml_price: float) -> float:
+    if px is None or ml_price is None or px <= 0 or np.isnan(ml_price):
+        return float('nan')
+    return (1.0 - ml_price / px) * 100.0 if side == "LONG" else (ml_price / px - 1.0) * 100.0
 
 def chandelier_stop(side: str, price: float, atr: float, mult: float = 3.0):
     return price - mult*atr if side == "LONG" else price + mult*atr
@@ -428,34 +455,67 @@ def quantize_to_tick(x: float | None, tick: float) -> float | None:
     if x is None or (isinstance(x, float) and np.isnan(x)): return x
     return round(round(x / tick) * tick, 10)
 
-def compute_pct_targets(entry: float, side: str, rng: dict, tick: float, pcts: list[float]) -> list[float]:
-    if side == "SHORT":
-        cap = rng["upper"]
-        path = max(0.0, cap - entry)
-        raw = [entry + path * p for p in pcts]
-        brk_up, _ = break_levels(rng)
-        buf = max(tick, 0.05 * max(rng.get("atr1h", 0.0), 1e-9))
-        capped = [min(x, brk_up - buf) for x in raw]
+def _place_segment(start: float, end: float, count: int, tick: float, include_end_last: bool) -> list[float]:
+    """Равномерно распределяем точки между start и end. Анти-слипание: >= DCA_MIN_GAP_TICKS."""
+    if count <= 0:
+        return []
+    path = end - start
+    if abs(path) < tick * CONFIG.DCA_MIN_GAP_TICKS:
+        return []
+    # Если нужно исключить начало и включить конец:
+    if include_end_last and count >= 1:
+        # фракции: 1/n, 2/n, ..., 1.0  (нет 0.0)
+        fracs = [(i + 1) / count for i in range(count)]
     else:
-        cap = rng["lower"]
-        path = max(0.0, entry - cap)
-        raw = [entry - path * p for p in pcts]
-        _, brk_dn = break_levels(rng)
-        buf = max(tick, 0.05 * max(rng.get("atr1h", 0.0), 1e-9))
-        capped = [max(x, brk_dn + buf) for x in raw]
-    out = []
-    for x in capped:
+        # по-прежнему исключаем оба конца
+        fracs = [(i + 1) / (count + 1) for i in range(count)]
+        
+    raw = [start + path * f for f in fracs]
+    # Квантование и анти-слипание
+    min_gap = tick * CONFIG.DCA_MIN_GAP_TICKS
+    out: list[float] = []
+    for x in raw:
         q = quantize_to_tick(x, tick)
-        if q is not None and (not out or (side=="SHORT" and q > out[-1] + tick) or (side=="LONG" and q < out[-1] - tick)):
+        if q is None:
+            continue
+        if not out or (abs(q - out[-1]) >= min_gap):
             out.append(q)
     return out
 
-def compute_pct_targets_labeled(entry, side, rng, tick, pcts, label):
-    prices = compute_pct_targets(entry, side, rng, tick, pcts)
-    out = []
-    for i, pr in enumerate(prices):
-        pct = int(round(pcts[min(i, len(pcts)-1)] * 100))
-        out.append({"price": pr, "label": f"{label} {pct}%"})
+def compute_corridor_targets(entry: float, side: str, rng_strat: dict, rng_tac: dict, tick: float) -> list[dict]:
+    """
+    2 точки в сторону TAC-границы (без включения самой границы),
+    3 точки между TAC- и STRAT-границами (последняя может совпасть со STRAT-границей).
+    Если «места мало» — количество автоматически сокращается.
+    """
+    if side == "LONG":
+        tac_b  = rng_tac["lower"]
+        strat_b = rng_strat["lower"]
+        seg1 = _place_segment(entry, tac_b, 2, tick, include_end_last=False)
+        seg2 = _place_segment(tac_b, strat_b, 3, tick, include_end_last=True)
+    else:
+        tac_b  = rng_tac["upper"]
+        strat_b = rng_strat["upper"]
+        seg1 = _place_segment(entry, tac_b, 2, tick, include_end_last=False)
+        seg2 = _place_segment(tac_b, strat_b, 3, tick, include_end_last=True)
+
+    # Метки
+    def _labels(prefix: str, n: int, include_end: bool) -> list[str]:
+        if n <= 0: return []
+        if include_end and n >= 1:
+            fr = [(i + 1) / n for i in range(n)]  # 33..100%
+        else:
+            fr = [(i + 1) / (n + 1) for i in range(n)]  # 33..66% для сегмента entry→TAC
+        return [f"{prefix} {int(round(f * 100))}%" for f in fr]
+
+    out: list[dict] = []
+    for p, lab in zip(seg1, _labels("TAC", len(seg1), include_end=False)):
+        out.append({"price": p, "label": lab})
+    for p, lab in zip(seg2, _labels("STRAT", len(seg2), include_end=True)):
+        out.append({"price": p, "label": lab})
+
+    # Упорядочить по стороне и удалить возможные дубликаты
+    out = merge_targets_sorted(side, tick, out)
     return out
 
 def merge_targets_sorted(side: str, tick: float, targets: list[dict]) -> list[dict]:
@@ -464,24 +524,22 @@ def merge_targets_sorted(side: str, tick: float, targets: list[dict]) -> list[di
     else:
         targets = sorted(targets, key=lambda t: t["price"], reverse=True)
     dedup = []
+    min_gap = tick * CONFIG.DCA_MIN_GAP_TICKS
     for t in targets:
         if not dedup: dedup.append(t)
         else:
-            if (side=="SHORT" and t["price"] > dedup[-1]["price"] + tick) or \
-               (side=="LONG"  and t["price"] < dedup[-1]["price"] - tick):
+            if (side=="SHORT" and t["price"] > dedup[-1]["price"] + min_gap) or \
+               (side=="LONG"  and t["price"] < dedup[-1]["price"] - min_gap):
                 dedup.append(t)
     return dedup
-
-def compute_mixed_targets(entry: float, side: str, rng_strat: dict, rng_tac: dict, tick: float) -> list[dict]:
-    tacs = compute_pct_targets_labeled(entry, side, rng_tac,   tick, CONFIG.TACTICAL_PCTS,  "TAC")
-    strs = compute_pct_targets_labeled(entry, side, rng_strat, tick, CONFIG.STRATEGIC_PCTS, "STRAT")
-    return merge_targets_sorted(side, tick, tacs + strs)
 
 def next_pct_target(pos):
     if not getattr(pos, "ordinary_targets", None):
         return None
-    ord_used_incl_open = pos.steps_filled - (1 if pos.reserve_used else 0)
-    idx = ord_used_incl_open - 1
+    # шагов обычных, включая OPEN
+    used_ord_incl_open = pos.steps_filled - (1 if pos.reserve_used else 0)
+    # следующий уровень в ordinary_targets имеет индекс на 1 меньше
+    idx = used_ord_incl_open - 1
     return pos.ordinary_targets[idx] if 0 <= idx < len(pos.ordinary_targets) else None
 
 def choose_growth(ind: dict, rng_strat: dict, rng_tac: dict) -> float:
@@ -510,8 +568,10 @@ def _is_df_fresh(df: pd.DataFrame, max_age_min: int = 15) -> bool:
 # ---------------------------------------------------------------------------
 # Диапазоны/индикаторы
 # ---------------------------------------------------------------------------
-async def build_range_from_df(df: Optional[pd.DataFrame]):
+async def build_range_from_df(df: Optional[pd.DataFrame], min_atr_mult: float):
     if df is None or df.empty: return None
+    cols = list(df.columns)[-5:]
+    df = df[cols].copy()
     df.columns = ["open","high","low","close","volume"]
     ema = _ema(df["close"], length=50)
     atr = ta_atr(df["high"], df["low"], df["close"], length=14)
@@ -520,22 +580,22 @@ async def build_range_from_df(df: Optional[pd.DataFrame]):
     if pd.notna(ema.iloc[-1]) and pd.notna(atr.iloc[-1]):
         mid = float(ema.iloc[-1])
         atr1h = float(atr.iloc[-1])
-        lower = min(lower, mid - CONFIG.RANGE_MIN_ATR_MULT*atr1h)
-        upper = max(upper, mid + CONFIG.RANGE_MIN_ATR_MULT*atr1h)
+        lower = min(lower, mid - min_atr_mult * atr1h)
+        upper = max(upper, mid + min_atr_mult * atr1h)
     else:
         atr1h = 0.0
         mid = float(df["close"].iloc[-1])
     return {"lower": lower, "upper": upper, "mid": mid, "atr1h": atr1h, "width": upper-lower}
 
 async def build_ranges(symbol: str):
-    # В нашем fx_feed: fetch_ohlcv(symbol, tf, limit)
-    s_limit = CONFIG.STRATEGIC_LOOKBACK_DAYS * 24  # бары 1h
+    s_limit = CONFIG.STRATEGIC_LOOKBACK_DAYS * 24
     t_limit = CONFIG.TACTICAL_LOOKBACK_DAYS  * 24
     s_df_task = asyncio.create_task(maybe_await(fetch_ohlcv_yf, symbol, CONFIG.TF_RANGE, s_limit))
     t_df_task = asyncio.create_task(maybe_await(fetch_ohlcv_yf, symbol, CONFIG.TF_RANGE, t_limit))
     s_df, t_df = await asyncio.gather(s_df_task, t_df_task)
-    s_task = asyncio.create_task(build_range_from_df(s_df))
-    t_task = asyncio.create_task(build_range_from_df(t_df))
+    # STRAT ≥ 3×ATR, TAC ≥ 1.5×ATR
+    s_task = asyncio.create_task(build_range_from_df(s_df, min_atr_mult=3.0))
+    t_task = asyncio.create_task(build_range_from_df(t_df, min_atr_mult=1.5))
     strat, tac = await asyncio.gather(s_task, t_task)
     return strat, tac
 
@@ -629,7 +689,8 @@ class Position:
         self.max_steps = used_ord_count + remaining_levels + (1 if (self.reserve_available and not self.reserve_used) else 0)
 
     def add_step(self, price: float):
-        margin = self.step_margins[self.steps_filled]
+        used_ord_count = self.steps_filled - (1 if self.reserve_used else 0)
+        margin = self.step_margins[used_ord_count]
         notional = margin * self.leverage
         new_qty = notional / max(price, 1e-9)
         self.avg = (self.avg * self.qty + price * new_qty) / max(self.qty + new_qty, 1e-9) if self.qty > 0 else price
@@ -686,35 +747,6 @@ def _wrap_broadcast(bc, default_chat_id: int | None):
             fb = _make_bcaster(default_chat_id)
             return await fb(app, text, target_chat_id=target_chat_id)
     return _wb
-
-# ---------------------------------------------------------------------------
-# [NEW] Локальный TTL-кэш для OHLCV 5m
-# ---------------------------------------------------------------------------
-async def _fetch_ohlcv_cached(symbol: str, tf: str, limit: int, bslot: dict, ttl_sec: int) -> Optional[pd.DataFrame]:
-    """
-    Простой кэш в памяти (per-символ/чат) на ttl_sec.
-    Ключ: (symbol, tf, limit). Храним ts и df. При переполнении — выкидываем самый старый.
-    """
-    cache = bslot.setdefault("_df_cache", {})
-    now = time.time()
-    key = (symbol, tf, int(limit))
-
-    item = cache.get(key)
-    if item and (now - item.get("ts", 0)) < ttl_sec:
-        df_cached = item.get("df")
-        if isinstance(df_cached, pd.DataFrame) and not df_cached.empty:
-            return df_cached
-
-    df = await maybe_await(fetch_ohlcv_yf, symbol, tf, limit)
-    if isinstance(df, pd.DataFrame) and not df.empty:
-        cache[key] = {"ts": now, "df": df}
-        # простая эвикция
-        if len(cache) > CONFIG.ENTRY_CACHE_MAX_KEYS:
-            # удалить самый старый
-            oldest_key = min(cache.items(), key=lambda kv: kv[1].get("ts", 0))[0]
-            if oldest_key in cache:
-                cache.pop(oldest_key, None)
-    return df
 
 # ---------------------------------------------------------------------------
 # Main Loop
@@ -841,10 +873,7 @@ async def scanner_main_loop(
 
             # 5m данные — ограничим кол-во баров
             bars_needed = max(60, CONFIG.VOL_WIN + CONFIG.ADX_LEN + 20)
-
-            # [NEW] используем TTL-кэш вместо постоянных вызовов
-            ohlc5_df = await _fetch_ohlcv_cached(symbol, CONFIG.TF_ENTRY, bars_needed, b, CONFIG.ENTRY_CACHE_TTL_SEC)
-
+            ohlc5_df = await maybe_await(fetch_ohlcv_yf, symbol, CONFIG.TF_ENTRY, bars_needed)
             if ohlc5_df is None or ohlc5_df.empty:
                 log.warning("Could not fetch 5m OHLCV data. Skipping this cycle.")
                 await asyncio.sleep(2); continue
@@ -1001,7 +1030,7 @@ async def scanner_main_loop(
                         pos.reserve_margin_usdt = 0.0
                         pos.max_steps = pos.ord_levels
                     
-                    pos.ordinary_targets = compute_mixed_targets(entry=px, side=pos.side, rng_strat=rng_strat, rng_tac=rng_tac, tick=tick)
+                    pos.ordinary_targets = compute_corridor_targets(entry=px, side=pos.side, rng_strat=rng_strat, rng_tac=rng_tac, tick=tick)
 
                     margin, _ = pos.add_step(px)
                     pos.rebalance_tail_margins_excluding_reserve(alloc_bank)
@@ -1011,7 +1040,7 @@ async def scanner_main_loop(
             if pos:
                 # Резервное усреднение при ретесте
                 if not pos or b.get("fsm_state") != int(FSM.MANAGING) or pos.steps_filled <= 0:
-                    pass # Пропускаем, если не в режиме управления
+                    pass
                 else:
                     now_ts = time.time()
                     need_retest_spike = (pos.spike_flag) and (pos.spike_deadline_ts and now_ts <= pos.spike_deadline_ts)
@@ -1047,10 +1076,12 @@ async def scanner_main_loop(
                             lots = margin_to_lots(symbol, margin, price=px, leverage=pos.leverage)
                             cum_notional = cum_margin * pos.leverage
                             fees_paid_est = cum_notional * fee_taker * CONFIG.LIQ_FEE_BUFFER
-                            liq = approx_liq_price_cross(avg=pos.avg, side=pos.side, qty=pos.qty, equity=bank, mmr=CONFIG.MAINT_MMR, fees_paid=fees_paid_est)
-                            dist_to_liq_pct = liq_distance_pct(pos.side, px, liq)
-                            dist_txt = "N/A" if np.isnan(dist_to_liq_pct) else f"{dist_to_liq_pct:.2f}%"
-                            liq_arrow = "↓" if pos.side == "LONG" else "↑"
+                            
+                            ml_price = ml_price_at(pos, CONFIG.ML_TARGET_PCT, bank, fees_paid_est)
+                            dist_ml_pct = ml_distance_pct(pos.side, px, ml_price)
+                            dist_txt = "N/A" if np.isnan(dist_ml_pct) else f"{dist_ml_pct:.2f}%"
+                            ml_arrow = "↓" if pos.side == "LONG" else "↑"
+                            
                             brk_up, brk_dn = break_levels(rng_strat)
                             brk_up_pct, brk_dn_pct = break_distance_pcts(px, brk_up, brk_dn)
                             brk_line = f"Пробой: ↑<code>{fmt(brk_up)}</code> ({brk_up_pct:.2f}%) | ↓<code>{fmt(brk_dn)}</code> ({brk_dn_pct:.2f}%)"
@@ -1060,9 +1091,9 @@ async def scanner_main_loop(
                                 f"Цена: <code>{fmt(px)}</code> | <b>{lots:.2f} lot</b>\n"
                                 f"Добор (резерв): <b>{margin:.2f} USD</b> | Депозит (тек): <b>{cum_margin:.2f} USD</b>\n"
                                 f"Средняя: <code>{fmt(pos.avg)}</code> | TP: <code>{fmt(pos.tp_price)}</code>\n"
-                                f"Ликвидация (est): {liq_arrow}<code>{fmt(liq) or 'N/A'}</code> ({dist_txt})\n"
+                                f"ML цена (20%): {ml_arrow}<code>{fmt(ml_price) or 'N/A'}</code> ({dist_txt})\n"
                                 f"{brk_line}\n"
-                                f"{margin_line(pos, bank)}"
+                                f"{margin_line(pos, bank, px, fees_paid_est)}"
                             )
                             await log_event_safely({
                                 "Event_ID": f"RETEST_ADD_{pos.signal_id}_{pos.steps_filled}", "Signal_ID": pos.signal_id,
@@ -1102,11 +1133,12 @@ async def scanner_main_loop(
                     cum_margin = _pos_total_margin(pos)
                     cum_notional = cum_margin * pos.leverage
                     fees_paid_est = cum_notional * fee_taker * CONFIG.LIQ_FEE_BUFFER
-                    liq = approx_liq_price_cross(avg=pos.avg, side=pos.side, qty=pos.qty, equity=bank, mmr=CONFIG.MAINT_MMR, fees_paid=fees_paid_est)
-                    dist_to_liq_pct = liq_distance_pct(pos.side, px, liq)
-                    dist_txt = "N/A" if np.isnan(dist_to_liq_pct) else f"{dist_to_liq_pct:.2f}%"
-                    liq_arrow = "↓" if pos.side == "LONG" else "↑"
 
+                    ml_price = ml_price_at(pos, CONFIG.ML_TARGET_PCT, bank, fees_paid_est)
+                    dist_ml_pct = ml_distance_pct(pos.side, px, ml_price)
+                    dist_txt = "N/A" if np.isnan(dist_ml_pct) else f"{dist_ml_pct:.2f}%"
+                    ml_arrow = "↓" if pos.side == "LONG" else "↑"
+                    
                     nxt2_txt = "N/A" if nxt2 is None else f"{fmt(nxt2['price'])} ({nxt2['label']})"
                     
                     if is_open_event:
@@ -1130,11 +1162,11 @@ async def scanner_main_loop(
                         f"Цена: <code>{fmt(px)}</code> | <b>{lots:.2f} lot</b>\n"
                         f"Добор: <b>{margin:.2f} USD</b> | Депозит (тек): <b>{cum_margin:.2f} USD</b>\n"
                         f"Средняя: <code>{fmt(pos.avg)}</code> | TP: <code>{fmt(pos.tp_price)}</code>\n"
-                        f"Ликвидация (est): {liq_arrow}<code>{fmt(liq) or 'N/A'}</code> ({dist_txt})\n"
+                        f"ML цена (20%): {ml_arrow}<code>{fmt(ml_price) or 'N/A'}</code> ({dist_txt})\n"
                         f"{brk_line}\n"
                         f"След. усреднение: <code>{nxt2_txt}</code>\n"
                         f"Плановый добор: <b>{nxt2_dep_txt}</b> (осталось: {remaining} из {total_ord})\n"
-                        f"{margin_line(pos, bank)}"
+                        f"{margin_line(pos, bank, px, fees_paid_est)}"
                     )
                     await log_event_safely({
                         "Event_ID": f"{'OPEN' if is_open_event else 'ADD'}_{pos.signal_id}_{pos.steps_filled}", "Signal_ID": pos.signal_id,
@@ -1143,7 +1175,7 @@ async def scanner_main_loop(
                         "Step_No": pos.steps_filled, "Step_Margin_USDT": margin,
                         "Cum_Margin_USDT": cum_margin, "Entry_Price": px, "Avg_Price": pos.avg,
                         "TP_Price": pos.tp_price, "SL_Price": pos.sl_price or "",
-                        "Liq_Est_Price": liq, "Next_DCA_Price": (nxt2 and nxt2["price"]) or "",
+                        "Liq_Est_Price": ml_price, "Next_DCA_Price": (nxt2 and nxt2["price"]) or "",
                         "Next_DCA_Label": (nxt2 and nxt2["label"]) or "",
                         "Triggered_Label": curr_label,
                         "Fee_Rate_Maker": fee_maker, "Fee_Rate_Taker": fee_taker,
