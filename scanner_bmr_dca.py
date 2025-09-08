@@ -168,6 +168,8 @@ class CONFIG:
     # ФА-политика
     FA_REFRESH_SEC = 300  # перечитывать раз в 5 минут
 
+    ORDINARY_ADDS = 5  # столько обычных доборов после входа
+
     # Анти-слипание ценовых уровней
     DCA_MIN_GAP_TICKS = 2       # минимум 2 тика между целями
 
@@ -461,9 +463,10 @@ def _place_segment(start: float, end: float, count: int, tick: float, include_en
     if count <= 0:
         return []
     path = end - start
-    if abs(path) < tick * CONFIG.DCA_MIN_GAP_TICKS:
+    min_gap = tick * CONFIG.DCA_MIN_GAP_TICKS
+    if abs(path) < min_gap:
         return []
-    
+
     if include_end_last and count >= 1:
         # фракции: 1/n, 2/n, ..., 1.0  (нет 0.0)
         fracs = [(i + 1) / count for i in range(count)]
@@ -473,11 +476,13 @@ def _place_segment(start: float, end: float, count: int, tick: float, include_en
         
     raw = [start + path * f for f in fracs]
     # Квантование и анти-слипание
-    min_gap = tick * CONFIG.DCA_MIN_GAP_TICKS
     out: list[float] = []
     for x in raw:
         q = quantize_to_tick(x, tick)
         if q is None:
+            continue
+        # гарантируем отступ минимум в min_gap от точки start
+        if abs(q - start) < min_gap:
             continue
         if not out or (abs(q - out[-1]) >= min_gap):
             out.append(q)
@@ -485,22 +490,23 @@ def _place_segment(start: float, end: float, count: int, tick: float, include_en
 
 def compute_corridor_targets(entry: float, side: str, rng_strat: dict, rng_tac: dict, tick: float) -> list[dict]:
     """
-    2 точки в сторону TAC-границы (без включения самой границы),
-    3 точки между TAC- и STRAT-границами (последняя может совпасть со STRAT-границей).
-    Если «места мало» — количество автоматически сокращается.
+    Строим цели только в сторону ухудшения:
+      LONG  -> вниз от entry,
+      SHORT -> вверх от entry.
+    TAC-сегмент (2 точки, без самой TAC), затем STRAT-сегмент (3 точки, последняя может совпасть со STRAT).
+    Если места мало — количество автоматически сокращается.
     """
     if side == "LONG":
-        tac_b  = rng_tac["lower"]
-        strat_b = rng_strat["lower"]
-        seg1 = _place_segment(entry, tac_b, 2, tick, include_end_last=False)
+        tac_b   = min(entry, rng_tac["lower"])
+        strat_b = min(entry, rng_strat["lower"])
+        seg1 = _place_segment(entry, tac_b,   2, tick, include_end_last=False)
         seg2 = _place_segment(tac_b, strat_b, 3, tick, include_end_last=True)
-    else:
-        tac_b  = rng_tac["upper"]
-        strat_b = rng_strat["upper"]
-        seg1 = _place_segment(entry, tac_b, 2, tick, include_end_last=False)
+    else:  # SHORT
+        tac_b   = max(entry, rng_tac["upper"])
+        strat_b = max(entry, rng_strat["upper"])
+        seg1 = _place_segment(entry, tac_b,   2, tick, include_end_last=False)
         seg2 = _place_segment(tac_b, strat_b, 3, tick, include_end_last=True)
 
-    # Метки
     def _labels(prefix: str, n: int, include_end: bool) -> list[str]:
         if n <= 0: return []
         if include_end and n >= 1:
@@ -509,29 +515,21 @@ def compute_corridor_targets(entry: float, side: str, rng_strat: dict, rng_tac: 
             fr = [(i + 1) / (n + 1) for i in range(n)]  # 33..66% для сегмента entry→TAC
         return [f"{prefix} {int(round(f * 100))}%" for f in fr]
 
-    out: list[dict] = []
+    targets: list[dict] = []
     for p, lab in zip(seg1, _labels("TAC", len(seg1), include_end=False)):
-        out.append({"price": p, "label": lab})
+        targets.append({"price": p, "label": lab})
     for p, lab in zip(seg2, _labels("STRAT", len(seg2), include_end=True)):
-        out.append({"price": p, "label": lab})
+        targets.append({"price": p, "label": lab})
 
-    # Упорядочить по стороне и удалить возможные дубликаты
-    out = merge_targets_sorted(side, tick, out)
-    return out
+    # Дедуп по тику, ПОРЯДОК СОХРАНЯЕМ (ближайшая к entry идёт первой)
+    return merge_targets_sorted(side, tick, entry, targets)
 
-def merge_targets_sorted(side: str, tick: float, targets: list[dict]) -> list[dict]:
-    if side == "SHORT":
-        targets = sorted(targets, key=lambda t: t["price"])
-    else:
-        targets = sorted(targets, key=lambda t: t["price"], reverse=True)
+def merge_targets_sorted(side: str, tick: float, entry: float, targets: list[dict]) -> list[dict]:
     dedup = []
     min_gap = tick * CONFIG.DCA_MIN_GAP_TICKS
     for t in targets:
-        if not dedup: dedup.append(t)
-        else:
-            if (side=="SHORT" and t["price"] >= dedup[-1]["price"] + min_gap) or \
-               (side=="LONG"  and t["price"] <= dedup[-1]["price"] - min_gap):
-                dedup.append(t)
+        if not dedup or abs(t["price"] - dedup[-1]["price"]) >= min_gap:
+            dedup.append(t)
     return dedup
 
 def next_pct_target(pos):
@@ -1022,12 +1020,11 @@ async def scanner_main_loop(
                 if side_cand:
                     pos = Position(side_cand, signal_id=f"{symbol.replace('/','')} {int(now)}", leverage=CONFIG.LEVERAGE, owner_key=b["owner_key"])
                     
-                    ord_levels = max(1, min(5, CONFIG.DCA_LEVELS - 1)) # Default
+                    ord_levels = min(CONFIG.DCA_LEVELS - 1, 1 + CONFIG.ORDINARY_ADDS)
                     if manual and manual.get("max_steps") is not None:
                         try:
-                            # Handle both string and number inputs safely
                             steps_val = int(float(manual["max_steps"]))
-                            ord_levels = max(1, min(CONFIG.DCA_LEVELS - 1, steps_val))
+                            ord_levels = min(CONFIG.DCA_LEVELS - 1, 1 + steps_val)
                         except (ValueError, TypeError):
                             log.warning(f"Could not parse manual max_steps: {manual['max_steps']}. Using default.")
                     
@@ -1126,7 +1123,8 @@ async def scanner_main_loop(
                 nxt = next_pct_target(pos)
                 is_open_event = b.get("fsm_state") == int(FSM.OPENED) and pos.steps_filled == 1
                 is_add_event = b.get("fsm_state") == int(FSM.MANAGING) and (nxt is not None) and (
-                    (pos.side == "LONG" and px <= nxt["price"]) or (pos.side == "SHORT" and px >= nxt["price"]) )
+                    (pos.side == "LONG" and px <= nxt["price"] - tick) or 
+                    (pos.side == "SHORT" and px >= nxt["price"] + tick) )
 
                 now_ts = time.time()
                 allowed_now = is_open_event or (pos.last_add_ts is None) or ((now_ts - pos.last_add_ts) >= CONFIG.ADD_COOLDOWN_SEC)
@@ -1141,7 +1139,7 @@ async def scanner_main_loop(
                     used_ord_after = pos.steps_filled - (1 if pos.reserve_used else 0)
                     used_dca = max(0, used_ord_after - 1)
                     nxt2 = next_pct_target(pos)
-                    total_ord = max(0, min(pos.ord_levels, len(pos.ordinary_targets)))
+                    total_ord = max(0, min(pos.ord_levels - 1, len(pos.ordinary_targets)))
                     remaining = max(0, total_ord - used_dca)
                     next_idx = used_ord_after
                     nxt2_margin = pos.step_margins[next_idx] if next_idx < len(pos.step_margins) else None
@@ -1162,10 +1160,9 @@ async def scanner_main_loop(
                     if is_open_event:
                         header_tag = dir_tag
                     else:
-                        idx = max(0, min(len(pos.ordinary_targets)-1, used_ord_after - 1))
-                        curr_label = (pos.ordinary_targets[idx]["label"] if 0 <= idx < len(pos.ordinary_targets) else "")
-                        header_tag = curr_label
-
+                    # Показать лейбл уровня, который СЕЙЧАС сработал
+                        header_tag = (nxt and nxt["label"]) or ""
+                    
                     nxt2_dep_txt = "N/A"
                     if nxt2_margin and nxt2:
                         nxt_lots = margin_to_lots(symbol, nxt2_margin, price=nxt2['price'], leverage=pos.leverage)
