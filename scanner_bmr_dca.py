@@ -23,6 +23,7 @@ from fx_feed import fetch_ohlcv as fetch_ohlcv_yf
 import trade_executor
 
 log = logging.getLogger("bmr_dca_engine")
+logging.getLogger("fx_feed").setLevel(logging.WARNING)
 
 # === Мини-TA без внешних зависимостей (EMA/ATR/RSI/ADX/Supertrend) ===
 def _ema(s: pd.Series, length: int) -> pd.Series:
@@ -462,7 +463,7 @@ def _place_segment(start: float, end: float, count: int, tick: float, include_en
     path = end - start
     if abs(path) < tick * CONFIG.DCA_MIN_GAP_TICKS:
         return []
-    # Если нужно исключить начало и включить конец:
+    
     if include_end_last and count >= 1:
         # фракции: 1/n, 2/n, ..., 1.0  (нет 0.0)
         fracs = [(i + 1) / count for i in range(count)]
@@ -528,8 +529,8 @@ def merge_targets_sorted(side: str, tick: float, targets: list[dict]) -> list[di
     for t in targets:
         if not dedup: dedup.append(t)
         else:
-            if (side=="SHORT" and t["price"] > dedup[-1]["price"] + min_gap) or \
-               (side=="LONG"  and t["price"] < dedup[-1]["price"] - min_gap):
+            if (side=="SHORT" and t["price"] >= dedup[-1]["price"] + min_gap) or \
+               (side=="LONG"  and t["price"] <= dedup[-1]["price"] - min_gap):
                 dedup.append(t)
     return dedup
 
@@ -690,6 +691,7 @@ class Position:
 
     def add_step(self, price: float):
         used_ord_count = self.steps_filled - (1 if self.reserve_used else 0)
+        used_ord_count = min(used_ord_count, max(0, len(self.step_margins) - 1))
         margin = self.step_margins[used_ord_count]
         notional = margin * self.leverage
         new_qty = notional / max(price, 1e-9)
@@ -817,6 +819,12 @@ async def scanner_main_loop(
 
     # Локальный хэлпер на рассылку
     async def say(txt: str):
+        now_ts = time.time()
+        # не дублируем точь-в-точь одинаковое сообщение чаще, чем раз в 20с
+        if txt == b.get("last_msg_text") and (now_ts - b.get("last_msg_ts", 0.0) < 20):
+            return
+        b["last_msg_text"] = txt
+        b["last_msg_ts"] = now_ts
         await broadcast(app, txt, target_chat_id=target_chat_id)
 
     # ФА-политика
@@ -1014,7 +1022,15 @@ async def scanner_main_loop(
                 if side_cand:
                     pos = Position(side_cand, signal_id=f"{symbol.replace('/','')} {int(now)}", leverage=CONFIG.LEVERAGE, owner_key=b["owner_key"])
                     
-                    ord_levels  = max(1, min(CONFIG.DCA_LEVELS - 1, int(manual["max_steps"]))) if (manual and manual.get("max_steps") is not None) else max(1, min(5, CONFIG.DCA_LEVELS - 1))
+                    ord_levels = max(1, min(5, CONFIG.DCA_LEVELS - 1)) # Default
+                    if manual and manual.get("max_steps") is not None:
+                        try:
+                            # Handle both string and number inputs safely
+                            steps_val = int(float(manual["max_steps"]))
+                            ord_levels = max(1, min(CONFIG.DCA_LEVELS - 1, steps_val))
+                        except (ValueError, TypeError):
+                            log.warning(f"Could not parse manual max_steps: {manual['max_steps']}. Using default.")
+                    
                     growth = choose_growth(ind, rng_strat, rng_tac)
 
                     # Amber → консервативнее: меньше уровней и рост ближе к A
@@ -1123,9 +1139,10 @@ async def scanner_main_loop(
                         margin = pos.step_margins[0]
 
                     used_ord_after = pos.steps_filled - (1 if pos.reserve_used else 0)
+                    used_dca = max(0, used_ord_after - 1)
                     nxt2 = next_pct_target(pos)
                     total_ord = max(0, min(pos.ord_levels, len(pos.ordinary_targets)))
-                    remaining = max(0, total_ord - used_ord_after)
+                    remaining = max(0, total_ord - used_dca)
                     next_idx = used_ord_after
                     nxt2_margin = pos.step_margins[next_idx] if next_idx < len(pos.step_margins) else None
                     
@@ -1141,11 +1158,13 @@ async def scanner_main_loop(
                     
                     nxt2_txt = "N/A" if nxt2 is None else f"{fmt(nxt2['price'])} ({nxt2['label']})"
                     
+                    dir_tag = "LONG 🟢" if pos.side == "LONG" else "SHORT 🛑"
                     if is_open_event:
-                        curr_label = "OPEN"
+                        header_tag = dir_tag
                     else:
                         idx = max(0, min(len(pos.ordinary_targets)-1, used_ord_after - 1))
                         curr_label = (pos.ordinary_targets[idx]["label"] if 0 <= idx < len(pos.ordinary_targets) else "")
+                        header_tag = curr_label
 
                     nxt2_dep_txt = "N/A"
                     if nxt2_margin and nxt2:
@@ -1156,9 +1175,9 @@ async def scanner_main_loop(
                     brk_up_pct, brk_dn_pct = break_distance_pcts(px, brk_up, brk_dn)
                     brk_line = f"Пробой: ↑<code>{fmt(brk_up)}</code> ({brk_up_pct:.2f}%) | ↓<code>{fmt(brk_dn)}</code> ({brk_dn_pct:.2f}%)"
 
-                    event_type_str = "▶️ OPEN" if is_open_event else f"➕ Усреднение #{used_ord_after}"
+                    event_type_str = "▶️ OPEN" if is_open_event else f"➕ Усреднение #{used_dca}"
                     await say(
-                        f"{event_type_str} [{curr_label}]\n"
+                        f"{event_type_str} [{header_tag}]\n"
                         f"Цена: <code>{fmt(px)}</code> | <b>{lots:.2f} lot</b>\n"
                         f"Добор: <b>{margin:.2f} USD</b> | Депозит (тек): <b>{cum_margin:.2f} USD</b>\n"
                         f"Средняя: <code>{fmt(pos.avg)}</code> | TP: <code>{fmt(pos.tp_price)}</code>\n"
@@ -1177,7 +1196,7 @@ async def scanner_main_loop(
                         "TP_Price": pos.tp_price, "SL_Price": pos.sl_price or "",
                         "Liq_Est_Price": ml_price, "Next_DCA_Price": (nxt2 and nxt2["price"]) or "",
                         "Next_DCA_Label": (nxt2 and nxt2["label"]) or "",
-                        "Triggered_Label": curr_label,
+                        "Triggered_Label": header_tag if not is_open_event else "OPEN",
                         "Fee_Rate_Maker": fee_maker, "Fee_Rate_Taker": fee_taker,
                         "Fee_Est_USDT": (cum_notional * fee_taker), "ATR_5m": ind["atr5m"], "ATR_1h": rng_strat["atr1h"],
                         "RSI_5m": ind["rsi"], "ADX_5m": ind["adx"], "Supertrend": ind["supertrend"], "Vol_z": ind["vol_z"],
