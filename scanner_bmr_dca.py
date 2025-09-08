@@ -216,6 +216,13 @@ BMR_HEADERS_FALLBACK = [
     "Triggered_Label","Chat_ID","Owner_Key","FA_Risk","FA_Bias"
 ]
 
+PAIR_KEY = {
+    "USDJPY": "JPY",
+    "AUDUSD": "AUD",
+    "EURUSD": "EUR",
+    "GBPUSD": "GBP",
+}
+
 def _get_master_headers(sh) -> list[str]:
     try:
         ws = sh.worksheet("BMR_DCA_Log")
@@ -265,12 +272,7 @@ def _ensure_ws(sh, name: str, headers: list[str]):
     return ws
 
 async def log_event_safely(payload: dict):
-    # 1) пишем через trade_executor в общий лог (как раньше)
-    try:
-        await maybe_await(trade_executor.bmr_log_event, _clean_payload(payload))
-    except Exception:
-        log.exception("[SHEETS] bmr_log_event failed")
-    # 2) дублируем в лист по символу
+    # Пишем только в лист по символу
     try:
         creds_json = os.environ.get("GOOGLE_CREDENTIALS")
         sheet_key  = os.environ.get("SHEET_ID")
@@ -288,7 +290,7 @@ async def log_event_safely(payload: dict):
     except Exception:
         log.exception("[SHEETS] per-symbol log failed")
 
-# ---- FA POLICY ----
+# ---- FA POLICY & WEIGHTS ----
 
 def read_fa_policy(symbol: str) -> dict:
     """Читает политику из листа FA_Signals: pair, risk(Green/Amber/Red), bias(neutral/long-only/short-only),
@@ -332,6 +334,32 @@ def read_fa_policy(symbol: str) -> dict:
     except Exception:
         log.exception("read_fa_policy failed")
         return {}
+
+def read_fund_bot_weights(sh) -> dict:
+    try:
+        ws = sh.worksheet("FUND_BOT")
+        rows = ws.get_all_values()
+        if not rows:
+            return {}
+        # ищем последнюю непустую строку
+        for row in reversed(rows):
+            if len(row) >= 5 and row[4].strip():
+                try:
+                    return json.loads(row[4])
+                except Exception:
+                    log.warning(f"Could not parse weights_json: {row[4]}")
+                    return {}
+        return {}
+    except gspread.WorksheetNotFound:
+        log.warning("FUND_BOT sheet not found. Using default weights.")
+        return {}
+    except Exception:
+        log.exception("read_fund_bot_weights failed")
+        return {}
+
+def target_weight_for_pair(pair: str, weights: dict, default: int = 25) -> int:
+    k = PAIR_KEY.get(pair)
+    return int(weights.get(k, default)) if k else default
 
 # ---------------------------------------------------------------------------
 # Formatting & maths
@@ -784,13 +812,13 @@ async def scanner_main_loop(
     b["chat_id"]   = target_chat_id
 
     # Google Sheets (необязательно)
+    sheet = None
     try:
         creds_json = os.environ.get("GOOGLE_CREDENTIALS")
         sheet_key  = os.environ.get("SHEET_ID")
         if creds_json and sheet_key:
             gc = gspread.service_account_from_dict(json.loads(creds_json))
             sheet = gc.open_by_key(sheet_key)
-            await maybe_await(trade_executor.ensure_bmr_log_sheet, sheet, title="BMR_DCA_Log")
     except Exception as e:
         log.error(f"Sheets init error: {e}", exc_info=True)
 
@@ -804,16 +832,12 @@ async def scanner_main_loop(
     log.info(f"Successfully initialized for Forex symbol {symbol} with tick size {tick}")
 
     # Подготовим листы для символа (если есть доступ)
-    try:
-        creds_json = os.environ.get("GOOGLE_CREDENTIALS")
-        sheet_key  = os.environ.get("SHEET_ID")
-        if creds_json and sheet_key:
-            gc = gspread.service_account_from_dict(json.loads(creds_json))
-            sh = gc.open_by_key(sheet_key)
-            headers = _get_master_headers(sh)
-            _ensure_ws(sh, f"BMR_DCA_{symbol}", headers)
-    except Exception:
-        log.exception("ensure symbol sheet failed")
+    if sheet:
+        try:
+            headers = _get_master_headers(sheet)
+            _ensure_ws(sheet, f"BMR_DCA_{symbol}", headers)
+        except Exception:
+            log.exception("ensure symbol sheet failed")
 
     # Локальный хэлпер на рассылку
     async def say(txt: str):
@@ -827,6 +851,7 @@ async def scanner_main_loop(
 
     # ФА-политика
     fa = read_fa_policy(symbol)
+    fund_weights = read_fund_bot_weights(sheet) if sheet else {}
     last_fa_read = 0.0
 
     rng_strat, rng_tac = None, None
@@ -845,6 +870,8 @@ async def scanner_main_loop(
             # периодически перечитываем ФА
             if now - last_fa_read > CONFIG.FA_REFRESH_SEC:
                 fa = read_fa_policy(symbol)
+                if sheet:
+                    fund_weights = read_fund_bot_weights(sheet)
                 last_fa_read = now
 
                 # тихое окно от фунд-бота
@@ -859,7 +886,8 @@ async def scanner_main_loop(
             b["fa_bias"] = fa_bias # hook
             
             # масштаб доборов/резерв
-            dca_scale = max(0.0, min(1.0, float(fa.get("dca_scale") or 1.0)))
+            weight = target_weight_for_pair(symbol, fund_weights)
+            dca_scale = weight / 100.0
             reserve_off = bool(fa.get("reserve_off"))
 
             need_build_strat = (rng_strat is None) or ((now - last_build_strat > CONFIG.REBUILD_RANGE_EVERY_MIN*60) and (b.get("position") is None))
@@ -904,7 +932,7 @@ async def scanner_main_loop(
                     pos.reserve_margin_usdt = 0.0
                     pos.max_steps = max(pos.steps_filled, pos.ord_levels)
 
-                new_alloc_bank = bank * float(fa.get("dca_scale") or 1.0)
+                new_alloc_bank = bank * dca_scale
                 if new_alloc_bank > 0 and pos.steps_filled < pos.ord_levels:
                     if pos.alloc_bank_planned <= 0 or abs(new_alloc_bank - pos.alloc_bank_planned) / max(pos.alloc_bank_planned, 1e-9) > 0.05:
                         pos.rebalance_tail_margins_excluding_reserve(new_alloc_bank)
@@ -1021,7 +1049,6 @@ async def scanner_main_loop(
                     pos = Position(side_cand, signal_id=f"{symbol.replace('/','')} {int(now)}",
                                    leverage=CONFIG.LEVERAGE, owner_key=b["owner_key"])
 
-                    # уровни/рост как раньше
                     ord_levels = min(CONFIG.DCA_LEVELS - 1, 1 + CONFIG.ORDINARY_ADDS)
                     if manual and manual.get("max_steps") is not None:
                         try:
