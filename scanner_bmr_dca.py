@@ -1010,7 +1010,7 @@ async def scanner_main_loop(
                     pos_in = max(0.0, min(1.0, (px - rng_tac["lower"]) / max(rng_tac["width"], 1e-9)))
                     side_cand = "LONG" if pos_in <= 0.30 else ("SHORT" if pos_in >= 0.70 else None)
 
-                # Учитываем FA bias
+                # FA bias
                 if side_cand:
                     if fa_bias == "long-only" and side_cand != "LONG":
                         side_cand = None
@@ -1018,8 +1018,10 @@ async def scanner_main_loop(
                         side_cand = None
 
                 if side_cand:
-                    pos = Position(side_cand, signal_id=f"{symbol.replace('/','')} {int(now)}", leverage=CONFIG.LEVERAGE, owner_key=b["owner_key"])
-                    
+                    pos = Position(side_cand, signal_id=f"{symbol.replace('/','')} {int(now)}",
+                                   leverage=CONFIG.LEVERAGE, owner_key=b["owner_key"])
+
+                    # уровни/рост как раньше
                     ord_levels = min(CONFIG.DCA_LEVELS - 1, 1 + CONFIG.ORDINARY_ADDS)
                     if manual and manual.get("max_steps") is not None:
                         try:
@@ -1027,10 +1029,7 @@ async def scanner_main_loop(
                             ord_levels = min(CONFIG.DCA_LEVELS - 1, 1 + steps_val)
                         except (ValueError, TypeError):
                             log.warning(f"Could not parse manual max_steps: {manual['max_steps']}. Using default.")
-                    
                     growth = choose_growth(ind, rng_strat, rng_tac)
-
-                    # Amber → консервативнее: меньше уровней и рост ближе к A
                     if fa_risk == "Amber":
                         ord_levels = max(1, ord_levels - 1)
                         growth = min(growth, CONFIG.AUTO_ALLOC["growth_A"])
@@ -1042,9 +1041,95 @@ async def scanner_main_loop(
                         pos.reserve_available = False
                         pos.reserve_margin_usdt = 0.0
                         pos.max_steps = pos.ord_levels
-                    
-                    pos.ordinary_targets = compute_corridor_targets(entry=px, side=pos.side, rng_strat=rng_strat, rng_tac=rng_tac, tick=tick)
 
+                    # --- BOOST-логика при входе снаружи STRAT ---
+                    breakout_short = (pos.side == "SHORT" and px >= rng_strat["upper"])
+                    breakout_long  = (pos.side == "LONG"  and px <= rng_strat["lower"])
+                    if breakout_short or breakout_long:
+                        # 1) Гарантируем, что останется один обычный добор до STRAT 100%
+                        BOOST_MIN_ORD_LEVELS = 6  # OPEN+4 до STRAT-67% и ещё 1 до STRAT-100%
+                        if pos.ord_levels < BOOST_MIN_ORD_LEVELS:
+                            pos.plan_with_reserve(alloc_bank, growth, BOOST_MIN_ORD_LEVELS)
+                            # если резерв выключен политикой — повторно обнулим
+                            if reserve_off:
+                                pos.reserve_available = False
+                                pos.reserve_margin_usdt = 0.0
+                                pos.max_steps = pos.ord_levels
+
+                        # 2) Синтетические STRAT-цели в сторону ухудшения
+                        t = b.get("price_tick", tick)
+                        w_base = (rng_strat["upper"] - rng_tac["upper"]) if pos.side == "SHORT" else (rng_tac["lower"] - rng_strat["lower"])
+                        w = max(t * CONFIG.DCA_MIN_GAP_TICKS * 4, abs(w_base))
+                        end = px + w if pos.side == "SHORT" else px - w
+                        seg = _place_segment(px, end, 3, t, include_end_last=True)
+                        if not seg:
+                            seg = [end]  # fallback на край диапазона
+
+                        full_targets = [
+                            {"price": px,    "label": "TAC 33%"},
+                            {"price": px,    "label": "TAC 67%"},
+                            {"price": px,    "label": "STRAT 33%"},
+                            {"price": px,    "label": "STRAT 67%"},
+                            {"price": seg[-1],"label": "STRAT 100%"},
+                        ]
+                        pos.ordinary_targets = full_targets[:min(len(full_targets), max(1, pos.ord_levels - 1))]
+
+                        # 3) Мгновенно «заливаем» до STRAT-2: OPEN + ещё 4 шага (если доступны)
+                        target_used_steps = min(5, pos.ord_levels)
+                        cum_margin_added = 0.0
+                        for _ in range(target_used_steps):
+                            m, _ = pos.add_step(px)
+                            cum_margin_added += m
+
+                        pos.rebalance_tail_margins_excluding_reserve(alloc_bank)
+                        b["position"] = pos
+                        b["fsm_state"] = int(FSM.MANAGING)
+
+                        # сообщение о «ускоренном» открытии
+                        used_ord_after = pos.steps_filled - (1 if pos.reserve_used else 0)
+                        nxt = next_pct_target(pos)  # это будет STRAT 100%
+                        nxt_txt = "N/A" if not nxt else f"{fmt(nxt['price'])} ({nxt['label']})"
+                        # оценки комиссий/ML
+                        cum_margin = _pos_total_margin(pos)
+                        cum_notional = cum_margin * pos.leverage
+                        fees_paid_est = cum_notional * fee_taker * CONFIG.LIQ_FEE_BUFFER
+                        ml_price = ml_price_at(pos, CONFIG.ML_TARGET_PCT, bank, fees_paid_est)
+                        dist_ml_pct = ml_distance_pct(pos.side, px, ml_price)
+                        dist_txt = "N/A" if np.isnan(dist_ml_pct) else f"{dist_ml_pct:.2f}%"
+                        ml_arrow = "↓" if pos.side == "LONG" else "↑"
+                        lots_open = margin_to_lots(symbol, cum_margin_added, price=px, leverage=pos.leverage)
+
+                        brk_up, brk_dn = break_levels(rng_strat)
+                        brk_up_pct, brk_dn_pct = break_distance_pcts(px, brk_up, brk_dn)
+                        brk_line = f"Пробой: ↑<code>{fmt(brk_up)}</code> ({brk_up_pct:.2f}%) | ↓<code>{fmt(brk_dn)}</code> ({brk_dn_pct:.2f}%)"
+
+                        await say(
+                            f"▶️ OPEN [BOOST → STRAT 67%]\n"
+                            f"Цена: <code>{fmt(px)}</code> | <b>{lots_open:.2f} lot</b>\n"
+                            f"Депозит (тек): <b>{cum_margin:.2f} USD</b> (шагов: {used_ord_after} из {pos.ord_levels})\n"
+                            f"Средняя: <code>{fmt(pos.avg)}</code> | TP: <code>{fmt(pos.tp_price)}</code>\n"
+                            f"ML цена (20%): {ml_arrow}<code>{fmt(ml_price) or 'N/A'}</code> ({dist_txt})\n"
+                            f"{brk_line}\n"
+                            f"След. усреднение: <code>{nxt_txt}</code>\n"
+                            f"{margin_line(pos, bank, px, fees_paid_est)}"
+                        )
+                        await log_event_safely({
+                            "Event_ID": f"OPEN_BOOST_{pos.signal_id}_{pos.steps_filled}",
+                            "Signal_ID": pos.signal_id, "Timestamp_UTC": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+                            "Pair": symbol, "Side": pos.side, "Event": "OPEN_BOOST",
+                            "Step_No": pos.steps_filled, "Cum_Margin_USDT": cum_margin, "Entry_Price": px, "Avg_Price": pos.avg,
+                            "Liq_Est_Price": ml_price, "Next_DCA_Price": (nxt and nxt['price']) or "", "Next_DCA_Label": (nxt and nxt['label']) or "",
+                            "Triggered_Label": "BOOST→STRAT 67%", "Fee_Rate_Taker": fee_taker, "ATR_5m": ind["atr5m"], "ATR_1h": rng_strat["atr1h"],
+                            "RSI_5m": ind["rsi"], "ADX_5m": ind["adx"], "Supertrend": ind["supertrend"], "Vol_z": ind["vol_z"],
+                            "Range_Lower": rng_strat["lower"], "Range_Upper": rng_strat["upper"], "Range_Width": rng_strat["width"],
+                            "Chat_ID": b.get("chat_id") or "", "Owner_Key": b.get("owner_key") or "",
+                            "FA_Risk": b.get("fa_risk") or "", "FA_Bias": b.get("fa_bias") or "",
+                        })
+                        continue  # не проходить стандартный OPEN-блок
+
+                    # --- обычный сценарий открытия внутри диапазонов ---
+                    pos.ordinary_targets = compute_corridor_targets(entry=px, side=pos.side,
+                                                                    rng_strat=rng_strat, rng_tac=rng_tac, tick=tick)
                     margin, _ = pos.add_step(px)
                     pos.rebalance_tail_margins_excluding_reserve(alloc_bank)
                     b["position"] = pos
@@ -1160,9 +1245,8 @@ async def scanner_main_loop(
                     if is_open_event:
                         header_tag = dir_tag
                     else:
-                    # Показать лейбл уровня, который СЕЙЧАС сработал
                         header_tag = (nxt and nxt["label"]) or ""
-                    
+
                     nxt2_dep_txt = "N/A"
                     if nxt2_margin and nxt2:
                         nxt_lots = margin_to_lots(symbol, nxt2_margin, price=nxt2['price'], leverage=pos.leverage)
