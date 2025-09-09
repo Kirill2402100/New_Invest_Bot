@@ -6,7 +6,7 @@
 
 from __future__ import annotations
 
-import asyncio, time, logging, json, os, inspect, numbers
+import asyncio, time, logging, json, os, inspect, numbers, ast
 from typing import Optional
 from datetime import datetime, timezone
 from enum import IntEnum
@@ -15,6 +15,7 @@ import numpy as np
 import pandas as pd
 from telegram.ext import Application
 import gspread
+from gspread.utils import rowcol_to_a1
 
 # === Forex адаптеры и фид ===
 from fx_mt5_adapter import FX, margin_to_lots, default_tick
@@ -224,12 +225,8 @@ PAIR_KEY = {
 }
 
 def _get_master_headers(sh) -> list[str]:
-    try:
-        ws = sh.worksheet("BMR_DCA_Log")
-        row1 = ws.row_values(1)
-        return row1 if row1 else BMR_HEADERS_FALLBACK
-    except Exception:
-        return BMR_HEADERS_FALLBACK
+    # Всегда фиксированный, чистый порядок колонок
+    return BMR_HEADERS_FALLBACK
 
 def _clean(v):
     if v is None: return ""
@@ -265,11 +262,18 @@ def _norm_symbol(x) -> str:
 def _ensure_ws(sh, name: str, headers: list[str]):
     try:
         ws = sh.worksheet(name)
+        # если шапка на листе не совпадает по длине/порядку — перепишем строку 1
+        existing = ws.row_values(1)
+        if existing != headers:
+            rng = f"A1:{rowcol_to_a1(1, len(headers))}"
+            ws.update(rng, [headers])
+        return ws
     except gspread.WorksheetNotFound:
         ws = sh.add_worksheet(title=name, rows=2000, cols=max(20, len(headers)))
         if headers:
-            ws.append_row(headers)
-    return ws
+            rng = f"A1:{rowcol_to_a1(1, len(headers))}"
+            ws.update(rng, [headers])
+        return ws
 
 async def log_event_safely(payload: dict):
     # Пишем только в лист по символу
@@ -286,7 +290,7 @@ async def log_event_safely(payload: dict):
         headers = _get_master_headers(sh)
         ws2 = _ensure_ws(sh, f"BMR_DCA_{sym}", headers)
         row = [_clean(payload.get(k)) for k in headers]
-        ws2.append_row(row)
+        ws2.append_row(row, value_input_option="USER_ENTERED")
     except Exception:
         log.exception("[SHEETS] per-symbol log failed")
 
@@ -344,11 +348,15 @@ def read_fund_bot_weights(sh) -> dict:
         # ищем последнюю непустую строку
         for row in reversed(rows):
             if len(row) >= 5 and row[4].strip():
+                cell = row[4].strip()
                 try:
-                    return json.loads(row[4])
+                    return json.loads(cell)
                 except Exception:
-                    log.warning(f"Could not parse weights_json: {row[4]}")
-                    return {}
+                    try:
+                        return ast.literal_eval(cell)
+                    except Exception:
+                        log.warning(f"Bad weights_json: {cell}")
+                        return {}
         return {}
     except gspread.WorksheetNotFound:
         log.warning("FUND_BOT sheet not found. Using default weights.")
@@ -406,15 +414,21 @@ def _pos_total_margin(pos):
     return ord_used + res
 
 def compute_net_pnl(pos, exit_p: float, fee_entry: float, fee_exit: float) -> tuple[float, float]:
-    sum_margin = _pos_total_margin(pos) or 1e-9
-    raw_pnl = (exit_p / pos.avg - 1.0) * (1 if pos.side == "LONG" else -1)
-    gross_usd = sum_margin * (raw_pnl * pos.leverage)
-    entry_notional = sum_margin * pos.leverage
+    used = _pos_total_margin(pos) or 1e-9
+    L = max(1, int(getattr(pos, "leverage", 1) or 1))
+
+    if pos.side == "LONG":
+        gross_usd = used * L * (exit_p / pos.avg - 1.0)
+    else:
+        gross_usd = used * L * (pos.avg / max(exit_p, 1e-12) - 1.0)
+
+    entry_notional = used * L
     exit_notional  = exit_p * pos.qty
-    fee_entry_usd = entry_notional * fee_entry
-    fee_exit_usd  = exit_notional  * fee_exit
+    fee_entry_usd  = entry_notional * fee_entry
+    fee_exit_usd   = exit_notional  * fee_exit
+
     net_usd = gross_usd - fee_entry_usd - fee_exit_usd
-    net_pct = (net_usd / sum_margin) * 100.0
+    net_pct = (net_usd / used) * 100.0
     return net_usd, net_pct
 
 def _pnl_at_price(pos, price: float, used_margin: float) -> float:
@@ -717,7 +731,8 @@ class Position:
 
     def add_step(self, price: float):
         used_ord_count = self.steps_filled - (1 if self.reserve_used else 0)
-        used_ord_count = min(used_ord_count, max(0, len(self.step_margins) - 1))
+        if used_ord_count >= len(self.step_margins):
+            raise RuntimeError("No ordinary steps left to add")
         margin = self.step_margins[used_ord_count]
         notional = margin * self.leverage
         new_qty = notional / max(price, 1e-9)
@@ -885,9 +900,16 @@ async def scanner_main_loop(
             b["fa_risk"] = fa_risk # hook
             b["fa_bias"] = fa_bias # hook
             
-            # масштаб доборов/резерв
+            # --- вес из FUND_BOT (для политики), но банк пары не масштабируем по умолчанию
             weight = target_weight_for_pair(symbol, fund_weights)
-            dca_scale = weight / 100.0
+            SCALE_BANK_BY_WEIGHTS = os.getenv("SCALE_BANK_BY_WEIGHTS", "0").lower() in ("1","true","yes","on")
+
+            def _alloc_bank(bank: float, weight: int) -> float:
+                if SCALE_BANK_BY_WEIGHTS:
+                    w = max(0.0, min(1.0, float(weight) / 100.0))
+                    return bank * w
+                return bank # по умолчанию банк уже "пер-пара"
+            
             reserve_off = bool(fa.get("reserve_off"))
 
             need_build_strat = (rng_strat is None) or ((now - last_build_strat > CONFIG.REBUILD_RANGE_EVERY_MIN*60) and (b.get("position") is None))
@@ -932,7 +954,7 @@ async def scanner_main_loop(
                     pos.reserve_margin_usdt = 0.0
                     pos.max_steps = max(pos.steps_filled, pos.ord_levels)
 
-                new_alloc_bank = bank * dca_scale
+                new_alloc_bank = _alloc_bank(bank, weight)
                 if new_alloc_bank > 0 and pos.steps_filled < pos.ord_levels:
                     if pos.alloc_bank_planned <= 0 or abs(new_alloc_bank - pos.alloc_bank_planned) / max(pos.alloc_bank_planned, 1e-9) > 0.05:
                         pos.rebalance_tail_margins_excluding_reserve(new_alloc_bank)
@@ -1061,7 +1083,7 @@ async def scanner_main_loop(
                         ord_levels = max(1, ord_levels - 1)
                         growth = min(growth, CONFIG.AUTO_ALLOC["growth_A"])
 
-                    alloc_bank = bank * dca_scale
+                    alloc_bank = _alloc_bank(bank, weight)
                     pos.plan_with_reserve(alloc_bank, growth, ord_levels)
                     pos.alloc_bank_planned = alloc_bank
                     if reserve_off:
@@ -1073,24 +1095,21 @@ async def scanner_main_loop(
                     breakout_short = (pos.side == "SHORT" and px >= rng_strat["upper"])
                     breakout_long  = (pos.side == "LONG"  and px <= rng_strat["lower"])
                     if breakout_short or breakout_long:
-                        # 1) Гарантируем, что останется один обычный добор до STRAT 100%
                         BOOST_MIN_ORD_LEVELS = 6  # OPEN+4 до STRAT-67% и ещё 1 до STRAT-100%
                         if pos.ord_levels < BOOST_MIN_ORD_LEVELS:
                             pos.plan_with_reserve(alloc_bank, growth, BOOST_MIN_ORD_LEVELS)
-                            # если резерв выключен политикой — повторно обнулим
                             if reserve_off:
                                 pos.reserve_available = False
                                 pos.reserve_margin_usdt = 0.0
                                 pos.max_steps = pos.ord_levels
 
-                        # 2) Синтетические STRAT-цели в сторону ухудшения
                         t = b.get("price_tick", tick)
                         w_base = (rng_strat["upper"] - rng_tac["upper"]) if pos.side == "SHORT" else (rng_tac["lower"] - rng_strat["lower"])
                         w = max(t * CONFIG.DCA_MIN_GAP_TICKS * 4, abs(w_base))
                         end = px + w if pos.side == "SHORT" else px - w
                         seg = _place_segment(px, end, 3, t, include_end_last=True)
                         if not seg:
-                            seg = [end]  # fallback на край диапазона
+                            seg = [end]
 
                         full_targets = [
                             {"price": px,    "label": "TAC 33%"},
@@ -1100,8 +1119,7 @@ async def scanner_main_loop(
                             {"price": seg[-1],"label": "STRAT 100%"},
                         ]
                         pos.ordinary_targets = full_targets[:min(len(full_targets), max(1, pos.ord_levels - 1))]
-
-                        # 3) Мгновенно «заливаем» до STRAT-2: OPEN + ещё 4 шага (если доступны)
+                        
                         target_used_steps = min(5, pos.ord_levels)
                         cum_margin_added = 0.0
                         for _ in range(target_used_steps):
@@ -1112,11 +1130,9 @@ async def scanner_main_loop(
                         b["position"] = pos
                         b["fsm_state"] = int(FSM.MANAGING)
 
-                        # сообщение о «ускоренном» открытии
                         used_ord_after = pos.steps_filled - (1 if pos.reserve_used else 0)
-                        nxt = next_pct_target(pos)  # это будет STRAT 100%
+                        nxt = next_pct_target(pos)
                         nxt_txt = "N/A" if not nxt else f"{fmt(nxt['price'])} ({nxt['label']})"
-                        # оценки комиссий/ML
                         cum_margin = _pos_total_margin(pos)
                         cum_notional = cum_margin * pos.leverage
                         fees_paid_est = cum_notional * fee_taker * CONFIG.LIQ_FEE_BUFFER
@@ -1152,9 +1168,8 @@ async def scanner_main_loop(
                             "Chat_ID": b.get("chat_id") or "", "Owner_Key": b.get("owner_key") or "",
                             "FA_Risk": b.get("fa_risk") or "", "FA_Bias": b.get("fa_bias") or "",
                         })
-                        continue  # не проходить стандартный OPEN-блок
+                        continue
 
-                    # --- обычный сценарий открытия внутри диапазонов ---
                     pos.ordinary_targets = compute_corridor_targets(entry=px, side=pos.side,
                                                                     rng_strat=rng_strat, rng_tac=rng_tac, tick=tick)
                     margin, _ = pos.add_step(px)
@@ -1163,162 +1178,95 @@ async def scanner_main_loop(
                     b["fsm_state"] = int(FSM.OPENED)
 
             if pos:
-                # Резервное усреднение при ретесте
-                if not pos or b.get("fsm_state") != int(FSM.MANAGING) or pos.steps_filled <= 0:
+                if not pos or b.get("fsm_state") == int(FSM.IDLE) or pos.steps_filled <= 0:
                     pass
                 else:
+                    used_ord = pos.steps_filled - (1 if pos.reserve_used else 0)
+                    nxt = next_pct_target(pos)
+                    is_open_event = b.get("fsm_state") == int(FSM.OPENED) and pos.steps_filled == 1
+                    is_add_event = b.get("fsm_state") == int(FSM.MANAGING) and (nxt is not None) and (
+                        (pos.side == "LONG" and px <= nxt["price"] - tick) or 
+                        (pos.side == "SHORT" and px >= nxt["price"] + tick) )
+                    
                     now_ts = time.time()
-                    need_retest_spike = (pos.spike_flag) and (pos.spike_deadline_ts and now_ts <= pos.spike_deadline_ts)
-                    need_retest_plain = (not pos.spike_flag) and (pos.freeze_ordinary)
-                    
-                    retrace_hit = False
-                    if need_retest_spike and pos.spike_ref_ohlc:
-                        o, h, l, c = pos.spike_ref_ohlc
-                        if pos.spike_direction == "down":
-                            ceiling = max(o, c, h)
-                            if ceiling > l + 1e-12:
-                                progress = (px - l) / (ceiling - l)
-                                retrace_hit = (progress >= CONFIG.SPIKE["RETRACE_FRAC"]) and (pos.side == "LONG")
-                        elif pos.spike_direction == "up":
-                            floor_ = min(o, c, l)
-                            if h > floor_ + 1e-12:
-                                progress = (h - px) / (h - floor_)
-                                retrace_hit = (progress >= CONFIG.SPIKE["RETRACE_FRAC"]) and (pos.side == "SHORT")
+                    allowed_now = is_open_event or (pos.last_add_ts is None) or ((now_ts - pos.last_add_ts) >= CONFIG.ADD_COOLDOWN_SEC)
+                    if (is_open_event or is_add_event) and (not pos.freeze_ordinary) and (used_ord < pos.ord_levels) and allowed_now:
+                        if is_add_event:
+                            alloc_bank = _alloc_bank(bank, weight)
+                            margin, _ = pos.add_step(px)
+                            pos.rebalance_tail_margins_excluding_reserve(alloc_bank)
+                        else:
+                            margin = pos.step_margins[0]
 
-                    need_retest_plain_hit = False
-                    if need_retest_plain:
-                        band = CONFIG.REENTRY_BAND
+                        used_ord_after = pos.steps_filled - (1 if pos.reserve_used else 0)
+                        used_dca = max(0, used_ord_after - 1)
+                        nxt2 = next_pct_target(pos)
+                        total_ord = max(0, min(pos.ord_levels - 1, len(pos.ordinary_targets)))
+                        remaining = max(0, total_ord - used_dca)
+                        next_idx = used_ord_after
+                        nxt2_margin = pos.step_margins[next_idx] if next_idx < len(pos.step_margins) else None
+                        
+                        lots = margin_to_lots(symbol, margin, price=px, leverage=pos.leverage)
+                        cum_margin = _pos_total_margin(pos)
+                        cum_notional = cum_margin * pos.leverage
+                        fees_paid_est = cum_notional * fee_taker * CONFIG.LIQ_FEE_BUFFER
+
+                        ml_price = ml_price_at(pos, CONFIG.ML_TARGET_PCT, bank, fees_paid_est)
+                        dist_ml_pct = ml_distance_pct(pos.side, px, ml_price)
+                        dist_txt = "N/A" if np.isnan(dist_ml_pct) else f"{dist_ml_pct:.2f}%"
+                        ml_arrow = "↓" if pos.side == "LONG" else "↑"
+                        
+                        nxt2_txt = "N/A" if nxt2 is None else f"{fmt(nxt2['price'])} ({nxt2['label']})"
+                        
+                        dir_tag = "LONG 🟢" if pos.side == "LONG" else "SHORT 🛑"
+                        if is_open_event:
+                            header_tag = dir_tag
+                        else:
+                            header_tag = (nxt and nxt["label"]) or ""
+
+                        nxt2_dep_txt = "N/A"
+                        if nxt2_margin and nxt2:
+                            nxt_lots = margin_to_lots(symbol, nxt2_margin, price=nxt2['price'], leverage=pos.leverage)
+                            nxt2_dep_txt = f"{nxt2_margin:.2f} USD ≈ {nxt_lots:.2f} lot"
+
                         brk_up, brk_dn = break_levels(rng_strat)
-                        reentry_up = brk_up * (1.0 - band)
-                        reentry_dn = brk_dn * (1.0 + band)
-                        if px <= reentry_up and px >= reentry_dn:
-                            need_retest_plain_hit = True
+                        brk_up_pct, brk_dn_pct = break_distance_pcts(px, brk_up, brk_dn)
+                        brk_line = f"Пробой: ↑<code>{fmt(brk_up)}</code> ({brk_up_pct:.2f}%) | ↓<code>{fmt(brk_dn)}</code> ({brk_dn_pct:.2f}%)"
 
-                    if (retrace_hit or need_retest_plain_hit) and pos.reserve_available and (not pos.reserve_used):
-                        if pos.last_add_ts is None or (now_ts - pos.last_add_ts) >= CONFIG.ADD_COOLDOWN_SEC:
-                            margin, _ = pos.add_reserve_step(px)
-                            cum_margin = _pos_total_margin(pos)
-                            lots = margin_to_lots(symbol, margin, price=px, leverage=pos.leverage)
-                            cum_notional = cum_margin * pos.leverage
-                            fees_paid_est = cum_notional * fee_taker * CONFIG.LIQ_FEE_BUFFER
-                            
-                            ml_price = ml_price_at(pos, CONFIG.ML_TARGET_PCT, bank, fees_paid_est)
-                            dist_ml_pct = ml_distance_pct(pos.side, px, ml_price)
-                            dist_txt = "N/A" if np.isnan(dist_ml_pct) else f"{dist_ml_pct:.2f}%"
-                            ml_arrow = "↓" if pos.side == "LONG" else "↑"
-                            
-                            brk_up, brk_dn = break_levels(rng_strat)
-                            brk_up_pct, brk_dn_pct = break_distance_pcts(px, brk_up, brk_dn)
-                            brk_line = f"Пробой: ↑<code>{fmt(brk_up)}</code> ({brk_up_pct:.2f}%) | ↓<code>{fmt(brk_dn)}</code> ({brk_dn_pct:.2f}%)"
+                        event_type_str = "▶️ OPEN" if is_open_event else f"➕ Усреднение #{used_dca}"
+                        await say(
+                            f"{event_type_str} [{header_tag}]\n"
+                            f"Цена: <code>{fmt(px)}</code> | <b>{lots:.2f} lot</b>\n"
+                            f"Добор: <b>{margin:.2f} USD</b> | Депозит (тек): <b>{cum_margin:.2f} USD</b>\n"
+                            f"Средняя: <code>{fmt(pos.avg)}</code> | TP: <code>{fmt(pos.tp_price)}</code>\n"
+                            f"ML цена (20%): {ml_arrow}<code>{fmt(ml_price) or 'N/A'}</code> ({dist_txt})\n"
+                            f"{brk_line}\n"
+                            f"След. усреднение: <code>{nxt2_txt}</code>\n"
+                            f"Плановый добор: <b>{nxt2_dep_txt}</b> (осталось: {remaining} из {total_ord})\n"
+                            f"{margin_line(pos, bank, px, fees_paid_est)}"
+                        )
+                        await log_event_safely({
+                            "Event_ID": f"{'OPEN' if is_open_event else 'ADD'}_{pos.signal_id}_{pos.steps_filled}", "Signal_ID": pos.signal_id,
+                            "Timestamp_UTC": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+                            "Pair": symbol, "Side": pos.side, "Event": "OPEN" if is_open_event else "ADD",
+                            "Step_No": pos.steps_filled, "Step_Margin_USDT": margin,
+                            "Cum_Margin_USDT": cum_margin, "Entry_Price": px, "Avg_Price": pos.avg,
+                            "TP_Price": pos.tp_price, "SL_Price": pos.sl_price or "",
+                            "Liq_Est_Price": ml_price, "Next_DCA_Price": (nxt2 and nxt2["price"]) or "",
+                            "Next_DCA_Label": (nxt2 and nxt2["label"]) or "",
+                            "Triggered_Label": header_tag if not is_open_event else "OPEN",
+                            "Fee_Rate_Maker": fee_maker, "Fee_Rate_Taker": fee_taker,
+                            "Fee_Est_USDT": (cum_notional * fee_taker), "ATR_5m": ind["atr5m"], "ATR_1h": rng_strat["atr1h"],
+                            "RSI_5m": ind["rsi"], "ADX_5m": ind["adx"], "Supertrend": ind["supertrend"], "Vol_z": ind["vol_z"],
+                            "Range_Lower": rng_strat["lower"], "Range_Upper": rng_strat["upper"], "Range_Width": rng_strat["width"],
+                            "Chat_ID": b.get("chat_id") or "", "Owner_Key": b.get("owner_key") or "",
+                            "FA_Risk": b.get("fa_risk") or "", "FA_Bias": b.get("fa_bias") or "",
+                        })
+                        if is_open_event:
+                            b["fsm_state"] = int(FSM.MANAGING) # Переключаем после первого сообщения
 
-                            await say(
-                                f"↩️ Ретест — резервный добор ({'шип' if need_retest_spike else 'плавный'})\n"
-                                f"Цена: <code>{fmt(px)}</code> | <b>{lots:.2f} lot</b>\n"
-                                f"Добор (резерв): <b>{margin:.2f} USD</b> | Депозит (тек): <b>{cum_margin:.2f} USD</b>\n"
-                                f"Средняя: <code>{fmt(pos.avg)}</code> | TP: <code>{fmt(pos.tp_price)}</code>\n"
-                                f"ML цена (20%): {ml_arrow}<code>{fmt(ml_price) or 'N/A'}</code> ({dist_txt})\n"
-                                f"{brk_line}\n"
-                                f"{margin_line(pos, bank, px, fees_paid_est)}"
-                            )
-                            await log_event_safely({
-                                "Event_ID": f"RETEST_ADD_{pos.signal_id}_{pos.steps_filled}", "Signal_ID": pos.signal_id,
-                                "Timestamp_UTC": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
-                                "Pair": symbol, "Side": pos.side, "Event": "RETEST_ADD",
-                                "Step_No": pos.steps_filled, "Step_Margin_USDT": margin,
-                                "Entry_Price": px, "Avg_Price": pos.avg,
-                                "Chat_ID": b.get("chat_id") or "", "Owner_Key": b.get("owner_key") or "",
-                                "FA_Risk": b.get("fa_risk") or "", "FA_Bias": b.get("fa_bias") or "",
-                            })
-
-                # Обычные усреднения (включая OPEN)
-                used_ord = pos.steps_filled - (1 if pos.reserve_used else 0)
-                nxt = next_pct_target(pos)
-                is_open_event = b.get("fsm_state") == int(FSM.OPENED) and pos.steps_filled == 1
-                is_add_event = b.get("fsm_state") == int(FSM.MANAGING) and (nxt is not None) and (
-                    (pos.side == "LONG" and px <= nxt["price"] - tick) or 
-                    (pos.side == "SHORT" and px >= nxt["price"] + tick) )
-
-                now_ts = time.time()
-                allowed_now = is_open_event or (pos.last_add_ts is None) or ((now_ts - pos.last_add_ts) >= CONFIG.ADD_COOLDOWN_SEC)
-                if (is_open_event or is_add_event) and (not pos.freeze_ordinary) and (used_ord < pos.ord_levels) and allowed_now:
-                    if is_add_event:
-                        alloc_bank = bank * dca_scale
-                        margin, _ = pos.add_step(px)
-                        pos.rebalance_tail_margins_excluding_reserve(alloc_bank)
-                    else:
-                        margin = pos.step_margins[0]
-
-                    used_ord_after = pos.steps_filled - (1 if pos.reserve_used else 0)
-                    used_dca = max(0, used_ord_after - 1)
-                    nxt2 = next_pct_target(pos)
-                    total_ord = max(0, min(pos.ord_levels - 1, len(pos.ordinary_targets)))
-                    remaining = max(0, total_ord - used_dca)
-                    next_idx = used_ord_after
-                    nxt2_margin = pos.step_margins[next_idx] if next_idx < len(pos.step_margins) else None
-                    
-                    lots = margin_to_lots(symbol, margin, price=px, leverage=pos.leverage)
-                    cum_margin = _pos_total_margin(pos)
-                    cum_notional = cum_margin * pos.leverage
-                    fees_paid_est = cum_notional * fee_taker * CONFIG.LIQ_FEE_BUFFER
-
-                    ml_price = ml_price_at(pos, CONFIG.ML_TARGET_PCT, bank, fees_paid_est)
-                    dist_ml_pct = ml_distance_pct(pos.side, px, ml_price)
-                    dist_txt = "N/A" if np.isnan(dist_ml_pct) else f"{dist_ml_pct:.2f}%"
-                    ml_arrow = "↓" if pos.side == "LONG" else "↑"
-                    
-                    nxt2_txt = "N/A" if nxt2 is None else f"{fmt(nxt2['price'])} ({nxt2['label']})"
-                    
-                    dir_tag = "LONG 🟢" if pos.side == "LONG" else "SHORT 🛑"
-                    if is_open_event:
-                        header_tag = dir_tag
-                    else:
-                        header_tag = (nxt and nxt["label"]) or ""
-
-                    nxt2_dep_txt = "N/A"
-                    if nxt2_margin and nxt2:
-                        nxt_lots = margin_to_lots(symbol, nxt2_margin, price=nxt2['price'], leverage=pos.leverage)
-                        nxt2_dep_txt = f"{nxt2_margin:.2f} USD ≈ {nxt_lots:.2f} lot"
-
-                    brk_up, brk_dn = break_levels(rng_strat)
-                    brk_up_pct, brk_dn_pct = break_distance_pcts(px, brk_up, brk_dn)
-                    brk_line = f"Пробой: ↑<code>{fmt(brk_up)}</code> ({brk_up_pct:.2f}%) | ↓<code>{fmt(brk_dn)}</code> ({brk_dn_pct:.2f}%)"
-
-                    event_type_str = "▶️ OPEN" if is_open_event else f"➕ Усреднение #{used_dca}"
-                    await say(
-                        f"{event_type_str} [{header_tag}]\n"
-                        f"Цена: <code>{fmt(px)}</code> | <b>{lots:.2f} lot</b>\n"
-                        f"Добор: <b>{margin:.2f} USD</b> | Депозит (тек): <b>{cum_margin:.2f} USD</b>\n"
-                        f"Средняя: <code>{fmt(pos.avg)}</code> | TP: <code>{fmt(pos.tp_price)}</code>\n"
-                        f"ML цена (20%): {ml_arrow}<code>{fmt(ml_price) or 'N/A'}</code> ({dist_txt})\n"
-                        f"{brk_line}\n"
-                        f"След. усреднение: <code>{nxt2_txt}</code>\n"
-                        f"Плановый добор: <b>{nxt2_dep_txt}</b> (осталось: {remaining} из {total_ord})\n"
-                        f"{margin_line(pos, bank, px, fees_paid_est)}"
-                    )
-                    await log_event_safely({
-                        "Event_ID": f"{'OPEN' if is_open_event else 'ADD'}_{pos.signal_id}_{pos.steps_filled}", "Signal_ID": pos.signal_id,
-                        "Timestamp_UTC": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
-                        "Pair": symbol, "Side": pos.side, "Event": "OPEN" if is_open_event else "ADD",
-                        "Step_No": pos.steps_filled, "Step_Margin_USDT": margin,
-                        "Cum_Margin_USDT": cum_margin, "Entry_Price": px, "Avg_Price": pos.avg,
-                        "TP_Price": pos.tp_price, "SL_Price": pos.sl_price or "",
-                        "Liq_Est_Price": ml_price, "Next_DCA_Price": (nxt2 and nxt2["price"]) or "",
-                        "Next_DCA_Label": (nxt2 and nxt2["label"]) or "",
-                        "Triggered_Label": header_tag if not is_open_event else "OPEN",
-                        "Fee_Rate_Maker": fee_maker, "Fee_Rate_Taker": fee_taker,
-                        "Fee_Est_USDT": (cum_notional * fee_taker), "ATR_5m": ind["atr5m"], "ATR_1h": rng_strat["atr1h"],
-                        "RSI_5m": ind["rsi"], "ADX_5m": ind["adx"], "Supertrend": ind["supertrend"], "Vol_z": ind["vol_z"],
-                        "Range_Lower": rng_strat["lower"], "Range_Upper": rng_strat["upper"], "Range_Width": rng_strat["width"],
-                        "Chat_ID": b.get("chat_id") or "", "Owner_Key": b.get("owner_key") or "",
-                        "FA_Risk": b.get("fa_risk") or "", "FA_Bias": b.get("fa_bias") or "",
-                    })
-                    if is_open_event:
-                        b["fsm_state"] = int(FSM.MANAGING) # Переключаем после первого сообщения
-
-                # Трейл-стоп
-                if not pos or b.get("fsm_state") != int(FSM.MANAGING) or pos.steps_filled <= 0:
-                    pass
-                else:
+                # Трейл-стоп, TP/SL выходы (без изменений) ...
+                if pos and b.get("fsm_state") == int(FSM.MANAGING) and pos.steps_filled > 0:
                     if pos.side == "LONG": gain_to_tp = max(0.0, (px / max(pos.avg, 1e-9) - 1.0) / CONFIG.TP_PCT)
                     else: gain_to_tp = max(0.0, (pos.avg / max(px, 1e-9) - 1.0) / CONFIG.TP_PCT)
                     for stage_idx, (arm, lock) in enumerate(CONFIG.TRAILING_STAGES):
@@ -1353,11 +1301,7 @@ async def scanner_main_loop(
                                     "Chat_ID": b.get("chat_id") or "", "Owner_Key": b.get("owner_key") or "",
                                     "FA_Risk": b.get("fa_risk") or "", "FA_Bias": b.get("fa_bias") or "",
                                 })
-
-                # TP / SL выход
-                if not pos or b.get("fsm_state") == int(FSM.IDLE) or pos.steps_filled <= 0:
-                    pass
-                else:
+                    
                     tp_hit = (pos.side == "LONG" and px >= pos.tp_price) or (pos.side == "SHORT" and px <= pos.tp_price)
                     sl_hit = pos.sl_price and (
                         (pos.side == "LONG" and px <= pos.sl_price) or (pos.side == "SHORT" and px >= pos.sl_price)
