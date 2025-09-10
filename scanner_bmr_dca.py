@@ -222,6 +222,75 @@ PAIR_KEY = {
     "GBPUSD": "GBP",
 }
 
+# === FUND_BOT targets ===
+TARGET_WS = os.getenv("TARGET_WS", "FUND_BOT")
+PAIR_LIST = ["USDJPY","AUDUSD","EURUSD","GBPUSD"]
+
+# {"USDJPY": {"value": 1120.0, "ts": "2025-09-09T..."}, ...}
+targets_cache: dict[str, dict] = {}
+
+def refresh_targets_from_fund_ws(sh, box=None) -> bool:
+    """
+    Прочитать последнюю строку с action=='alloc' из листа TARGET_WS
+    (по умолчанию FUND_BOT), распарсить note как JSON вида:
+      {"USDJPY":1120,"AUDUSD":700,"EURUSD":560,"GBPUSD":420}
+    и обновить targets_cache (+продублировать в box[ns_key]["bank_target_usdt"]).
+    """
+    try:
+        ws = sh.worksheet(TARGET_WS)
+        rows = ws.get_all_records()  # [{'ts':..., 'chat_id':..., 'action':..., 'note':...}, ...]
+        filter_chat = os.getenv("FUND_ALLOC_CHAT_ID")
+        last_alloc = None
+        for r in reversed(rows):
+            if str(r.get("action","")).lower() == "alloc" and (not filter_chat or str(r.get("chat_id","")) == filter_chat):
+                last_alloc = r
+                break
+        if not last_alloc:
+            return False
+
+        note_raw = last_alloc.get("note") or "{}"
+        try:
+            alloc = json.loads(note_raw)
+        except Exception:
+            try:
+                alloc = ast.literal_eval(note_raw)
+            except Exception:
+                alloc = {}
+
+        ts = str(last_alloc.get("ts") or "")
+        updated = False
+        for sym in PAIR_LIST:
+            try:
+                val = float(alloc.get(sym, 0) or 0)
+            except Exception:
+                val = 0.0
+            if val > 0:
+                targets_cache[sym] = {"value": val, "ts": ts}
+                if box is not None:
+                    # если знаешь ID торгового чата для пары — можно задать через ENV <SYM>_CHAT_ID
+                    chat_env = os.getenv(f"{sym}_CHAT_ID")
+                    ns_key = f"{sym}|{chat_env or 'default'}"
+                    slot = box.setdefault(ns_key, {})
+                    slot["bank_target_usdt"] = val
+                updated = True
+        return updated
+    except gspread.WorksheetNotFound:
+        log.warning(f"{TARGET_WS} sheet not found for targets.")
+        return False
+    except Exception:
+        log.exception("refresh_targets_from_fund_ws failed")
+        return False
+
+def _diag_targets_snapshot() -> str:
+    lines = []
+    for sym in PAIR_LIST:
+        t = targets_cache.get(sym)
+        if t and "value" in t:
+            lines.append(f"{sym}  target={t['value']:.2f}  source=FUND_BOT  ts={t.get('ts','')}")
+        else:
+            lines.append(f"{sym}  target=N/A  source=fallback")
+    return "🧪 Targets snapshot:\n" + "\n".join(lines)
+
 def _get_master_headers(sh) -> list[str]:
     # Всегда фиксированный, чистый порядок колонок
     return BMR_HEADERS_FALLBACK
@@ -849,6 +918,11 @@ async def scanner_main_loop(
         try:
             headers = _get_master_headers(sheet)
             _ensure_ws(sheet, f"BMR_DCA_{symbol}", headers)
+            # NEW: первичная подтяжка alloc-таргетов из FUND_BOT
+            try:
+                refresh_targets_from_fund_ws(sheet, root)
+            except Exception:
+                log.exception("initial refresh_targets_from_fund_ws failed")
         except Exception:
             log.exception("ensure symbol sheet failed")
 
@@ -866,6 +940,7 @@ async def scanner_main_loop(
     fa = read_fa_policy(symbol)
     fund_weights = read_fund_bot_weights(sheet) if sheet else {}
     last_fa_read = 0.0
+    last_targets_read = 0.0
 
     rng_strat, rng_tac = None, None
     last_flush = 0
@@ -874,8 +949,22 @@ async def scanner_main_loop(
 
     while b.get("bot_on", True):
         try:
+            # Факт банка — как и раньше
             bank = float(b.get("safety_bank_usdt", CONFIG.SAFETY_BANK_USDT))
-            bank_target = float(b.get("bank_target_usdt", bank))
+
+            # Истинный таргет: 1) из box (если уже положен), 2) из локального кэша FUND_BOT,
+            # 3) в крайнем случае — фолбэк на факт
+            _tgt = b.get("bank_target_usdt")
+            if _tgt is None:
+                tce = targets_cache.get(symbol)
+                if tce:
+                    _tgt = tce.get("value")
+            bank_target = float(_tgt if _tgt is not None else bank)
+
+            # Синхронизируем в box — чтобы with_banks() всегда брал консистентные значения
+            b["bank_target_usdt"] = bank_target
+            b["safety_bank_usdt"] = bank
+            
             fee_maker = float(b.get("fee_maker", CONFIG.FEE_MAKER))
             fee_taker = float(b.get("fee_taker", CONFIG.FEE_TAKER))
 
@@ -886,7 +975,7 @@ async def scanner_main_loop(
                 payload["Bank_Fact_USDT"] = bank
                 return payload
 
-            # периодически перечитываем ФА
+            # периодически перечитываем ФА и таргеты
             if now - last_fa_read > CONFIG.FA_REFRESH_SEC:
                 fa = read_fa_policy(symbol)
                 if sheet:
@@ -897,6 +986,15 @@ async def scanner_main_loop(
                 scan_until = pd.to_datetime(fa.get("scan_lock_until"), utc=True) if fa.get("scan_lock_until") else None
                 b["fa_scan_lock"] = bool(scan_until and pd.Timestamp.now(tz="UTC") < scan_until)
                 b["fa_scan_until_ts"] = float(scan_until.timestamp()) if scan_until is not None else None
+
+            if sheet and (now - last_targets_read > 180):  # ~3 минуты
+                try:
+                    refreshed = refresh_targets_from_fund_ws(sheet, root)
+                    if refreshed:
+                        log.info("FUND_BOT targets refreshed.")
+                except Exception:
+                    log.exception("periodic refresh_targets_from_fund_ws failed")
+                last_targets_read = now
 
             # применяем FA: risk Red -> управляем, но не открываем; Amber -> консервативней
             fa_risk = (fa.get("risk") or "Green").capitalize()
@@ -1004,6 +1102,10 @@ async def scanner_main_loop(
                 )
                 b["intro_done"] = True
 
+            # Диагностика по флагу
+            if b.pop("cmd_diag_targets", False):
+                await say(_diag_targets_snapshot())
+
             # Ручное закрытие
             if pos and b.get("force_close"):
                 if not pos or b.get("fsm_state") != int(FSM.MANAGING) or pos.steps_filled <= 0:
@@ -1106,6 +1208,8 @@ async def scanner_main_loop(
                                 pos.reserve_available = False
                                 pos.reserve_margin_usdt = 0.0
                                 pos.max_steps = pos.ord_levels
+                        pos.growth = min(pos.growth, 1.6)
+                        pos.rebalance_tail_margins_excluding_reserve(alloc_bank)
 
                         t = b.get("price_tick", tick)
                         w_base = (rng_strat["upper"] - rng_tac["upper"]) if pos.side == "SHORT" else (rng_tac["lower"] - rng_strat["lower"])
