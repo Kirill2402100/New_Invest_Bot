@@ -201,10 +201,7 @@ SAFE_LOG_KEYS = {
     "PNL_Realized_USDT","PNL_Realized_Pct","Time_In_Trade_min","Trail_Stage",
     "Next_DCA_Label","Triggered_Label"
 }
-SAFE_LOG_KEYS |= {
-    "Chat_ID", "Owner_Key",      # для трассировки по чату/владельцу
-    "FA_Risk", "FA_Bias"         # подготовка под фунд-политику
-}
+SAFE_LOG_KEYS |= {"Bank_Target_USDT", "Bank_Fact_USDT", "Chat_ID", "Owner_Key", "FA_Risk", "FA_Bias"}
 
 BMR_HEADERS_FALLBACK = [
     "Event","Event_ID","Timestamp_UTC","Pair","Side","Signal_ID","Leverage",
@@ -214,7 +211,8 @@ BMR_HEADERS_FALLBACK = [
     "Range_Lower","Range_Upper","Range_Width",
     "Fee_Rate_Maker","Fee_Rate_Taker","Fee_Est_USDT",
     "PNL_Realized_USDT","PNL_Realized_Pct","Time_In_Trade_min","Trail_Stage",
-    "Triggered_Label","Chat_ID","Owner_Key","FA_Risk","FA_Bias"
+    "Triggered_Label","Chat_ID","Owner_Key","FA_Risk","FA_Bias",
+    "Bank_Target_USDT", "Bank_Fact_USDT"
 ]
 
 PAIR_KEY = {
@@ -877,10 +875,16 @@ async def scanner_main_loop(
     while b.get("bot_on", True):
         try:
             bank = float(b.get("safety_bank_usdt", CONFIG.SAFETY_BANK_USDT))
+            bank_target = float(b.get("bank_target_usdt", bank))
             fee_maker = float(b.get("fee_maker", CONFIG.FEE_MAKER))
             fee_taker = float(b.get("fee_taker", CONFIG.FEE_TAKER))
 
             now = time.time()
+            
+            def with_banks(payload: dict) -> dict:
+                payload["Bank_Target_USDT"] = bank_target
+                payload["Bank_Fact_USDT"] = bank
+                return payload
 
             # периодически перечитываем ФА
             if now - last_fa_read > CONFIG.FA_REFRESH_SEC:
@@ -1013,7 +1017,7 @@ async def scanner_main_loop(
                     f"P&L (net)≈ {net_usd:+.2f} USD ({net_pct:+.2f}%)\n"
                     f"Время в сделке: {time_min:.1f} мин"
                 )
-                await log_event_safely({
+                await log_event_safely(with_banks({
                     "Event_ID": f"MANUAL_CLOSE_{pos.signal_id}", "Signal_ID": pos.signal_id,
                     "Timestamp_UTC": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
                     "Pair": symbol, "Side": pos.side, "Event": "MANUAL_CLOSE",
@@ -1021,7 +1025,7 @@ async def scanner_main_loop(
                     "Time_In_Trade_min": time_min,
                     "Chat_ID": b.get("chat_id") or "", "Owner_Key": b.get("owner_key") or "",
                     "FA_Risk": b.get("fa_risk") or "", "FA_Bias": b.get("fa_bias") or "",
-                })
+                }))
                 b["force_close"] = False
                 pos.last_sl_notified_price = None
                 b["position"] = None
@@ -1156,7 +1160,7 @@ async def scanner_main_loop(
                             f"След. усреднение: <code>{nxt_txt}</code>\n"
                             f"{margin_line(pos, bank, px, fees_paid_est)}"
                         )
-                        await log_event_safely({
+                        await log_event_safely(with_banks({
                             "Event_ID": f"OPEN_BOOST_{pos.signal_id}_{pos.steps_filled}",
                             "Signal_ID": pos.signal_id, "Timestamp_UTC": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
                             "Pair": symbol, "Side": pos.side, "Event": "OPEN_BOOST",
@@ -1167,7 +1171,7 @@ async def scanner_main_loop(
                             "Range_Lower": rng_strat["lower"], "Range_Upper": rng_strat["upper"], "Range_Width": rng_strat["width"],
                             "Chat_ID": b.get("chat_id") or "", "Owner_Key": b.get("owner_key") or "",
                             "FA_Risk": b.get("fa_risk") or "", "FA_Bias": b.get("fa_bias") or "",
-                        })
+                        }))
                         continue
 
                     pos.ordinary_targets = compute_corridor_targets(entry=px, side=pos.side,
@@ -1245,7 +1249,7 @@ async def scanner_main_loop(
                             f"Плановый добор: <b>{nxt2_dep_txt}</b> (осталось: {remaining} из {total_ord})\n"
                             f"{margin_line(pos, bank, px, fees_paid_est)}"
                         )
-                        await log_event_safely({
+                        await log_event_safely(with_banks({
                             "Event_ID": f"{'OPEN' if is_open_event else 'ADD'}_{pos.signal_id}_{pos.steps_filled}", "Signal_ID": pos.signal_id,
                             "Timestamp_UTC": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
                             "Pair": symbol, "Side": pos.side, "Event": "OPEN" if is_open_event else "ADD",
@@ -1261,7 +1265,7 @@ async def scanner_main_loop(
                             "Range_Lower": rng_strat["lower"], "Range_Upper": rng_strat["upper"], "Range_Width": rng_strat["width"],
                             "Chat_ID": b.get("chat_id") or "", "Owner_Key": b.get("owner_key") or "",
                             "FA_Risk": b.get("fa_risk") or "", "FA_Bias": b.get("fa_bias") or "",
-                        })
+                        }))
                         if is_open_event:
                             b["fsm_state"] = int(FSM.MANAGING) # Переключаем после первого сообщения
 
@@ -1293,14 +1297,14 @@ async def scanner_main_loop(
                                (pos.side == "SHORT" and new_sl_q < (last_notif_q - t)):
                                 await say(f"🛡️ Трейлинг-SL (стадия {stage_idx+1}) → <code>{fmt(pos.sl_price)}</code>")
                                 pos.last_sl_notified_price = pos.sl_price
-                                await log_event_safely({
+                                await log_event_safely(with_banks({
                                     "Event_ID": f"TRAIL_SET_{pos.signal_id}_{int(now)}", "Signal_ID": pos.signal_id,
                                     "Timestamp_UTC": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
                                     "Pair": symbol, "Side": pos.side, "Event": "TRAIL_SET",
                                     "SL_Price": pos.sl_price, "Avg_Price": pos.avg, "Trail_Stage": stage_idx + 1,
                                     "Chat_ID": b.get("chat_id") or "", "Owner_Key": b.get("owner_key") or "",
                                     "FA_Risk": b.get("fa_risk") or "", "FA_Bias": b.get("fa_bias") or "",
-                                })
+                                }))
                     
                     tp_hit = (pos.side == "LONG" and px >= pos.tp_price) or (pos.side == "SHORT" and px <= pos.tp_price)
                     sl_hit = pos.sl_price and (
@@ -1319,7 +1323,7 @@ async def scanner_main_loop(
                             f"ATR(5m): {atr_now:.6f}\n"
                             f"Время в сделке: {time_min:.1f} мин"
                         )
-                        await log_event_safely({
+                        await log_event_safely(with_banks({
                             "Event_ID": f"{reason}_{pos.signal_id}", "Signal_ID": pos.signal_id,
                             "Timestamp_UTC": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
                             "Pair": symbol, "Side": pos.side, "Event": reason,
@@ -1327,7 +1331,7 @@ async def scanner_main_loop(
                             "Time_In_Trade_min": time_min, "ATR_5m": atr_now,
                             "Chat_ID": b.get("chat_id") or "", "Owner_Key": b.get("owner_key") or "",
                             "FA_Risk": b.get("fa_risk") or "", "FA_Bias": b.get("fa_bias") or "",
-                        })
+                        }))
                         pos.last_sl_notified_price = None
                         b["position"] = None
                         b["fsm_state"] = int(FSM.IDLE)
