@@ -177,6 +177,14 @@ class CONFIG:
     # Показываем ML-цену при целевом Margin Level
     ML_TARGET_PCT = 20.0        # "ML цена (20%)"
 
+    # Расширение коридора после пробоя
+    EXT_AFTER_BREAK = {
+        "CONFIRM_BARS_5M": 6,     # сколько 5m-баров нужно удержаться за STRAT
+        "EXTRA_LOOKBACK_DAYS": 10, # доп. история для «нового потолка/пола» (на TF_RANGE)
+        "ATR_MULT_MIN": 2.0,      # минимальная ширина экстеншена в ATR
+        "PRICE_EPS": 0.0015,      # небольшой буфер от уровня пробоя
+    }
+
 # ENV-переопределения
 CONFIG.SYMBOL    = os.getenv("FX_SYMBOL", CONFIG.SYMBOL)
 CONFIG.TF_ENTRY = os.getenv("TF_ENTRY", CONFIG.TF_ENTRY)
@@ -509,7 +517,7 @@ def _pnl_at_price(pos, price: float, used_margin: float) -> float:
         return used_margin * L * (pos.avg / max(price, 1e-12) - 1.0)
 
 def equity_at_price(pos, price: float, bank: float, fees_est: float) -> float:
-    """Equity = банк (включая 30% буфер) + PnL - комиссии."""
+    """Equity = банк + PnL - комиссии."""
     used = _pos_total_margin(pos)
     pnl  = _pnl_at_price(pos, price, used)
     return bank + pnl - max(fees_est, 0.0)
@@ -673,6 +681,63 @@ def _is_df_fresh(df: pd.DataFrame, max_age_min: int = 15) -> bool:
     except Exception:
         return True
 
+async def plan_extension_after_break(symbol: str, pos: "Position",
+                                     rng_strat: dict, rng_tac: dict,
+                                     px: float, tick: float) -> list[dict]:
+    """
+    Дорисовывает оставшиеся обычные уровни после подтверждённого пробоя STRAT.
+    Не трогает уже 'израсходованные' цели. Возвращает новый список ordinary_targets.
+    """
+    # Сколько обычных шагов уже использовано (включая OPEN, без резерва)
+    used_ord = pos.steps_filled - (1 if pos.reserve_used else 0)
+    remaining = max(0, pos.ord_levels - used_ord)
+    if remaining <= 0:
+        return pos.ordinary_targets
+
+    # Подтягиваем расширенную историю на TF_RANGE
+    ext_hours = max(
+        (CONFIG.TACTICAL_LOOKBACK_DAYS + CONFIG.EXT_AFTER_BREAK["EXTRA_LOOKBACK_DAYS"]) * 24,
+        CONFIG.TACTICAL_LOOKBACK_DAYS * 24
+    )
+    try:
+        ext_df = await maybe_await(fetch_ohlcv_yf, symbol, CONFIG.TF_RANGE, ext_hours)
+    except Exception:
+        ext_df = None
+    ext_rng = await build_range_from_df(ext_df, min_atr_mult=1.5) if (ext_df is not None and not ext_df.empty) else None
+
+    # Минимальная «добавка» по ширине через ATR
+    atr1h = float(rng_strat.get("atr1h", 0.0))
+    atr_guard = CONFIG.EXT_AFTER_BREAK["ATR_MULT_MIN"] * max(atr1h, 1e-12)
+
+    # Конечная точка расширения: «новый потолок/пол»
+    if pos.side == "SHORT":  # пробой вверх, строим ПОДАЛЬШЕ вверх
+        candidates = [
+            px + atr_guard,
+            rng_strat["upper"],
+            (ext_rng and ext_rng["upper"]) or rng_strat["upper"],
+        ]
+        end = max([v for v in candidates if np.isfinite(v)])
+        start = px
+    else:                      # LONG: пробой вниз, строим ПОДАЛЬШЕ вниз
+        candidates = [
+            px - atr_guard,
+            rng_strat["lower"],
+            (ext_rng and ext_rng["lower"]) or rng_strat["lower"],
+        ]
+        end = min([v for v in candidates if np.isfinite(v)])
+        start = px
+
+    # Равномерно раскидываем оставшиеся уровни, последний — у "нового потолка/пола"
+    seg = _place_segment(start, end, remaining, tick, include_end_last=True)
+    if not seg:
+        return pos.ordinary_targets
+
+    # Сохраняем уже пройденные цели (кол-во = used_ord-1; OPEN съедает «нулевой» шаг)
+    already = pos.ordinary_targets[:max(0, used_ord - 1)]
+    new_labels = [f"EXT {int(round((i + 1) / len(seg) * 100))}%" for i in range(len(seg))]
+    ext_targets = [{"price": p, "label": lab} for p, lab in zip(seg, new_labels)]
+
+    return already + ext_targets
 # ---------------------------------------------------------------------------
 # Диапазоны/индикаторы
 # ---------------------------------------------------------------------------
@@ -771,6 +836,9 @@ class Position:
         self.spike_deadline_ts: float | None = None
         self.spike_ref_ohlc: Optional[tuple[float, float, float, float]] = None
         self.alloc_bank_planned: float = 0.0
+        self.break_dir: str | None = None
+        self.break_confirm_bars: int = 0
+        self.extension_planned: bool = False
 
     def plan_with_reserve(self, bank: float, growth: float, ord_levels: int):
         self.growth = growth
@@ -1062,8 +1130,8 @@ async def scanner_main_loop(
                         pos.rebalance_tail_margins_excluding_reserve(new_alloc_bank)
                         pos.alloc_bank_planned = new_alloc_bank
 
-            df5 = ohlc5_df.copy()
-            df5.columns = ["open","high","low","close","volume"]
+            df5 = ohlc5_df.iloc[:, -5:].copy()
+            df5.columns = ["open", "high", "low", "close", "volume"]
             try:
                 ind = compute_indicators_5m(df5)
             except (ValueError, IndexError) as e:
@@ -1142,6 +1210,9 @@ async def scanner_main_loop(
                 on_break = (px >= brk_up) or (px <= brk_dn)
                 if on_break and not pos.freeze_ordinary:
                     pos.freeze_ordinary = True
+                    pos.break_dir = "up" if px >= brk_up else "down"
+                    pos.break_confirm_bars = 0
+                    pos.extension_planned = False
                     o, h, l, c = (float(df5[k].iloc[-1]) for k in ("open","high","low","close"))
                     # «шип»?
                     body = abs(c - o); upper_wick = max(0.0, h - max(o, c)); lower_wick = max(0.0, min(o, c) - l)
@@ -1156,6 +1227,54 @@ async def scanner_main_loop(
                             pos.spike_deadline_ts = time.time() + CONFIG.SPIKE["RETRACE_WINDOW_SEC"]
                             pos.spike_ref_ohlc = (o, h, l, c)
                     await say("📌 Пробой STRAT — обычные усреднения заморожены. Резерв держим на ретест.")
+            
+            # --- Подтверждение пробоя и дорисовка коридора ---
+            if pos and pos.freeze_ordinary:
+                brk_up, brk_dn = break_levels(rng_strat)
+                eps = CONFIG.EXT_AFTER_BREAK["PRICE_EPS"]
+                still_beyond = (px >= brk_up * (1.0 + eps)) if pos.break_dir == "up" else (px <= brk_dn * (1.0 - eps))
+
+                last_idx = df5.index[-1]
+                if isinstance(last_idx, (pd.Timestamp, np.datetime64)):
+                    curr_bar_id = pd.to_datetime(last_idx).floor("5min")
+                elif "time" in ohlc5_df.columns:
+                    curr_bar_id = pd.to_datetime(ohlc5_df["time"].iloc[-1]).floor("5min")
+                else:
+                    curr_bar_id = pd.Timestamp.utcnow().floor("5min")
+
+                last_seen = b.get("break_last_bar_id")
+                if last_seen is None or curr_bar_id != last_seen:
+                    pos.break_confirm_bars = (pos.break_confirm_bars + 1) if still_beyond else 0
+                    b["break_last_bar_id"] = curr_bar_id
+
+                re_up = rng_strat["upper"] * (1.0 + CONFIG.REENTRY_BAND)
+                re_dn = rng_strat["lower"] * (1.0 - CONFIG.REENTRY_BAND)
+                back_inside = (re_dn <= px <= re_up)
+
+                if (not still_beyond) and back_inside and pos.break_confirm_bars == 0:
+                    pos.freeze_ordinary = False
+                    pos.break_dir = None
+                    pos.extension_planned = False
+                    await say("🔄 Пробой не подтвердился — вернулись в STRAT. Разморозил обычные усреднения.")
+
+                if (not pos.extension_planned) and (pos.break_confirm_bars >= CONFIG.EXT_AFTER_BREAK["CONFIRM_BARS_5M"]):
+                    new_targets = await plan_extension_after_break(symbol, pos, rng_strat, rng_tac, px, tick)
+                    if len(new_targets) > len(pos.ordinary_targets):
+                        pos.ordinary_targets = new_targets
+                        pos.extension_planned = True
+                        pos.freeze_ordinary = False
+                        await say("↗️ Пробой подтверждён — расширил коридор и достроил уровни EXT. Возобновляю обычные усреднения.")
+                        try:
+                            await log_event_safely(with_banks({
+                                "Event": "EXT_PLAN", "Event_ID": f"EXT_{pos.signal_id}_{int(time.time())}",
+                                "Timestamp_UTC": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+                                "Pair": symbol, "Side": pos.side, "Signal_ID": pos.signal_id,
+                                "Triggered_Label": "BREAK_CONFIRMED",
+                                "Chat_ID": b.get("chat_id") or "", "Owner_Key": b.get("owner_key") or "",
+                                "FA_Risk": b.get("fa_risk") or "", "FA_Bias": b.get("fa_bias") or "",
+                            }))
+                        except Exception:
+                            log.exception("log EXT_PLAN failed")
 
             # Открытие
             if not pos and (b.get("manual_open") is not None or not manage_only_flag):
@@ -1237,8 +1356,11 @@ async def scanner_main_loop(
                         pos.rebalance_tail_margins_excluding_reserve(alloc_bank)
                         b["position"] = pos
                         b["fsm_state"] = int(FSM.MANAGING)
-
+                        
                         used_ord_after = pos.steps_filled - (1 if pos.reserve_used else 0)
+                        keep_from = max(0, used_ord_after - 1)
+                        pos.ordinary_targets = pos.ordinary_targets[keep_from:]
+
                         nxt = next_pct_target(pos)
                         nxt_txt = "N/A" if not nxt else f"{fmt(nxt['price'])} ({nxt['label']})"
                         cum_margin = _pos_total_margin(pos)
@@ -1259,7 +1381,7 @@ async def scanner_main_loop(
                             f"Цена: <code>{fmt(px)}</code> | <b>{lots_open:.2f} lot</b>\n"
                             f"Депозит (тек): <b>{cum_margin:.2f} USD</b> (шагов: {used_ord_after} из {pos.ord_levels})\n"
                             f"Средняя: <code>{fmt(pos.avg)}</code> | TP: <code>{fmt(pos.tp_price)}</code>\n"
-                            f"ML цена (20%): {ml_arrow}<code>{fmt(ml_price) or 'N/A'}</code> ({dist_txt})\n"
+                            f"ML цена (20%): {ml_arrow}<code>{fmt(ml_price)}</code> ({dist_txt})\n"
                             f"{brk_line}\n"
                             f"След. усреднение: <code>{nxt_txt}</code>\n"
                             f"{margin_line(pos, bank, px, fees_paid_est)}"
@@ -1347,7 +1469,7 @@ async def scanner_main_loop(
                             f"Цена: <code>{fmt(px)}</code> | <b>{lots:.2f} lot</b>\n"
                             f"Добор: <b>{margin:.2f} USD</b> | Депозит (тек): <b>{cum_margin:.2f} USD</b>\n"
                             f"Средняя: <code>{fmt(pos.avg)}</code> | TP: <code>{fmt(pos.tp_price)}</code>\n"
-                            f"ML цена (20%): {ml_arrow}<code>{fmt(ml_price) or 'N/A'}</code> ({dist_txt})\n"
+                            f"ML цена (20%): {ml_arrow}<code>{fmt(ml_price)}</code> ({dist_txt})\n"
                             f"{brk_line}\n"
                             f"След. усреднение: <code>{nxt2_txt}</code>\n"
                             f"Плановый добор: <b>{nxt2_dep_txt}</b> (осталось: {remaining} из {total_ord})\n"
