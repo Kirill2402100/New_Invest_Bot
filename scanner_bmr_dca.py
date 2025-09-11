@@ -247,15 +247,21 @@ ws_cache: dict[str, gspread.Worksheet] = {}
 
 async def _gs_call(func, *args, **kwargs):
     delay = 0.5
+    last_exc = None
     for _ in range(5):
         async with _GS_SEM:
             try:
                 return await maybe_await(func, *args, **kwargs)
             except gspread.exceptions.APIError as e:
-                if "429" in str(e) or "rateLimitExceeded" in str(e):
+                s = str(e)
+                # расширим список временных ошибок
+                if any(x in s for x in ("429", "rateLimitExceeded", "internalError", "backendError", "503")):
+                    last_exc = e
                     await asyncio.sleep(delay); delay *= 2
                     continue
                 raise
+    # если так и не получилось — явно бросаем, чтобы внешняя логика не получила None
+    raise last_exc or RuntimeError("GSheets call failed without explicit error")
 
 async def refresh_targets_from_fund_ws(sh, box=None) -> bool:
     """
@@ -267,6 +273,8 @@ async def refresh_targets_from_fund_ws(sh, box=None) -> bool:
     try:
         ws = await _gs_call(sh.worksheet, TARGET_WS)
         rows = await _gs_call(ws.get_all_records)
+        if not rows:
+            return False
         filter_chat = os.getenv("FUND_ALLOC_CHAT_ID")
         last_alloc = None
         for r in reversed(rows):
@@ -1294,10 +1302,7 @@ async def scanner_main_loop(
                         pos.freeze_ordinary = False
                         used_ord_now = pos.steps_filled - (1 if pos.reserve_used else 0)
                         pos.ordinary_offset = max(0, used_ord_now - 1)
-                        now_ts = time.time()
-                        if now_ts - b.get("break_toggle_ts", 0) >= CONFIG.BREAK_MSG_COOLDOWN_SEC:
-                            b["break_toggle_ts"] = now_ts
-                            await say("↗️ Пробой подтверждён — расширил коридор и достроил уровни EXT. Возобновляю обычные усреднения.")
+                        await say("↗️ Пробой подтверждён — расширил коридор и достроил уровни EXT. Возобновляю обычные усреднения.")
                         try:
                             await log_event_safely(with_banks({
                                 "Event": "EXT_PLAN", "Event_ID": f"EXT_{pos.signal_id}_{int(time.time())}",
