@@ -26,6 +26,9 @@ import trade_executor
 log = logging.getLogger("bmr_dca_engine")
 logging.getLogger("fx_feed").setLevel(logging.WARNING)
 
+# === G-Sheets Concurrency & Retry Control ===
+_GS_SEM = asyncio.Semaphore(int(os.getenv("GS_MAX_CONC", "3")))
+
 # === Мини-TA без внешних зависимостей (EMA/ATR/RSI/ADX/Supertrend) ===
 def _ema(s: pd.Series, length: int) -> pd.Series:
     return s.ewm(span=length, adjust=False, min_periods=length).mean()
@@ -187,6 +190,7 @@ class CONFIG:
     
     # BOOST
     BOOST_MAX_STEPS = 3
+    BREAK_MSG_COOLDOWN_SEC = 45
 
 # ENV-переопределения
 CONFIG.SYMBOL    = os.getenv("FX_SYMBOL", CONFIG.SYMBOL)
@@ -239,8 +243,21 @@ PAIR_LIST = ["USDJPY","AUDUSD","EURUSD","GBPUSD"]
 
 # {"USDJPY": {"value": 1120.0, "ts": "2025-09-09T..."}, ...}
 targets_cache: dict[str, dict] = {}
+ws_cache: dict[str, gspread.Worksheet] = {}
 
-def refresh_targets_from_fund_ws(sh, box=None) -> bool:
+async def _gs_call(func, *args, **kwargs):
+    delay = 0.5
+    for _ in range(5):
+        async with _GS_SEM:
+            try:
+                return await maybe_await(func, *args, **kwargs)
+            except gspread.exceptions.APIError as e:
+                if "429" in str(e) or "rateLimitExceeded" in str(e):
+                    await asyncio.sleep(delay); delay *= 2
+                    continue
+                raise
+
+async def refresh_targets_from_fund_ws(sh, box=None) -> bool:
     """
     Прочитать последнюю строку с action=='alloc' из листа TARGET_WS
     (по умолчанию FUND_BOT), распарсить note как JSON вида:
@@ -248,8 +265,8 @@ def refresh_targets_from_fund_ws(sh, box=None) -> bool:
     и обновить targets_cache (+продублировать в box[ns_key]["bank_target_usdt"]).
     """
     try:
-        ws = sh.worksheet(TARGET_WS)
-        rows = ws.get_all_records()  # [{'ts':..., 'chat_id':..., 'action':..., 'note':...}, ...]
+        ws = await _gs_call(sh.worksheet, TARGET_WS)
+        rows = await _gs_call(ws.get_all_records)
         filter_chat = os.getenv("FUND_ALLOC_CHAT_ID")
         last_alloc = None
         for r in reversed(rows):
@@ -337,59 +354,68 @@ def _norm_symbol(x) -> str:
 
 # ---- SHEETS HELPERS ----
 
-def _ensure_ws(sh, name: str, headers: list[str]):
+async def _gs_append_row(ws, row):
+    await _gs_call(ws.append_row, row, value_input_option="USER_ENTERED")
+
+async def _ensure_ws(sh, name: str, headers: list[str]):
     try:
-        ws = sh.worksheet(name)
+        ws = await _gs_call(sh.worksheet, name)
         # если шапка на листе не совпадает по длине/порядку — перепишем строку 1
-        existing = ws.row_values(1)
+        existing = await _gs_call(ws.row_values, 1)
         if existing != headers:
             rng = f"A1:{rowcol_to_a1(1, len(headers))}"
-            ws.update(rng, [headers])
+            await _gs_call(ws.update, rng, [headers])
         return ws
     except gspread.WorksheetNotFound:
-        ws = sh.add_worksheet(title=name, rows=2000, cols=max(20, len(headers)))
+        ws = await _gs_call(sh.add_worksheet, title=name, rows=2000, cols=max(20, len(headers)))
         if headers:
             rng = f"A1:{rowcol_to_a1(1, len(headers))}"
-            ws.update(rng, [headers])
+            await _gs_call(ws.update, rng, [headers])
         return ws
 
-async def log_event_safely(payload: dict):
+async def ensure_ws_cached(sh, name, headers):
+    ws = ws_cache.get(name)
+    if inspect.iscoroutine(ws):
+        ws = await ws
+        ws_cache[name] = ws
+    if ws is None:
+        ws = await _ensure_ws(sh, name, headers)
+        ws_cache[name] = ws
+    return ws
+
+async def log_event_safely(payload: dict, sh: gspread.Spreadsheet | None = None):
     # Пишем только в лист по символу
     try:
-        creds_json = os.environ.get("GOOGLE_CREDENTIALS")
-        sheet_key  = os.environ.get("SHEET_ID")
-        if not (creds_json and sheet_key):
-            return
+        if sh is None:
+            creds_json = os.environ.get("GOOGLE_CREDENTIALS")
+            sheet_key  = os.environ.get("SHEET_ID")
+            if not (creds_json and sheet_key): return
+            gc = gspread.service_account_from_dict(json.loads(creds_json))
+            sh = gc.open_by_key(sheet_key)
+            
         sym = str(payload.get("Pair") or payload.get("pair") or "").upper()
-        if not sym:
-            return
-        gc = gspread.service_account_from_dict(json.loads(creds_json))
-        sh = gc.open_by_key(sheet_key)
+        if not sym: return
         headers = _get_master_headers(sh)
-        ws2 = _ensure_ws(sh, f"BMR_DCA_{sym}", headers)
-        row = [_clean(payload.get(k)) for k in headers]
-        ws2.append_row(row, value_input_option="USER_ENTERED")
+        ws2 = await ensure_ws_cached(sh, f"BMR_DCA_{sym}", headers)
+        await _gs_append_row(ws2, [_clean(payload.get(k)) for k in headers])
     except Exception:
         log.exception("[SHEETS] per-symbol log failed")
 
 # ---- FA POLICY & WEIGHTS ----
 
-def read_fa_policy(symbol: str) -> dict:
+async def read_fa_policy(symbol: str, sh: gspread.Spreadsheet | None = None) -> dict:
     """Читает политику из листа FA_Signals: pair, risk(Green/Amber/Red), bias(neutral/long-only/short-only),
     ttl (мин), updated_at (ISO). При просрочке TTL возвращает {}.
     """
     try:
-        creds_json = os.environ.get("GOOGLE_CREDENTIALS")
-        sheet_key  = os.environ.get("SHEET_ID")
-        if not (creds_json and sheet_key):
-            return {}
-        gc = gspread.service_account_from_dict(json.loads(creds_json))
-        sh = gc.open_by_key(sheet_key)
-        try:
-            ws = sh.worksheet("FA_Signals")
-        except gspread.WorksheetNotFound:
-            return {}
-        rows = ws.get_all_records()
+        if sh is None:
+            creds_json = os.environ.get("GOOGLE_CREDENTIALS"); sheet_key = os.environ.get("SHEET_ID")
+            if not (creds_json and sheet_key): return {}
+            gc = gspread.service_account_from_dict(json.loads(creds_json))
+            sh = gc.open_by_key(sheet_key)
+            
+        ws = await _gs_call(sh.worksheet, "FA_Signals")
+        rows = await _gs_call(ws.get_all_records)
         for r in rows:
             if str(r.get("pair", "")).upper() == symbol.upper():
                 risk = (str(r.get("risk", "") or "Green").capitalize())
@@ -417,10 +443,12 @@ def read_fa_policy(symbol: str) -> dict:
         log.exception("read_fa_policy failed")
         return {}
 
-def read_fund_bot_weights(sh) -> dict:
+async def read_fund_bot_weights(sh) -> dict:
     try:
-        ws = sh.worksheet("FUND_BOT")
-        rows = ws.get_all_values()
+        ws = await _gs_call(sh.worksheet, "FUND_BOT")
+        rc = ws.row_count
+        start = max(2, rc - 200)
+        rows = await _gs_call(ws.get, f"A{start}:E{rc}")
         if not rows:
             return {}
         # ищем последнюю непустую строку
@@ -992,10 +1020,10 @@ async def scanner_main_loop(
     if sheet:
         try:
             headers = _get_master_headers(sheet)
-            _ensure_ws(sheet, f"BMR_DCA_{symbol}", headers)
+            await _ensure_ws(sheet, f"BMR_DCA_{symbol}", headers)
             # NEW: первичная подтяжка alloc-таргетов из FUND_BOT
             try:
-                refresh_targets_from_fund_ws(sheet, root)
+                await refresh_targets_from_fund_ws(sheet, root)
             except Exception:
                 log.exception("initial refresh_targets_from_fund_ws failed")
         except Exception:
@@ -1012,8 +1040,8 @@ async def scanner_main_loop(
         await broadcast(app, txt, target_chat_id=target_chat_id)
 
     # ФА-политика
-    fa = read_fa_policy(symbol)
-    fund_weights = read_fund_bot_weights(sheet) if sheet else {}
+    fa = await read_fa_policy(symbol, sheet)
+    fund_weights = await read_fund_bot_weights(sheet) if sheet else {}
     last_fa_read = 0.0
     last_targets_read = 0.0
 
@@ -1052,9 +1080,9 @@ async def scanner_main_loop(
 
             # периодически перечитываем ФА и таргеты
             if now - last_fa_read > CONFIG.FA_REFRESH_SEC:
-                fa = read_fa_policy(symbol)
+                fa = await read_fa_policy(symbol, sheet)
                 if sheet:
-                    fund_weights = read_fund_bot_weights(sheet)
+                    fund_weights = await read_fund_bot_weights(sheet)
                 last_fa_read = now
 
                 # тихое окно от фунд-бота
@@ -1064,7 +1092,7 @@ async def scanner_main_loop(
 
             if sheet and (now - last_targets_read > 180):  # ~3 минуты
                 try:
-                    refreshed = refresh_targets_from_fund_ws(sheet, root)
+                    refreshed = await refresh_targets_from_fund_ws(sheet, root)
                     if refreshed:
                         log.info("FUND_BOT targets refreshed.")
                 except Exception:
@@ -1202,7 +1230,7 @@ async def scanner_main_loop(
                     "Time_In_Trade_min": time_min,
                     "Chat_ID": b.get("chat_id") or "", "Owner_Key": b.get("owner_key") or "",
                     "FA_Risk": b.get("fa_risk") or "", "FA_Bias": b.get("fa_bias") or "",
-                }))
+                }), sheet)
                 b["force_close"] = False
                 pos.last_sl_notified_price = None
                 b["position"] = None
@@ -1214,26 +1242,17 @@ async def scanner_main_loop(
                 if not pos or b.get("fsm_state") != int(FSM.MANAGING) or pos.steps_filled <= 0:
                     await asyncio.sleep(1); continue
                 brk_up, brk_dn = break_levels(rng_strat)
-                on_break = (px >= brk_up) or (px <= brk_dn)
+                eps = CONFIG.EXT_AFTER_BREAK["PRICE_EPS"]
+                on_break = (px >= brk_up * (1.0 + eps)) or (px <= brk_dn * (1.0 - eps))
                 if on_break and not pos.freeze_ordinary:
                     pos.freeze_ordinary = True
                     pos.break_dir = "up" if px >= brk_up else "down"
                     pos.break_confirm_bars = 0
                     pos.extension_planned = False
-                    o, h, l, c = (float(df5[k].iloc[-1]) for k in ("open","high","low","close"))
-                    # «шип»?
-                    body = abs(c - o); upper_wick = max(0.0, h - max(o, c)); lower_wick = max(0.0, min(o, c) - l)
-                    rng_len = max(1e-12, h - l)
-                    pos.spike_flag = False; pos.spike_direction = None; pos.spike_deadline_ts = None; pos.spike_ref_ohlc = None
-                    if abs(ind["vol_z"]) >= CONFIG.SPIKE["VOLZ_THR"] and rng_len >= CONFIG.SPIKE["ATR_MULT"] * max(ind["atr5m"],1e-12):
-                        if lower_wick >= CONFIG.SPIKE["WICK_RATIO"] * body:
-                            pos.spike_flag = True; pos.spike_direction = "down"
-                        elif upper_wick >= CONFIG.SPIKE["WICK_RATIO"] * body:
-                            pos.spike_flag = True; pos.spike_direction = "up"
-                        if pos.spike_flag:
-                            pos.spike_deadline_ts = time.time() + CONFIG.SPIKE["RETRACE_WINDOW_SEC"]
-                            pos.spike_ref_ohlc = (o, h, l, c)
-                    await say("📌 Пробой STRAT — обычные усреднения заморожены. Резерв держим на ретест.")
+                    now_ts = time.time()
+                    if now_ts - b.get("break_toggle_ts", 0) >= CONFIG.BREAK_MSG_COOLDOWN_SEC:
+                        b["break_toggle_ts"] = now_ts
+                        await say("📌 Пробой STRAT — обычные усреднения заморожены. Резерв держим на ретест.")
             
             # --- Подтверждение пробоя и дорисовка коридора ---
             if pos and pos.freeze_ordinary:
@@ -1262,7 +1281,10 @@ async def scanner_main_loop(
                     pos.freeze_ordinary = False
                     pos.break_dir = None
                     pos.extension_planned = False
-                    await say("🔄 Пробой не подтвердился — вернулись в STRAT. Разморозил обычные усреднения.")
+                    now_ts = time.time()
+                    if now_ts - b.get("break_toggle_ts", 0) >= CONFIG.BREAK_MSG_COOLDOWN_SEC:
+                        b["break_toggle_ts"] = now_ts
+                        await say("🔄 Пробой не подтвердился — вернулись в STRAT. Разморозил обычные усреднения.")
 
                 if (not pos.extension_planned) and (pos.break_confirm_bars >= CONFIG.EXT_AFTER_BREAK["CONFIRM_BARS_5M"]):
                     new_targets = await plan_extension_after_break(symbol, pos, rng_strat, rng_tac, px, tick)
@@ -1272,7 +1294,10 @@ async def scanner_main_loop(
                         pos.freeze_ordinary = False
                         used_ord_now = pos.steps_filled - (1 if pos.reserve_used else 0)
                         pos.ordinary_offset = max(0, used_ord_now - 1)
-                        await say("↗️ Пробой подтверждён — расширил коридор и достроил уровни EXT. Возобновляю обычные усреднения.")
+                        now_ts = time.time()
+                        if now_ts - b.get("break_toggle_ts", 0) >= CONFIG.BREAK_MSG_COOLDOWN_SEC:
+                            b["break_toggle_ts"] = now_ts
+                            await say("↗️ Пробой подтверждён — расширил коридор и достроил уровни EXT. Возобновляю обычные усреднения.")
                         try:
                             await log_event_safely(with_banks({
                                 "Event": "EXT_PLAN", "Event_ID": f"EXT_{pos.signal_id}_{int(time.time())}",
@@ -1281,7 +1306,7 @@ async def scanner_main_loop(
                                 "Triggered_Label": "BREAK_CONFIRMED",
                                 "Chat_ID": b.get("chat_id") or "", "Owner_Key": b.get("owner_key") or "",
                                 "FA_Risk": b.get("fa_risk") or "", "FA_Bias": b.get("fa_bias") or "",
-                            }))
+                            }), sheet)
                         except Exception:
                             log.exception("log EXT_PLAN failed")
 
@@ -1408,7 +1433,7 @@ async def scanner_main_loop(
                             "Range_Lower": rng_strat["lower"], "Range_Upper": rng_strat["upper"], "Range_Width": rng_strat["width"],
                             "Chat_ID": b.get("chat_id") or "", "Owner_Key": b.get("owner_key") or "",
                             "FA_Risk": b.get("fa_risk") or "", "FA_Bias": b.get("fa_bias") or "",
-                        }))
+                        }), sheet)
                         continue
 
                     pos.ordinary_targets = compute_corridor_targets(entry=px, side=pos.side,
@@ -1504,7 +1529,7 @@ async def scanner_main_loop(
                             "Range_Lower": rng_strat["lower"], "Range_Upper": rng_strat["upper"], "Range_Width": rng_strat["width"],
                             "Chat_ID": b.get("chat_id") or "", "Owner_Key": b.get("owner_key") or "",
                             "FA_Risk": b.get("fa_risk") or "", "FA_Bias": b.get("fa_bias") or "",
-                        }))
+                        }), sheet)
                         if is_open_event:
                             b["fsm_state"] = int(FSM.MANAGING) # Переключаем после первого сообщения
 
@@ -1543,7 +1568,7 @@ async def scanner_main_loop(
                                     "SL_Price": pos.sl_price, "Avg_Price": pos.avg, "Trail_Stage": stage_idx + 1,
                                     "Chat_ID": b.get("chat_id") or "", "Owner_Key": b.get("owner_key") or "",
                                     "FA_Risk": b.get("fa_risk") or "", "FA_Bias": b.get("fa_bias") or "",
-                                }))
+                                }), sheet)
                     
                     tp_hit = (pos.side == "LONG" and px >= pos.tp_price) or (pos.side == "SHORT" and px <= pos.tp_price)
                     sl_hit = pos.sl_price and (
@@ -1570,7 +1595,7 @@ async def scanner_main_loop(
                             "Time_In_Trade_min": time_min, "ATR_5m": atr_now,
                             "Chat_ID": b.get("chat_id") or "", "Owner_Key": b.get("owner_key") or "",
                             "FA_Risk": b.get("fa_risk") or "", "FA_Bias": b.get("fa_bias") or "",
-                        }))
+                        }), sheet)
                         pos.last_sl_notified_price = None
                         b["position"] = None
                         b["fsm_state"] = int(FSM.IDLE)
