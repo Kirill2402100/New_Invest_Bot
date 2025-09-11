@@ -184,6 +184,9 @@ class CONFIG:
         "ATR_MULT_MIN": 2.0,      # минимальная ширина экстеншена в ATR
         "PRICE_EPS": 0.0015,      # небольшой буфер от уровня пробоя
     }
+    
+    # BOOST
+    BOOST_MAX_STEPS = 3
 
 # ENV-переопределения
 CONFIG.SYMBOL    = os.getenv("FX_SYMBOL", CONFIG.SYMBOL)
@@ -645,17 +648,17 @@ def merge_targets_sorted(side: str, tick: float, entry: float, targets: list[dic
     dedup = []
     min_gap = tick * CONFIG.DCA_MIN_GAP_TICKS
     for t in targets:
-        if not dedup or abs(t["price"] - dedup[-1]["price"]) >= min_gap:
+        if not dedup or (side == "SHORT" and t["price"] >= dedup[-1]["price"] + min_gap) or \
+           (side == "LONG"  and t["price"] <= dedup[-1]["price"] - min_gap):
             dedup.append(t)
     return dedup
 
 def next_pct_target(pos):
     if not getattr(pos, "ordinary_targets", None):
         return None
-    # шагов обычных, включая OPEN
     used_ord_incl_open = pos.steps_filled - (1 if pos.reserve_used else 0)
-    # следующий уровень в ordinary_targets имеет индекс на 1 меньше
-    idx = used_ord_incl_open - 1
+    base = getattr(pos, "ordinary_offset", 0)
+    idx = used_ord_incl_open - 1 - base
     return pos.ordinary_targets[idx] if 0 <= idx < len(pos.ordinary_targets) else None
 
 def choose_growth(ind: dict, rng_strat: dict, rng_tac: dict) -> float:
@@ -733,7 +736,10 @@ async def plan_extension_after_break(symbol: str, pos: "Position",
         return pos.ordinary_targets
 
     # Сохраняем уже пройденные цели (кол-во = used_ord-1; OPEN съедает «нулевой» шаг)
-    already = pos.ordinary_targets[:max(0, used_ord - 1)]
+    base = getattr(pos, "ordinary_offset", 0)
+    already_rel = max(0, min(len(pos.ordinary_targets), (used_ord - 1) - base))
+    already = pos.ordinary_targets[:already_rel]
+    
     new_labels = [f"EXT {int(round((i + 1) / len(seg) * 100))}%" for i in range(len(seg))]
     ext_targets = [{"price": p, "label": lab} for p, lab in zip(seg, new_labels)]
 
@@ -839,6 +845,7 @@ class Position:
         self.break_dir: str | None = None
         self.break_confirm_bars: int = 0
         self.extension_planned: bool = False
+        self.ordinary_offset: int = 0
 
     def plan_with_reserve(self, bank: float, growth: float, ord_levels: int):
         self.growth = growth
@@ -1263,6 +1270,8 @@ async def scanner_main_loop(
                         pos.ordinary_targets = new_targets
                         pos.extension_planned = True
                         pos.freeze_ordinary = False
+                        used_ord_now = pos.steps_filled - (1 if pos.reserve_used else 0)
+                        pos.ordinary_offset = max(0, used_ord_now - 1)
                         await say("↗️ Пробой подтверждён — расширил коридор и достроил уровни EXT. Возобновляю обычные усреднения.")
                         try:
                             await log_event_safely(with_banks({
@@ -1341,13 +1350,13 @@ async def scanner_main_loop(
                         full_targets = [
                             {"price": px,    "label": "TAC 33%"},
                             {"price": px,    "label": "TAC 67%"},
-                            {"price": px,    "label": "STRAT 33%"},
-                            {"price": px,    "label": "STRAT 67%"},
+                            {"price": seg[0], "label": "STRAT 33%"},
+                            {"price": seg[1] if len(seg) > 1 else seg[-1], "label": "STRAT 67%"},
                             {"price": seg[-1],"label": "STRAT 100%"},
                         ]
                         pos.ordinary_targets = full_targets[:min(len(full_targets), max(1, pos.ord_levels - 1))]
                         
-                        target_used_steps = min(5, pos.ord_levels)
+                        target_used_steps = min(CONFIG.BOOST_MAX_STEPS, pos.ord_levels)
                         cum_margin_added = 0.0
                         for _ in range(target_used_steps):
                             m, _ = pos.add_step(px)
@@ -1360,6 +1369,7 @@ async def scanner_main_loop(
                         used_ord_after = pos.steps_filled - (1 if pos.reserve_used else 0)
                         keep_from = max(0, used_ord_after - 1)
                         pos.ordinary_targets = pos.ordinary_targets[keep_from:]
+                        pos.ordinary_offset = getattr(pos, "ordinary_offset", 0) + keep_from
 
                         nxt = next_pct_target(pos)
                         nxt_txt = "N/A" if not nxt else f"{fmt(nxt['price'])} ({nxt['label']})"
@@ -1375,9 +1385,10 @@ async def scanner_main_loop(
                         brk_up, brk_dn = break_levels(rng_strat)
                         brk_up_pct, brk_dn_pct = break_distance_pcts(px, brk_up, brk_dn)
                         brk_line = f"Пробой: ↑<code>{fmt(brk_up)}</code> ({brk_up_pct:.2f}%) | ↓<code>{fmt(brk_dn)}</code> ({brk_dn_pct:.2f}%)"
+                        boost_label = f"BOOST x{target_used_steps}"
 
                         await say(
-                            f"▶️ OPEN [BOOST → STRAT 67%]\n"
+                            f"▶️ OPEN [{boost_label}]\n"
                             f"Цена: <code>{fmt(px)}</code> | <b>{lots_open:.2f} lot</b>\n"
                             f"Депозит (тек): <b>{cum_margin:.2f} USD</b> (шагов: {used_ord_after} из {pos.ord_levels})\n"
                             f"Средняя: <code>{fmt(pos.avg)}</code> | TP: <code>{fmt(pos.tp_price)}</code>\n"
@@ -1392,7 +1403,7 @@ async def scanner_main_loop(
                             "Pair": symbol, "Side": pos.side, "Event": "OPEN_BOOST",
                             "Step_No": pos.steps_filled, "Cum_Margin_USDT": cum_margin, "Entry_Price": px, "Avg_Price": pos.avg,
                             "Liq_Est_Price": ml_price, "Next_DCA_Price": (nxt and nxt['price']) or "", "Next_DCA_Label": (nxt and nxt['label']) or "",
-                            "Triggered_Label": "BOOST→STRAT 67%", "Fee_Rate_Taker": fee_taker, "ATR_5m": ind["atr5m"], "ATR_1h": rng_strat["atr1h"],
+                            "Triggered_Label": boost_label, "Fee_Rate_Taker": fee_taker, "ATR_5m": ind["atr5m"], "ATR_1h": rng_strat["atr1h"],
                             "RSI_5m": ind["rsi"], "ADX_5m": ind["adx"], "Supertrend": ind["supertrend"], "Vol_z": ind["vol_z"],
                             "Range_Lower": rng_strat["lower"], "Range_Upper": rng_strat["upper"], "Range_Width": rng_strat["width"],
                             "Chat_ID": b.get("chat_id") or "", "Owner_Key": b.get("owner_key") or "",
@@ -1402,6 +1413,7 @@ async def scanner_main_loop(
 
                     pos.ordinary_targets = compute_corridor_targets(entry=px, side=pos.side,
                                                                     rng_strat=rng_strat, rng_tac=rng_tac, tick=tick)
+                    pos.ordinary_offset = 0
                     margin, _ = pos.add_step(px)
                     pos.rebalance_tail_margins_excluding_reserve(alloc_bank)
                     b["position"] = pos
@@ -1431,8 +1443,9 @@ async def scanner_main_loop(
                         used_ord_after = pos.steps_filled - (1 if pos.reserve_used else 0)
                         used_dca = max(0, used_ord_after - 1)
                         nxt2 = next_pct_target(pos)
-                        total_ord = max(0, min(pos.ord_levels - 1, len(pos.ordinary_targets)))
-                        remaining = max(0, total_ord - used_dca)
+                        base = getattr(pos, "ordinary_offset", 0)
+                        total_ord = max(0, min(pos.ord_levels - 1 - base, len(pos.ordinary_targets)))
+                        remaining = max(0, total_ord - max(0, used_dca - base))
                         next_idx = used_ord_after
                         nxt2_margin = pos.step_margins[next_idx] if next_idx < len(pos.step_margins) else None
                         
