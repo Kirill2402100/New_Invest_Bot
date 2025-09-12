@@ -182,10 +182,10 @@ class CONFIG:
 
     # Расширение коридора после пробоя
     EXT_AFTER_BREAK = {
-        "CONFIRM_BARS_5M": 6,     # сколько 5m-баров нужно удержаться за STRAT
+        "CONFIRM_BARS_5M": 6,   # сколько 5m-баров нужно удержаться за STRAT
         "EXTRA_LOOKBACK_DAYS": 10, # доп. история для «нового потолка/пола» (на TF_RANGE)
-        "ATR_MULT_MIN": 2.0,      # минимальная ширина экстеншена в ATR
-        "PRICE_EPS": 0.0015,      # небольшой буфер от уровня пробоя
+        "ATR_MULT_MIN": 2.0,    # минимальная ширина экстеншена в ATR
+        "PRICE_EPS": 0.0015,     # небольшой буфер от уровня пробоя
     }
     
     # BOOST
@@ -412,8 +412,9 @@ async def log_event_safely(payload: dict, sh: gspread.Spreadsheet | None = None)
 # ---- FA POLICY & WEIGHTS ----
 
 async def read_fa_policy(symbol: str, sh: gspread.Spreadsheet | None = None) -> dict:
-    """Читает политику из листа FA_Signals: pair, risk(Green/Amber/Red), bias(neutral/long-only/short-only),
-    ttl (мин), updated_at (ISO). При просрочке TTL возвращает {}.
+    """Читает политику из листа FA_Signals:
+    pair, risk(Green/Amber/Red), bias(neutral/long-only/short-only), ttl (мин), updated_at (ISO),
+    scan_lock_until, reserve_off, dca_scale, reason. При просрочке TTL возвращает {}.
     """
     try:
         if sh is None:
@@ -440,11 +441,13 @@ async def read_fa_policy(symbol: str, sh: gspread.Spreadsheet | None = None) -> 
                 
                 scan_lock_until = str(r.get("scan_lock_until") or "").strip()
                 reserve_off = str(r.get("reserve_off") or "").strip().lower() in ("1","true","yes","on")
-                try: dca_scale = float(r.get("dca_scale") or 1.0)
+                try:
+                    dca_scale = float(r.get("dca_scale") or 1.0)
                 except: dca_scale = 1.0
                 return {
-                   "risk": risk, "bias": bias, "ttl": ttl, "updated_at": updated_at,
-                   "scan_lock_until": scan_lock_until, "reserve_off": reserve_off, "dca_scale": dca_scale
+                    "risk": risk, "bias": bias, "ttl": ttl, "updated_at": updated_at,
+                    "scan_lock_until": scan_lock_until, "reserve_off": reserve_off, "dca_scale": dca_scale,
+                    "reason": str(r.get("reason","")).strip()
                 }
         return {}
     except Exception:
@@ -653,12 +656,12 @@ def compute_corridor_targets(entry: float, side: str, rng_strat: dict, rng_tac: 
     Если места мало — количество автоматически сокращается.
     """
     if side == "LONG":
-        tac_b   = min(entry, rng_tac["lower"])
+        tac_b    = min(entry, rng_tac["lower"])
         strat_b = min(entry, rng_strat["lower"])
         seg1 = _place_segment(entry, tac_b,   2, tick, include_end_last=False)
         seg2 = _place_segment(tac_b, strat_b, 3, tick, include_end_last=True)
     else:  # SHORT
-        tac_b   = max(entry, rng_tac["upper"])
+        tac_b    = max(entry, rng_tac["upper"])
         strat_b = max(entry, rng_strat["upper"])
         seg1 = _place_segment(entry, tac_b,   2, tick, include_end_last=False)
         seg2 = _place_segment(tac_b, strat_b, 3, tick, include_end_last=True)
@@ -721,8 +724,8 @@ def _is_df_fresh(df: pd.DataFrame, max_age_min: int = 15) -> bool:
         return True
 
 async def plan_extension_after_break(symbol: str, pos: "Position",
-                                     rng_strat: dict, rng_tac: dict,
-                                     px: float, tick: float) -> list[dict]:
+                                         rng_strat: dict, rng_tac: dict,
+                                         px: float, tick: float) -> list[dict]:
     """
     Дорисовывает оставшиеся обычные уровни после подтверждённого пробоя STRAT.
     Не трогает уже 'израсходованные' цели. Возвращает новый список ordinary_targets.
@@ -757,7 +760,7 @@ async def plan_extension_after_break(symbol: str, pos: "Position",
         ]
         end = max([v for v in candidates if np.isfinite(v)])
         start = px
-    else:                      # LONG: пробой вниз, строим ПОДАЛЬШЕ вниз
+    else:                         # LONG: пробой вниз, строим ПОДАЛЬШЕ вниз
         candidates = [
             px - atr_guard,
             rng_strat["lower"],
@@ -841,9 +844,9 @@ def compute_indicators_5m(df: pd.DataFrame) -> dict:
     }
 
 class FSM(IntEnum):
-    IDLE = 0      # нет позиции
-    OPENED = 1    # открыт 1-й шаг, идёт первичное оповещение
-    MANAGING = 2  # можно ADD/RETEST/TRAIL/EXIT
+    IDLE = 0     # нет позиции
+    OPENED = 1   # открыт 1-й шаг, идёт первичное оповещение
+    MANAGING = 2 # можно ADD/RETEST/TRAIL/EXIT
 
 # ---------------------------------------------------------------------------
 # Состояние позиции
@@ -1098,6 +1101,60 @@ async def scanner_main_loop(
                 b["fa_scan_lock"] = bool(scan_until and pd.Timestamp.now(tz="UTC") < scan_until)
                 b["fa_scan_until_ts"] = float(scan_until.timestamp()) if scan_until is not None else None
 
+                # --- детекция изменения FA и оповещение/логирование ---
+                prev = (
+                    b.get("fa_risk"),
+                    b.get("fa_bias"),
+                    b.get("fa_dca_scale"),
+                    b.get("fa_reserve_off"),
+                    b.get("fa_scan_until_iso"),
+                )
+
+                # записываем свежие значения в box
+                b["fa_risk"] = (fa.get("risk") or "Green").capitalize()
+                b["fa_bias"] = (fa.get("bias") or "neutral").lower()
+                b["fa_dca_scale"] = float(fa.get("dca_scale") or 1.0)
+                b["fa_reserve_off"] = bool(fa.get("reserve_off"))
+                b["fa_scan_until_iso"] = fa.get("scan_lock_until") or ""
+                b["fa_reason"] = (fa.get("reason") or "").strip()
+
+                changed = prev != (
+                    b["fa_risk"], b["fa_bias"], b["fa_dca_scale"], b["fa_reserve_off"], b["fa_scan_until_iso"]
+                )
+
+                if changed:
+                    # 1) короткое уведомление в канал
+                    emoji = {"Green":"✅","Amber":"🟡","Red":"🛑"}.get(b["fa_risk"], "✅")
+                    lock_txt = ""
+                    if b["fa_scan_until_iso"]:
+                        try:
+                            hhmm = pd.to_datetime(b["fa_scan_until_iso"], utc=True).strftime("%H:%M")
+                            lock_txt = f"\n• тихое окно до {hhmm} (UTC)"
+                        except Exception:
+                            pass
+                    dca_txt = ""
+                    if b["fa_dca_scale"] < 1.0:
+                        dca_txt = f"\n• dca_scale={b['fa_dca_scale']:.2f}"
+                    res_txt = " (резерв отключён)" if b["fa_reserve_off"] else ""
+                    rsn_txt = f"\n• reason: {b['fa_reason']}" if b.get("fa_reason") else ""
+
+                    await say(
+                        f"🔔 Обновлён FA-статус по <b>{symbol}</b> → {emoji} <b>{b['fa_risk']}</b>{res_txt}\n"
+                        f"• bias: <b>{b['fa_bias']}</b>{dca_txt}{lock_txt}{rsn_txt}"
+                    )
+
+                    # 2) «маячок» в BMR_DCA_<SYM>, чтобы FA_Risk/FA_Bias были актуальны в логах
+                    try:
+                        await log_event_safely(with_banks({
+                            "Event": "FA_STATUS",
+                            "Event_ID": f"FA_{symbol}_{int(time.time())}",
+                            "Timestamp_UTC": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+                            "Pair": symbol, "FA_Risk": b["fa_risk"], "FA_Bias": b["fa_bias"],
+                            "Chat_ID": b.get("chat_id") or "", "Owner_Key": b.get("owner_key") or "",
+                        }), sheet)
+                    except Exception:
+                        log.exception("log_event_safely(FA_STATUS) failed")
+
             if sheet and (now - last_targets_read > 180):  # ~3 минуты
                 try:
                     refreshed = await refresh_targets_from_fund_ws(sheet, root)
@@ -1108,11 +1165,9 @@ async def scanner_main_loop(
                 last_targets_read = now
 
             # применяем FA: risk Red -> управляем, но не открываем; Amber -> консервативней
-            fa_risk = (fa.get("risk") or "Green").capitalize()
-            fa_bias = (fa.get("bias") or "neutral").lower()
-            b["fa_risk"] = fa_risk # hook
-            b["fa_bias"] = fa_bias # hook
-            
+            fa_risk = b.get("fa_risk", (fa.get("risk") or "Green").capitalize())
+            fa_bias = b.get("fa_bias", (fa.get("bias") or "neutral").lower())
+
             # --- вес из FUND_BOT (для политики), но банк пары не масштабируем по умолчанию
             weight = target_weight_for_pair(symbol, fund_weights)
             SCALE_BANK_BY_WEIGHTS = os.getenv("SCALE_BANK_BY_WEIGHTS", "0").lower() in ("1","true","yes","on")
@@ -1134,7 +1189,7 @@ async def scanner_main_loop(
                     log.info(f"[RANGE-STRAT] lower={fmt(rng_strat['lower'])} upper={fmt(rng_strat['upper'])} width={fmt(rng_strat['width'])}")
                 if need_build_tac and t:
                     rng_tac = t; last_build_tac = now; b["intro_done"] = False
-                    log.info(f"[RANGE-TAC]   lower={fmt(rng_tac['lower'])} upper={fmt(rng_tac['upper'])} width={fmt(rng_tac['width'])}")
+                    log.info(f"[RANGE-TAC]    lower={fmt(rng_tac['lower'])} upper={fmt(rng_tac['upper'])} width={fmt(rng_tac['width'])}")
 
             if not (rng_strat and rng_tac):
                 log.error("Range is not available. Cannot proceed.")
@@ -1261,7 +1316,7 @@ async def scanner_main_loop(
                     if now_ts - b.get("break_toggle_ts", 0) >= CONFIG.BREAK_MSG_COOLDOWN_SEC:
                         b["break_toggle_ts"] = now_ts
                         await say("📌 Пробой STRAT — обычные усреднения заморожены. Резерв держим на ретест.")
-            
+                
             # --- Подтверждение пробоя и дорисовка коридора ---
             if pos and pos.freeze_ordinary:
                 brk_up, brk_dn = break_levels(rng_strat)
@@ -1378,8 +1433,8 @@ async def scanner_main_loop(
                             seg = [end]
 
                         full_targets = [
-                            {"price": px,    "label": "TAC 33%"},
-                            {"price": px,    "label": "TAC 67%"},
+                            {"price": px,   "label": "TAC 33%"},
+                            {"price": px,   "label": "TAC 67%"},
                             {"price": seg[0], "label": "STRAT 33%"},
                             {"price": seg[1] if len(seg) > 1 else seg[-1], "label": "STRAT 67%"},
                             {"price": seg[-1],"label": "STRAT 100%"},
@@ -1574,7 +1629,7 @@ async def scanner_main_loop(
                                     "Chat_ID": b.get("chat_id") or "", "Owner_Key": b.get("owner_key") or "",
                                     "FA_Risk": b.get("fa_risk") or "", "FA_Bias": b.get("fa_bias") or "",
                                 }), sheet)
-                    
+                        
                     tp_hit = (pos.side == "LONG" and px >= pos.tp_price) or (pos.side == "SHORT" and px <= pos.tp_price)
                     sl_hit = pos.sl_price and (
                         (pos.side == "LONG" and px <= pos.sl_price) or (pos.side == "SHORT" and px >= pos.sl_price)
