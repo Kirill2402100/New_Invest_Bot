@@ -26,6 +26,29 @@ import trade_executor
 log = logging.getLogger("bmr_dca_engine")
 logging.getLogger("fx_feed").setLevel(logging.WARNING)
 
+# --- Status snapshot helper (для /status)
+def _update_status_snapshot(box: dict, *, symbol: str, bank_fact: float, bank_target: float,
+                            pos, scan_paused: bool, rng_strat, rng_tac):
+    state = "ПАУЗА" if scan_paused else "РАБОТАЕТ"
+    pos_line = "Нет активной позиции."
+    if pos and getattr(pos, "steps_filled", 0) > 0:
+        pos_line = f"{pos.side} steps {pos.steps_filled}/{pos.max_steps} | avg={fmt(pos.avg)} | tp={fmt(pos.tp_price)}"
+    # значения, которые может читать обработчик /status
+    box["status_snapshot"] = {
+        "symbol": symbol,
+        "state": state,
+        "bank_fact_usdt": float(bank_fact),
+        "bank_target_usdt": float(bank_target),
+        "has_ranges": bool(rng_strat and rng_tac),
+        "ts": time.time(),
+    }
+    box["status_line"] = (
+        f"Состояние ({symbol})\n"
+        f"Сканер: {state}\n"
+        f"Банк (факт/план): {bank_fact:.2f} / {bank_target:.2f} USD\n"
+        f"Позиция: {pos_line}"
+    )
+
 # === G-Sheets Concurrency & Retry Control ===
 _GS_SEM = asyncio.Semaphore(int(os.getenv("GS_MAX_CONC", "3")))
 
@@ -193,7 +216,7 @@ class CONFIG:
     BREAK_MSG_COOLDOWN_SEC = 45
 
 # ENV-переопределения
-CONFIG.SYMBOL    = os.getenv("FX_SYMBOL", CONFIG.SYMBOL)
+CONFIG.SYMBOL   = os.getenv("FX_SYMBOL", CONFIG.SYMBOL)
 CONFIG.TF_ENTRY = os.getenv("TF_ENTRY", CONFIG.TF_ENTRY)
 CONFIG.TF_RANGE = os.getenv("TF_RANGE", os.getenv("TF_TREND", CONFIG.TF_RANGE))
 
@@ -760,7 +783,7 @@ async def plan_extension_after_break(symbol: str, pos: "Position",
         ]
         end = max([v for v in candidates if np.isfinite(v)])
         start = px
-    else:                         # LONG: пробой вниз, строим ПОДАЛЬШЕ вниз
+    else:                                 # LONG: пробой вниз, строим ПОДАЛЬШЕ вниз
         candidates = [
             px - atr_guard,
             rng_strat["lower"],
@@ -844,8 +867,8 @@ def compute_indicators_5m(df: pd.DataFrame) -> dict:
     }
 
 class FSM(IntEnum):
-    IDLE = 0     # нет позиции
-    OPENED = 1   # открыт 1-й шаг, идёт первичное оповещение
+    IDLE = 0    # нет позиции
+    OPENED = 1  # открыт 1-й шаг, идёт первичное оповещение
     MANAGING = 2 # можно ADD/RETEST/TRAIL/EXIT
 
 # ---------------------------------------------------------------------------
@@ -1000,11 +1023,11 @@ async def scanner_main_loop(
     symbol = _norm_symbol(symbol_override or CONFIG.SYMBOL)
     ns_key = f"{symbol}|{target_chat_id or 'default'}"
     
-    b = root.setdefault(ns_key, {})       # <- у каждого символа/чата свой карман
+    b = root.setdefault(ns_key, {})      # <- у каждого символа/чата свой карман
     b.setdefault("position", None)
     b.setdefault("fsm_state", int(FSM.IDLE))
     b.setdefault("intro_done", False)
-    b["owner_key"] = ns_key               # полезно видеть в логах
+    b["owner_key"] = ns_key              # полезно видеть в логах
     b["chat_id"]   = target_chat_id
 
     # Google Sheets (необязательно)
@@ -1078,6 +1101,8 @@ async def scanner_main_loop(
             # Синхронизируем в box — чтобы with_banks() всегда брал консистентные значения
             b["bank_target_usdt"] = bank_target
             b["safety_bank_usdt"] = bank
+            # для обратной совместимости со старым /status
+            b["status_bank"] = {"fact": bank, "target": bank_target}
             
             fee_maker = float(b.get("fee_maker", CONFIG.FEE_MAKER))
             fee_taker = float(b.get("fee_taker", CONFIG.FEE_TAKER))
@@ -1186,21 +1211,42 @@ async def scanner_main_loop(
                 s, t = await build_ranges(symbol)
                 if need_build_strat and s:
                     rng_strat = s; last_build_strat = now; b["intro_done"] = False
+                    b["rng_strat_cache"] = s
                     log.info(f"[RANGE-STRAT] lower={fmt(rng_strat['lower'])} upper={fmt(rng_strat['upper'])} width={fmt(rng_strat['width'])}")
                 if need_build_tac and t:
                     rng_tac = t; last_build_tac = now; b["intro_done"] = False
+                    b["rng_tac_cache"] = t
                     log.info(f"[RANGE-TAC]    lower={fmt(rng_tac['lower'])} upper={fmt(rng_tac['upper'])} width={fmt(rng_tac['width'])}")
 
+            # Если нет диапазонов — попробуем взять кеш и, при неудаче, сообщим «нет данных — пауза»
             if not (rng_strat and rng_tac):
-                log.error("Range is not available. Cannot proceed.")
-                await asyncio.sleep(10); continue
+                rng_strat = rng_strat or b.get("rng_strat_cache")
+                rng_tac   = rng_tac   or b.get("rng_tac_cache")
+                if not (rng_strat and rng_tac):
+                    paused_msg_cool = 3600  # не чаще 1 раза в час
+                    if time.time() - b.get("stale_notice_ts", 0) > paused_msg_cool:
+                        await say("⏸ Нет данных — пауза. Нет свежих котировок/диапазонов, сканер на паузе до открытия рынка.")
+                        b["stale_notice_ts"] = time.time()
+                    b["scan_paused"] = True
+                    _update_status_snapshot(b, symbol=symbol, bank_fact=bank, bank_target=bank_target,
+                                            pos=b.get("position"), scan_paused=True,
+                                            rng_strat=None, rng_tac=None)
+                    await asyncio.sleep(30)
+                    continue
 
             # 5m данные — ограничим кол-во баров
             bars_needed = max(60, CONFIG.VOL_WIN + CONFIG.ADX_LEN + 20)
             ohlc5_df = await maybe_await(fetch_ohlcv_yf, symbol, CONFIG.TF_ENTRY, bars_needed)
             if ohlc5_df is None or ohlc5_df.empty:
-                log.warning("Could not fetch 5m OHLCV data. Skipping this cycle.")
-                await asyncio.sleep(2); continue
+                log.warning("Could not fetch 5m OHLCV data. Pausing.")
+                if time.time() - b.get("stale_notice_ts", 0) > 3600:
+                    await say("⏸ Нет данных — пауза. Нет свежих котировок (5m).")
+                    b["stale_notice_ts"] = time.time()
+                b["scan_paused"] = True
+                _update_status_snapshot(b, symbol=symbol, bank_fact=bank, bank_target=bank_target,
+                                        pos=b.get("position"), scan_paused=True,
+                                        rng_strat=rng_strat, rng_tac=rng_tac)
+                await asyncio.sleep(30); continue
 
             fa_ts = b.get("fa_scan_until_ts")
             if fa_ts is not None and time.time() < fa_ts:
@@ -1267,6 +1313,11 @@ async def scanner_main_loop(
                     )
                 )
                 b["intro_done"] = True
+
+            # Обновляем снапшот статуса на каждом цикле
+            _update_status_snapshot(b, symbol=symbol, bank_fact=bank, bank_target=bank_target,
+                                    pos=pos, scan_paused=b.get("scan_paused", False),
+                                    rng_strat=rng_strat, rng_tac=rng_tac)
 
             # Диагностика по флагу
             if b.pop("cmd_diag_targets", False):
@@ -1388,7 +1439,7 @@ async def scanner_main_loop(
 
                 if side_cand:
                     pos = Position(side_cand, signal_id=f"{symbol.replace('/','')} {int(now)}",
-                                   leverage=CONFIG.LEVERAGE, owner_key=b["owner_key"])
+                                     leverage=CONFIG.LEVERAGE, owner_key=b["owner_key"])
 
                     ord_levels = min(CONFIG.DCA_LEVELS - 1, 1 + CONFIG.ORDINARY_ADDS)
                     if manual and manual.get("max_steps") is not None:
