@@ -10,6 +10,7 @@ import asyncio, time, logging, json, os, inspect, numbers, ast
 from typing import Optional
 from datetime import datetime, timezone
 from enum import IntEnum
+from contextlib import suppress
 
 import numpy as np
 import pandas as pd
@@ -25,6 +26,9 @@ import trade_executor
 
 log = logging.getLogger("bmr_dca_engine")
 logging.getLogger("fx_feed").setLevel(logging.WARNING)
+
+# Регистр для задач сканеров в рамках Telegram-приложения
+TASKS_KEY = "scan_tasks"    # app.bot_data[TASKS_KEY] -> dict[ns_key] = asyncio.Task
 
 # --- Status snapshot helper (для /status)
 def _update_status_snapshot(box: dict, *, symbol: str, bank_fact: float, bank_target: float,
@@ -1024,6 +1028,8 @@ async def scanner_main_loop(
     ns_key = f"{symbol}|{target_chat_id or 'default'}"
     
     b = root.setdefault(ns_key, {})      # <- у каждого символа/чата свой карман
+    # при запуске процесса гарантируем «включённость»
+    b["bot_on"] = True
     b.setdefault("position", None)
     b.setdefault("fsm_state", int(FSM.IDLE))
     b.setdefault("intro_done", False)
@@ -1725,3 +1731,115 @@ async def scanner_main_loop(
             await asyncio.sleep(5)
 
     log.info("BMR-DCA loop gracefully stopped.")
+
+# ---------------------------------------------------------------------------
+# Task Manager: поключично запускаем/останавливаем сканеры по парам
+# ---------------------------------------------------------------------------
+def _ns_key(symbol: str, chat_id: Optional[int]) -> str:
+    return f"{_norm_symbol(symbol)}|{chat_id or 'default'}"
+
+def is_scanner_running(app: Application, symbol: str, chat_id: Optional[int]) -> bool:
+    tasks = app.bot_data.get(TASKS_KEY) or {}
+    t = tasks.get(_ns_key(symbol, chat_id))
+    return bool(t and not t.done())
+
+async def start_scanner_for_pair(
+    app: Application,
+    broadcast,
+    *,
+    symbol: str,
+    chat_id: Optional[int],
+    botbox: Optional[dict] = None,
+) -> str:
+    """
+    Стартует отдельный сканер для пары/чата.
+    Не стартует дубликат, возвращает человекочитаемый статус.
+    """
+    symbol = _norm_symbol(symbol)
+    ns_key = _ns_key(symbol, chat_id)
+    tasks: dict = app.bot_data.setdefault(TASKS_KEY, {})
+
+    # уже бежит?
+    if ns_key in tasks and not tasks[ns_key].done():
+        return f"⏳ Сканер для {ns_key} уже запущен."
+
+    # поднимаем флаг и стартуем задачу
+    box = botbox if botbox is not None else app.bot_data
+    slot = box.setdefault(ns_key, {})
+    slot["bot_on"] = True
+
+    bc = _wrap_broadcast(broadcast, chat_id)
+
+    async def _runner():
+        try:
+            await scanner_main_loop(
+                app,
+                bc,
+                symbol_override=symbol,
+                target_chat_id=chat_id,
+                botbox=botbox,
+            )
+        except asyncio.CancelledError:
+            # мягкое завершение при отмене
+            pass
+        except Exception:
+            log.exception(f"[runner:{ns_key}] crashed")
+        finally:
+            # убираем задачу из реестра
+            reg = app.bot_data.get(TASKS_KEY) or {}
+            if reg.get(ns_key) is asyncio.current_task():
+                reg.pop(ns_key, None)
+
+    task = asyncio.create_task(_runner(), name=f"scan[{ns_key}]")
+    tasks[ns_key] = task
+    return f"✅ Сканер для {ns_key} запущен."
+
+async def stop_scanner_for_pair(
+    app: Application,
+    *,
+    symbol: str,
+    chat_id: Optional[int],
+    hard: bool = False,
+    join_timeout: float = 6.0,
+) -> str:
+    """
+    Останавливает отдельный сканер.
+    hard=True дополнительно обнуляет позицию/состояние в box.
+    """
+    symbol = _norm_symbol(symbol)
+    ns_key = _ns_key(symbol, chat_id)
+    tasks: dict = app.bot_data.get(TASKS_KEY) or {}
+    t: asyncio.Task | None = tasks.get(ns_key)
+
+    # погасим флаг цикла
+    slot = (app.bot_data if "bot_on" in app.bot_data.get(ns_key, {}) else app.bot_data).setdefault(ns_key, {})
+    slot["bot_on"] = False
+
+    if hard:
+        slot["position"] = None
+        slot["fsm_state"] = int(FSM.IDLE)
+        slot["intro_done"] = False
+
+    # если есть реальная задача — подождём мягкое завершение и при необходимости отменим
+    if t:
+        with suppress(asyncio.TimeoutError):
+            await asyncio.wait_for(asyncio.shield(t), timeout=join_timeout)
+        if not t.done():
+            t.cancel()
+            with suppress(asyncio.CancelledError):
+                await t
+        # убираем из реестра
+        tasks.pop(ns_key, None)
+        return f"🛑 Сканер для {ns_key} остановлен{' (hard)' if hard else ''}."
+    else:
+        return f"ℹ️ Сканер для {ns_key} не найден (возможно, уже остановлен)."
+
+async def stop_all_scanners(app: Application, *, hard: bool = False) -> list[str]:
+    """Останавливает все сканеры; возвращает список строк-результатов."""
+    tasks: dict = app.bot_data.get(TASKS_KEY) or {}
+    out = []
+    for k in list(tasks.keys()):
+        sym, chat = (k.split("|", 1) + ["default"])[:2]
+        chat_id = None if chat == "default" else int(chat) if chat.isdigit() else None
+        out.append(await stop_scanner_for_pair(app, symbol=sym, chat_id=chat_id, hard=hard))
+    return out
