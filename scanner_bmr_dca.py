@@ -912,6 +912,9 @@ class Position:
         self.break_confirm_bars: int = 0
         self.extension_planned: bool = False
         self.ordinary_offset: int = 0
+        # антидубли
+        self.last_filled_q: float | None = None    # последний исполненный уровень (квантованный в тик)
+        self.last_px: float | None = None          # предыдущая наблюдённая цена (для кросс-овера)
 
     def plan_with_reserve(self, bank: float, growth: float, ord_levels: int):
         self.growth = growth
@@ -1289,6 +1292,11 @@ async def scanner_main_loop(
                 await asyncio.sleep(2); continue
 
             px = float(df5["close"].iloc[-1])
+            # запомним прошлую цену для кросс-овера
+            prev_px = None
+            if b.get("position"):
+                prev_px = b["position"].last_px
+                b["position"].last_px = px
 
             # Интро-сообщение
             if (not b.get("intro_done")) and (pos is None):
@@ -1489,14 +1497,15 @@ async def scanner_main_loop(
                         if not seg:
                             seg = [end]
 
-                        full_targets = [
-                            {"price": px,   "label": "TAC 33%"},
-                            {"price": px,   "label": "TAC 67%"},
-                            {"price": seg[0], "label": "STRAT 33%"},
-                            {"price": seg[1] if len(seg) > 1 else seg[-1], "label": "STRAT 67%"},
-                            {"price": seg[-1],"label": "STRAT 100%"},
-                        ]
-                        pos.ordinary_targets = full_targets[:min(len(full_targets), max(1, pos.ord_levels - 1))]
+                        # Не кладём уровни на цене входа (px), чтобы next всегда указывал на реальную следующую цель.
+                        full_targets = []
+                        if len(seg) >= 1:
+                            full_targets.append({"price": seg[0], "label": "STRAT 33%"})
+                        if len(seg) >= 2:
+                            full_targets.append({"price": seg[1], "label": "STRAT 67%"})
+                        # Последний — всегда STRAT 100% (даже если seg всего один)
+                        full_targets.append({"price": seg[-1], "label": "STRAT 100%"})
+                        pos.ordinary_targets = full_targets[:max(1, min(len(full_targets), pos.ord_levels - 1))]
                         
                         target_used_steps = min(CONFIG.BOOST_MAX_STEPS, pos.ord_levels)
                         cum_margin_added = 0.0
@@ -1505,14 +1514,17 @@ async def scanner_main_loop(
                             cum_margin_added += m
 
                         pos.rebalance_tail_margins_excluding_reserve(alloc_bank)
+                        # зафиксируем последний использованный "уровень" как текущую цену
+                        pos.last_filled_q = quantize_to_tick(px, tick)
+                        
+                        # После BOOST исполнено used_ord_after обычных шагов.
+                        # Список целей не режем (он уже без дублей на px), просто сдвигаем указатель.
+                        used_ord_after = pos.steps_filled - (1 if pos.reserve_used else 0)
+                        pos.ordinary_offset = used_ord_after - 1
+                        
                         b["position"] = pos
                         b["fsm_state"] = int(FSM.MANAGING)
                         
-                        used_ord_after = pos.steps_filled - (1 if pos.reserve_used else 0)
-                        keep_from = max(0, used_ord_after - 1)
-                        pos.ordinary_targets = pos.ordinary_targets[keep_from:]
-                        pos.ordinary_offset = getattr(pos, "ordinary_offset", 0) + keep_from
-
                         nxt = next_pct_target(pos)
                         nxt_txt = "N/A" if not nxt else f"{fmt(nxt['price'])} ({nxt['label']})"
                         cum_margin = _pos_total_margin(pos)
@@ -1568,9 +1580,22 @@ async def scanner_main_loop(
                     used_ord = pos.steps_filled - (1 if pos.reserve_used else 0)
                     nxt = next_pct_target(pos)
                     is_open_event = b.get("fsm_state") == int(FSM.OPENED) and pos.steps_filled == 1
-                    is_add_event = b.get("fsm_state") == int(FSM.MANAGING) and (nxt is not None) and (
-                        (pos.side == "LONG" and px <= nxt["price"] - tick) or 
-                        (pos.side == "SHORT" and px >= nxt["price"] + tick) )
+                    # --- АНТИДУБЛЬ: триггер только при реальном "кросс-овере" уровня ---
+                    crossed = False
+                    if (b.get("fsm_state") == int(FSM.MANAGING)) and (nxt is not None) and (prev_px is not None):
+                        tgt = nxt["price"]
+                        if pos.side == "LONG":
+                            # раньше были выше, теперь ушли НИЖЕ уровня на >= 1 тик
+                            crossed = (prev_px > tgt) and (px <= tgt - tick)
+                        else:
+                            # раньше были ниже, теперь ушли ВЫШЕ уровня на >= 1 тик
+                            crossed = (prev_px < tgt) and (px >= tgt + tick)
+                    # блокируем повтор на том же самом уровне (квантованном)
+                    if crossed and nxt is not None:
+                        tgt_q = quantize_to_tick(nxt["price"], tick)
+                        if pos.last_filled_q is not None and tgt_q == pos.last_filled_q:
+                            crossed = False
+                    is_add_event = crossed
                     
                     now_ts = time.time()
                     allowed_now = is_open_event or (pos.last_add_ts is None) or ((now_ts - pos.last_add_ts) >= CONFIG.ADD_COOLDOWN_SEC)
@@ -1579,11 +1604,15 @@ async def scanner_main_loop(
                             alloc_bank = _alloc_bank(bank, weight)
                             margin, _ = pos.add_step(px)
                             pos.rebalance_tail_margins_excluding_reserve(alloc_bank)
+                            # пометим уровень как «израсходованный»
+                            pos.last_filled_q = quantize_to_tick(nxt["price"], tick) if nxt else None
                         else:
                             margin = pos.step_margins[0]
 
                         used_ord_after = pos.steps_filled - (1 if pos.reserve_used else 0)
                         used_dca = max(0, used_ord_after - 1)
+                        # сдвинем базу так, чтобы индексация шла строго на «следующий» уровень
+                        pos.ordinary_offset = max(0, (pos.steps_filled - (1 if pos.reserve_used else 0)) - 1)
                         nxt2 = next_pct_target(pos)
                         base = getattr(pos, "ordinary_offset", 0)
                         total_ord = max(0, min(pos.ord_levels - 1 - base, len(pos.ordinary_targets)))
