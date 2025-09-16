@@ -1,284 +1,325 @@
+# main.py
 from __future__ import annotations
-import os
+
 import asyncio
 import logging
+import os
+import re
 from typing import Optional
 
-from telegram import (
-    Update, constants, BotCommand,
-    BotCommandScopeAllGroupChats, BotCommandScopeAllPrivateChats,
-    BotCommandScopeChat, MenuButtonCommands
-)
+from telegram import Update
+from telegram.constants import ParseMode
 from telegram.ext import (
-    Application, ApplicationBuilder, CommandHandler,
-    ContextTypes, PicklePersistence
+    Application,
+    CommandHandler,
+    ContextTypes,
 )
 
-# --- Logging FIRST ---
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-)
-logging.getLogger("httpx").setLevel(logging.WARNING)
-log = logging.getLogger("bot")
-
-# --- Engine imports ---
-from scanner_bmr_dca import CONFIG, _norm_symbol
+# === наш сканер ===
 from scanner_bmr_dca import (
     start_scanner_for_pair,
     stop_scanner_for_pair,
+    stop_all_scanners,
     is_scanner_running,
+    CONFIG,
 )
 
-BOT_VERSION = "BMR-DCA FX v3.0 (Per-Chat Per-Pair)"
+logging.basicConfig(
+    level=os.getenv("LOGLEVEL", "INFO"),
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
+log = logging.getLogger("main")
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN env var is not set")
+# -----------------------------------------------------------------------------
+# HTML sanitizer + универсальная отправка
+# -----------------------------------------------------------------------------
+ALLOWED_TAGS = {
+    "b", "strong", "i", "em", "u", "ins", "s", "strike", "del",
+    "code", "pre", "a", "tg-spoiler"
+}
+A_OPEN_RE = re.compile(r"&lt;a\s+href=(['\"]).*?\1\s*&gt;", re.IGNORECASE)
 
-# === Helpers ===
+def html_safe(text: str) -> str:
+    """
+    Телеграм строго парсит HTML. Любые неразрешённые угловые скобки надо экранировать,
+    а известные теги вернуть обратно. Поддерживаем <a href="...">...</a>.
+    """
+    if text is None:
+        return ""
+    # 1) экранируем всё
+    t = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    # 2) вернём разрешённые теги открывающие/закрывающие
+    for tag in ALLOWED_TAGS:
+        t = t.replace(f"&lt;{tag}&gt;", f"<{tag}>")
+        t = t.replace(f"&lt;/{tag}&gt;", f"</{tag}>")
+    # 3) аккуратно починим <a href="...">...</a>
+    #    (допускаем только сам атрибут href; остальные останутся экранированными)
+    def _restore_a(m: re.Match) -> str:
+        s = m.group(0)
+        s = s.replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&")
+        return s
+    t = A_OPEN_RE.sub(_restore_a, t)
+    t = t.replace("&lt;/a&gt;", "</a>")
+    return t
 
-def ns_key(pair: str, chat_id: int | None) -> str:
-    return f"{_norm_symbol(pair)}|{chat_id or 'default'}"
-
-def slot_for(app: Application, pair: str, chat_id: int) -> dict:
-    """Бокс состояния движка для конкретной пары в конкретном чате."""
-    key = ns_key(pair, chat_id)
-    return app.bot_data.setdefault(key, {"chat_id": chat_id})
-
-async def broadcast(app: Application, txt: str, target_chat_id: int | None = None):
-    """Единая точка рассылки: если задан chat_id — пишем только туда."""
-    if not target_chat_id:
-        log.warning("broadcast called without target_chat_id; dropping message")
+async def broadcast_html(app: Application, text: str, target_chat_id: Optional[int] = None):
+    if target_chat_id is None:
+        log.warning("broadcast_html: target_chat_id is None; drop message")
         return
     try:
-        await app.bot.send_message(chat_id=target_chat_id, text=txt, parse_mode=constants.ParseMode.HTML)
+        await app.bot.send_message(
+            chat_id=target_chat_id,
+            text=html_safe(text),
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
     except Exception as e:
-        log.error(f"Send message failed for chat {target_chat_id}: {e}")
+        log.error(f"broadcast_html send failed: {e}", exc_info=True)
 
-# === Lifecycle / init ===
 
-async def post_init(app: Application):
-    try:
-        await app.bot.delete_webhook(drop_pending_updates=True)
-    except Exception as e:
-        log.warning(f"delete_webhook failed: {e}")
+# -----------------------------------------------------------------------------
+# Вспомогательные функции/ключи состояния
+# -----------------------------------------------------------------------------
+def _ns_key(symbol: str, chat_id: Optional[int]) -> str:
+    return f"{(symbol or '').upper()}|{chat_id or 'default'}"
 
-    # Команды (везде одинаковые)
-    CMDS = [
-        BotCommand("start",   "Справка и команды"),
-        BotCommand("run",     "Запуск: /run EURUSD"),
-        BotCommand("stop",    "Стоп: /stop EURUSD [hard]"),
-        BotCommand("status",  "Статус: /status EURUSD"),
-        BotCommand("open",    "Открыть: /open EURUSD long|short [lev] [steps]"),
-        BotCommand("close",   "Закрыть: /close EURUSD"),
-        BotCommand("setbank", "Банк: /setbank EURUSD 1000"),
-        BotCommand("mychatid","Показать chat_id"),
-    ]
-    for scope in (BotCommandScopeAllPrivateChats(), BotCommandScopeAllGroupChats()):
-        try:
-            await app.bot.set_my_commands(CMDS, scope=scope)
-        except Exception as e:
-            log.warning(f"set_my_commands({scope}) failed: {e}")
-    try:
-        await app.bot.set_my_commands(CMDS)
-    except Exception as e:
-        log.warning(f"set_my_commands(default) failed: {e}")
+def _get_current_symbol(app: Application, chat_id: int) -> Optional[str]:
+    return app.bot_data.get(f"current_symbol|{chat_id}")
 
-    # Кнопка меню
-    try:
-        await app.bot.set_chat_menu_button(menu_button=MenuButtonCommands())
-    except Exception as e:
-        log.warning(f"set_chat_menu_button(default) failed: {e}")
+def _set_current_symbol(app: Application, chat_id: int, symbol: str):
+    app.bot_data[f"current_symbol|{chat_id}"] = (symbol or "").upper()
 
-async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
-    log.exception("Unhandled error in handler", exc_info=context.error)
+def _slot(app: Application, symbol: str, chat_id: int) -> dict:
+    return app.bot_data.setdefault(_ns_key(symbol, chat_id), {})
 
-# === Commands ===
 
-async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+# -----------------------------------------------------------------------------
+# Команды бота
+# -----------------------------------------------------------------------------
+START_TEXT = (
+    "🤖 Бот запущен.\n"
+    "Команды (в этом чате):\n"
+    "• /run <SYMBOL> — запустить сканер для пары (пример: /run GBPUSD)\n"
+    "• /stop [hard] — остановить сканер по текущей паре (hard — с очисткой состояния)\n"
+    "• /stopall — остановить все сканеры\n"
+    "• /status — краткий статус по текущей паре\n"
+    "• /setbank <USD> — установить банк пары (пример: /setbank 6000)\n"
+    "• /open <long|short> [steps] — запрос на ручной вход c указанным направлением\n"
+    "• /close — принудительно закрыть текущую позицию\n"
+    "• /mychat — показать ID этого чата\n"
+)
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(html_safe(START_TEXT), parse_mode=ParseMode.HTML)
+
+async def cmd_mychat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cid = update.effective_chat.id
     await update.message.reply_text(
-        "✅ <b>Бот запущен.</b>\n"
-        "Все команды работают <u>для указанной пары в текущем чате</u>.\n\n"
-        "<b>Примеры</b>:\n"
-        "• /run EURUSD — запустить сканер по EURUSD\n"
-        "• /stop EURUSD — мягко остановить (добавь <code>hard</code> для сброса)\n"
-        "• /status EURUSD — короткий статус\n"
-        "• /open EURUSD long 200 5 — открыть лонг, плечо 200, макс. 5 шагов\n"
-        "• /close EURUSD — закрыть текущую позицию\n"
-        "• /setbank EURUSD 1200 — установить банк пары\n"
-        "• /mychatid — показать ID чата",
-        parse_mode=constants.ParseMode.HTML
+        html_safe(f"Этот чат: <code>{cid}</code>"),
+        parse_mode=ParseMode.HTML,
     )
 
-async def cmd_mychatid(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        f"Ваш chat_id: <code>{update.effective_chat.id}</code>",
-        parse_mode=constants.ParseMode.HTML
-    )
-
-async def cmd_run(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not ctx.args:
-        await update.message.reply_text("Формат: /run <PAIR>\nНапример: <code>/run EURUSD</code>", parse_mode=constants.ParseMode.HTML)
-        return
-    pair = _norm_symbol(ctx.args[0])
-    chat_id = update.effective_chat.id
-
-    msg = await start_scanner_for_pair(
-        ctx.application,
-        broadcast,
-        symbol=pair,
-        chat_id=chat_id,
-        botbox=ctx.application.bot_data,
-    )
-    await update.message.reply_text(msg, parse_mode=constants.ParseMode.HTML)
-
-async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not ctx.args:
-        await update.message.reply_text("Формат: /stop <PAIR> [hard]\nНапример: <code>/stop EURUSD hard</code>", parse_mode=constants.ParseMode.HTML)
-        return
-    pair = _norm_symbol(ctx.args[0])
-    hard = any(a.lower() == "hard" for a in ctx.args[1:])
-    chat_id = update.effective_chat.id
-
-    msg = await stop_scanner_for_pair(
-        ctx.application,
-        symbol=pair,
-        chat_id=chat_id,
-        hard=hard
-    )
-    await update.message.reply_text(msg, parse_mode=constants.ParseMode.HTML)
-
-async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not ctx.args:
-        await update.message.reply_text("Формат: /status <PAIR>\nНапример: <code>/status EURUSD</code>", parse_mode=constants.ParseMode.HTML)
-        return
-    pair = _norm_symbol(ctx.args[0])
-    chat_id = update.effective_chat.id
-    key = ns_key(pair, chat_id)
-    box = ctx.application.bot_data.get(key, {})
-
-    # Движок в каждом цикле кладёт "status_line" (см. _update_status_snapshot)
-    line = box.get("status_line")
-    if not line:
-        running = is_scanner_running(ctx.application, pair, chat_id)
-        hint = "Сканер не запущен." if not running else "Идёт инициализация… подождите немного."
-        await update.message.reply_text(f"ℹ️ {hint}", parse_mode=constants.ParseMode.HTML)
-        return
-
-    await update.message.reply_text(line, parse_mode=constants.ParseMode.HTML)
-
-async def cmd_open(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if len(ctx.args) < 2:
+async def cmd_run(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    app = context.application
+    cid = update.effective_chat.id
+    if not context.args:
         await update.message.reply_text(
-            "Формат: /open <PAIR> long|short [leverage] [steps]\n"
-            "Например: <code>/open EURUSD long 200 5</code>",
-            parse_mode=constants.ParseMode.HTML
+            html_safe("Укажи символ: /run <SYMBOL> (напр. /run GBPUSD)"),
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    symbol = context.args[0].upper()
+    _set_current_symbol(app, cid, symbol)
+    msg = await start_scanner_for_pair(
+        app,
+        broadcast=broadcast_html,
+        symbol=symbol,
+        chat_id=cid,
+        botbox=app.bot_data,
+    )
+    await broadcast_html(app, f"✅ {html_safe(msg)}", target_chat_id=cid)
+
+async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    app = context.application
+    cid = update.effective_chat.id
+    symbol = _get_current_symbol(app, cid)
+    if not symbol:
+        await update.message.reply_text(
+            html_safe("Нет выбранной пары в этом чате. Сначала запусти: /run <SYMBOL>"),
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    hard = False
+    if context.args and context.args[0].lower() == "hard":
+        hard = True
+    msg = await stop_scanner_for_pair(app, symbol=symbol, chat_id=cid, hard=hard)
+    await broadcast_html(app, msg, target_chat_id=cid)
+
+async def cmd_stopall(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    app = context.application
+    msgs = await stop_all_scanners(app, hard=("hard" in [a.lower() for a in context.args] if context.args else False))
+    text = ";\n".join(msgs) if msgs else "Нет активных сканеров."
+    await broadcast_html(app, text, target_chat_id=update.effective_chat.id)
+
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    app = context.application
+    cid = update.effective_chat.id
+    symbol = _get_current_symbol(app, cid)
+    if not symbol:
+        await update.message.reply_text(
+            html_safe("Сканер ещё не запускался в этом чате. Используй: /run <SYMBOL>"),
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    slot = _slot(app, symbol, cid)
+    line = slot.get("status_line")
+    if not line:
+        if is_scanner_running(app, symbol, cid):
+            line = f"⏳ Сканер для <b>{symbol}</b> работает. Данные собираются…"
+        else:
+            line = f"ℹ️ Сканер для <b>{symbol}</b> не запущен."
+    await broadcast_html(app, line, target_chat_id=cid)
+
+async def cmd_setbank(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Устанавливает банк (USD) для текущей пары в этом чате.
+    Пример: /setbank 6000
+    """
+    app = context.application
+    cid = update.effective_chat.id
+    symbol = _get_current_symbol(app, cid)
+    if not context.args:
+        await update.message.reply_text(
+            html_safe("Использование: /setbank <USD>, пример: /setbank 6000"),
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    if not symbol:
+        await update.message.reply_text(
+            html_safe("Сначала выбери пару командой /run <SYMBOL>"),
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    try:
+        amount = float(context.args[0].replace(",", "."))
+        if amount <= 0:
+            raise ValueError
+    except Exception:
+        await update.message.reply_text(
+            html_safe("Некорректная сумма. Пример: /setbank 6000"),
+            parse_mode=ParseMode.HTML,
         )
         return
 
-    pair = _norm_symbol(ctx.args[0])
-    side = (ctx.args[1] or "").upper()
-    if side not in ("LONG", "SHORT"):
-        await update.message.reply_text("Вторая позиция — сторона: long или short", parse_mode=constants.ParseMode.HTML)
-        return
+    slot = _slot(app, symbol, cid)
+    slot["safety_bank_usdt"] = float(amount)
+    # Пользовательский таргет можем не трогать — его даёт FUND_BOT; но если его нет,
+    # пусть таргет будет равен факту, чтобы статус выглядел консистентно.
+    if "bank_target_usdt" not in slot:
+        slot["bank_target_usdt"] = float(amount)
 
-    lev = None
-    steps = None
-    if len(ctx.args) >= 3:
-        try: lev = int(ctx.args[2])
-        except: lev = None
-    if len(ctx.args) >= 4:
-        try: steps = int(ctx.args[3])
-        except: steps = None
-
-    # нормализуем по конфигу
-    if lev is not None:
-        lev = max(CONFIG.MIN_LEVERAGE, min(CONFIG.MAX_LEVERAGE, lev))
-    if steps is not None:
-        steps = max(1, min(CONFIG.DCA_LEVELS, steps))
-
-    chat_id = update.effective_chat.id
-    box = slot_for(ctx.application, pair, chat_id)
-
-    if box.get("position"):
-        await update.message.reply_text("Уже есть открытая позиция по этой паре. Сначала закройте (/close <PAIR>).")
-        return
-
-    # гарантируем запущенный сканер
-    if not is_scanner_running(ctx.application, pair, chat_id):
-        await start_scanner_for_pair(ctx.application, broadcast, symbol=pair, chat_id=chat_id, botbox=ctx.application.bot_data)
-        await asyncio.sleep(0.3)
-
-    box["manual_open"] = {"side": side, "leverage": lev, "max_steps": steps}
-    box["bot_on"] = True
-
-    lev_txt = f"(плечо: {lev}) " if lev else ""
-    steps_txt = f"(макс. шагов: {steps})" if steps else ""
-    await update.message.reply_text(
-        f"Ок, открываю {side} по <b>{pair}</b> по рынку. {lev_txt}{steps_txt}",
-        parse_mode=constants.ParseMode.HTML
+    await broadcast_html(
+        app,
+        f"✅ Банк для пары <b>{symbol}</b> установлен: <code>{amount:.2f}</code> USD.",
+        target_chat_id=cid,
     )
 
-async def cmd_close(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not ctx.args:
-        await update.message.reply_text("Формат: /close <PAIR>\nНапример: <code>/close EURUSD</code>", parse_mode=constants.ParseMode.HTML)
+async def cmd_open(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Ручной запрос на вход: /open long [steps] или /open short [steps]
+    Шаги опционально. Плечо берётся из CONFIG.
+    """
+    app = context.application
+    cid = update.effective_chat.id
+    symbol = _get_current_symbol(app, cid)
+    if not symbol:
+        await update.message.reply_text(
+            html_safe("Сначала запусти сканер: /run <SYMBOL>"),
+            parse_mode=ParseMode.HTML,
+        )
         return
-    pair = _norm_symbol(ctx.args[0])
-    chat_id = update.effective_chat.id
-    box = slot_for(ctx.application, pair, chat_id)
-
-    if not box.get("position"):
-        await update.message.reply_text("ℹ️ Активной позиции по этой паре нет.")
+    if not context.args:
+        await update.message.reply_text(
+            html_safe("Использование: /open <long|short> [steps]"),
+            parse_mode=ParseMode.HTML,
+        )
         return
-
-    # если сканер не бежит — поднимем, чтобы обработать закрытие
-    if not is_scanner_running(ctx.application, pair, chat_id):
-        await start_scanner_for_pair(ctx.application, broadcast, symbol=pair, chat_id=chat_id, botbox=ctx.application.bot_data)
-        await asyncio.sleep(0.3)
-
-    box["force_close"] = True
-    await update.message.reply_text(f"🧰 Запрошено закрытие позиции по <b>{pair}</b>. Закрою в ближайшем цикле.",
-                                    parse_mode=constants.ParseMode.HTML)
-
-async def cmd_setbank(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if len(ctx.args) < 2:
-        await update.message.reply_text("Формат: /setbank <PAIR> <AMOUNT>\nНапример: <code>/setbank EURUSD 1200</code>",
-                                        parse_mode=constants.ParseMode.HTML)
+    side = context.args[0].lower()
+    if side not in ("long", "short"):
+        await update.message.reply_text(
+            html_safe("Направление должно быть long или short."),
+            parse_mode=ParseMode.HTML,
+        )
         return
-    pair = _norm_symbol(ctx.args[0])
-    try:
-        val = float(ctx.args[1])
-        assert val > 0
-    except Exception:
-        await update.message.reply_text("Укажите корректную сумму (> 0).")
+    steps = None
+    if len(context.args) >= 2:
+        try:
+            steps = int(float(context.args[1]))
+        except Exception:
+            steps = None
+
+    slot = _slot(app, symbol, cid)
+    slot["manual_open"] = {"side": side.upper(), "max_steps": steps}
+    await broadcast_html(
+        app,
+        f"⏳ Запрос на ручной вход по <b>{symbol}</b>: <code>{side.upper()}</code>"
+        + (f" (steps={steps})" if steps else ""),
+        target_chat_id=cid,
+    )
+
+async def cmd_close(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    app = context.application
+    cid = update.effective_chat.id
+    symbol = _get_current_symbol(app, cid)
+    if not symbol:
+        await update.message.reply_text(
+            html_safe("Сначала запусти сканер: /run <SYMBOL>"),
+            parse_mode=ParseMode.HTML,
+        )
         return
+    slot = _slot(app, symbol, cid)
+    slot["force_close"] = True
+    await broadcast_html(app, f"🧰 Ручное закрытие запрошено по <b>{symbol}</b>.", target_chat_id=cid)
 
-    chat_id = update.effective_chat.id
-    box = slot_for(ctx.application, pair, chat_id)
-    box["safety_bank_usdt"] = val
-    await update.message.reply_text(f"💰 Банк для <b>{pair}</b> установлен: {val:.2f} USD", parse_mode=constants.ParseMode.HTML)
+async def cmd_diag(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    app = context.application
+    cid = update.effective_chat.id
+    symbol = _get_current_symbol(app, cid)
+    if not symbol:
+        await update.message.reply_text(
+            html_safe("Сначала /run <SYMBOL>"),
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    slot = _slot(app, symbol, cid)
+    slot["cmd_diag_targets"] = True
+    await broadcast_html(app, "🧪 Диагностика таргетов запрошена.", target_chat_id=cid)
 
-# === Entrypoint ===
+
+# -----------------------------------------------------------------------------
+# boot
+# -----------------------------------------------------------------------------
+def build_app() -> Application:
+    token = os.environ.get("TELEGRAM_TOKEN")
+    if not token:
+        raise RuntimeError("TELEGRAM_TOKEN is not set")
+    app = Application.builder().token(token).build()
+
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("run", cmd_run))
+    app.add_handler(CommandHandler("stop", cmd_stop))
+    app.add_handler(CommandHandler("stopall", cmd_stopall))
+    app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("setbank", cmd_setbank))
+    app.add_handler(CommandHandler("open", cmd_open))
+    app.add_handler(CommandHandler("close", cmd_close))
+    app.add_handler(CommandHandler("mychat", cmd_mychat))
+    app.add_handler(CommandHandler("diag", cmd_diag))
+
+    return app
 
 if __name__ == "__main__":
-    persistence = PicklePersistence(filepath="bot_persistence")
-    app = ApplicationBuilder() \
-        .token(BOT_TOKEN) \
-        .persistence(persistence) \
-        .post_init(post_init) \
-        .build()
-
-    app.add_error_handler(on_error)
-
-    app.add_handler(CommandHandler("start",   cmd_start))
-    app.add_handler(CommandHandler("mychatid",cmd_mychatid))
-    app.add_handler(CommandHandler("run",     cmd_run))
-    app.add_handler(CommandHandler("stop",    cmd_stop))
-    app.add_handler(CommandHandler("status",  cmd_status))
-    app.add_handler(CommandHandler("open",    cmd_open))
-    app.add_handler(CommandHandler("close",   cmd_close))
-    app.add_handler(CommandHandler("setbank", cmd_setbank))
-
-    log.info(f"Bot {BOT_VERSION} starting...")
-    app.run_polling()
+    application = build_app()
+    log.info("Bot starting…")
+    # polling (Railway/Heroku ok). Если нужен webhook — добавь конфиг при деплое.
+    application.run_polling(close_loop=False)
