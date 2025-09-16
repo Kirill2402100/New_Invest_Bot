@@ -676,38 +676,55 @@ def _place_segment(start: float, end: float, count: int, tick: float, include_en
 
 def compute_corridor_targets(entry: float, side: str, rng_strat: dict, rng_tac: dict, tick: float) -> list[dict]:
     """
-    Строим цели только в сторону ухудшения:
-      LONG  -> вниз от entry,
-      SHORT -> вверх от entry.
-    TAC-сегмент (2 точки, без самой TAC), затем STRAT-сегмент (3 точки, последняя может совпасть со STRAT).
-    Если места мало — количество автоматически сокращается.
+    Строим цели только в сторону ухудшения.
+    Логика: 2 TAC + 3 STRAT (последний = STRAT 100%).
+    Если TAC-сегмент короткий/нулевой — недостающие TAC-точки забираем
+    с начала STRAT-сегмента (не сокращая общее количество шагов).
     """
-    if side == "LONG":
-        tac_b    = min(entry, rng_tac["lower"])
-        strat_b = min(entry, rng_strat["lower"])
-        seg1 = _place_segment(entry, tac_b,   2, tick, include_end_last=False)
-        seg2 = _place_segment(tac_b, strat_b, 3, tick, include_end_last=True)
-    else:  # SHORT
-        tac_b    = max(entry, rng_tac["upper"])
-        strat_b = max(entry, rng_strat["upper"])
-        seg1 = _place_segment(entry, tac_b,   2, tick, include_end_last=False)
-        seg2 = _place_segment(tac_b, strat_b, 3, tick, include_end_last=True)
+    DESIRED_TAC = 2
+    DESIRED_STRAT = 3
 
+    if side == "LONG":
+        tac_b   = min(entry, rng_tac["lower"])
+        strat_b = min(entry, rng_strat["lower"])
+        seg1 = _place_segment(entry, tac_b,   DESIRED_TAC,   tick, include_end_last=False)  # TAC
+        seg2 = _place_segment(tac_b,  strat_b, DESIRED_STRAT, tick, include_end_last=True)   # STRAT
+    else:
+        tac_b   = max(entry, rng_tac["upper"])
+        strat_b = max(entry, rng_strat["upper"])
+        seg1 = _place_segment(entry, tac_b,   DESIRED_TAC,   tick, include_end_last=False)
+        seg2 = _place_segment(tac_b,  strat_b, DESIRED_STRAT, tick, include_end_last=True)
+
+    # Если TAC-точек не хватает, «одалживаем» их с начала STRAT,
+    # но ВСЕГДА сохраняем последний STRAT (100%) в конце.
+    missing_tac = max(0, DESIRED_TAC - len(seg1))
+    if missing_tac > 0 and len(seg2) > 0:
+        # нельзя забрать последний «якорь» (STRAT 100%)
+        can_take = max(0, len(seg2) - 1)
+        take = min(missing_tac, can_take)
+        if take > 0:
+            seg1 = seg1 + seg2[:take]
+            seg2 = seg2[take:]
+
+    # Подписи (берём «столько, сколько есть»)
     def _labels(prefix: str, n: int, include_end: bool) -> list[str]:
         if n <= 0: return []
-        if include_end and n >= 1:
-            fr = [(i + 1) / n for i in range(n)]  # 33..100%
+        if include_end:
+            fr = [(i + 1) / n for i in range(n)]  # 50..100 (n=2) | 33..100 (n=3)
         else:
-            fr = [(i + 1) / (n + 1) for i in range(n)]  # 33..66% для сегмента entry→TAC
+            fr = [(i + 1) / (n + 1) for i in range(n)]  # 33..66 (n=2)
         return [f"{prefix} {int(round(f * 100))}%" for f in fr]
 
+    labs_tac   = _labels("TAC",   max(len(seg1), 0), include_end=False)
+    labs_strat = _labels("STRAT", max(len(seg2), 0), include_end=True)
+
     targets: list[dict] = []
-    for p, lab in zip(seg1, _labels("TAC", len(seg1), include_end=False)):
+    for p, lab in zip(seg1, labs_tac):
         targets.append({"price": p, "label": lab})
-    for p, lab in zip(seg2, _labels("STRAT", len(seg2), include_end=True)):
+    for p, lab in zip(seg2, labs_strat):
         targets.append({"price": p, "label": lab})
 
-    # Дедуп по тику, ПОРЯДОК СОХРАНЯЕМ (ближайшая к entry идёт первой)
+    # Дедуп по тику, порядок сохраняем
     return merge_targets_sorted(side, tick, entry, targets)
 
 def merge_targets_sorted(side: str, tick: float, entry: float, targets: list[dict]) -> list[dict]:
