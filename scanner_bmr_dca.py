@@ -736,13 +736,26 @@ def merge_targets_sorted(side: str, tick: float, entry: float, targets: list[dic
             dedup.append(t)
     return dedup
 
+def _advance_pointer(pos, tick):
+    if pos.last_filled_q is None:
+        return
+    min_gap = tick * CONFIG.DCA_MIN_GAP_TICKS
+    base = getattr(pos, "ordinary_offset", 0)
+    while base < len(pos.ordinary_targets):
+        p = pos.ordinary_targets[base]["price"]
+        ok = (pos.side == "SHORT" and p >= pos.last_filled_q + min_gap) or \
+             (pos.side == "LONG"  and p <= pos.last_filled_q - min_gap)
+        if ok: break
+        base += 1
+    pos.ordinary_offset = base
+
 def next_pct_target(pos):
     if not getattr(pos, "ordinary_targets", None):
         return None
-    used_ord_incl_open = pos.steps_filled - (1 if pos.reserve_used else 0)
+    used_dca = max(0, (pos.steps_filled - (1 if pos.reserve_used else 0)) - 1)
     base = getattr(pos, "ordinary_offset", 0)
-    idx = used_ord_incl_open - 1 - base
-    return pos.ordinary_targets[idx] if 0 <= idx < len(pos.ordinary_targets) else None
+    abs_idx = max(base, used_dca)      # <-- ключевая правка
+    return pos.ordinary_targets[abs_idx] if 0 <= abs_idx < len(pos.ordinary_targets) else None
 
 def choose_growth(ind: dict, rng_strat: dict, rng_tac: dict) -> float:
     try:
@@ -818,10 +831,9 @@ async def plan_extension_after_break(symbol: str, pos: "Position",
     if not seg:
         return pos.ordinary_targets
 
-    # Сохраняем уже пройденные цели (кол-во = used_ord-1; OPEN съедает «нулевой» шаг)
-    base = getattr(pos, "ordinary_offset", 0)
-    already_rel = max(0, min(len(pos.ordinary_targets), (used_ord - 1) - base))
-    already = pos.ordinary_targets[:already_rel]
+    # Сохраняем уже пройденные цели
+    keep_idx = max(getattr(pos, "ordinary_offset", 0), max(0, used_ord - 1))
+    already = pos.ordinary_targets[:min(keep_idx, len(pos.ordinary_targets))]
     
     new_labels = [f"EXT {int(round((i + 1) / len(seg) * 100))}%" for i in range(len(seg))]
     ext_targets = [{"price": p, "label": lab} for p, lab in zip(seg, new_labels)]
@@ -1032,7 +1044,7 @@ async def scanner_main_loop(
 ):
     """
     Основной цикл BMR-DCA. Совместим как с kwargs (symbol_override/target_chat_id/botbox),
-    так и с позиционным запуском (app, broadcast, botbox).
+    так и с позиционным запуском (app, broadcast, box).
     """
     # Совместимость с вызовом через 3 позиционных аргумента: (app, broadcast, box)
     if botbox is None and args:
@@ -1432,13 +1444,15 @@ async def scanner_main_loop(
                         await say("🔄 Пробой не подтвердился — вернулись в STRAT. Разморозил обычные усреднения.")
 
                 if (not pos.extension_planned) and (pos.break_confirm_bars >= CONFIG.EXT_AFTER_BREAK["CONFIRM_BARS_5M"]):
+                    used_ord_now = pos.steps_filled - (1 if pos.reserve_used else 0)
+                    keep_idx = max(getattr(pos, "ordinary_offset", 0), max(0, used_ord_now - 1))
                     new_targets = await plan_extension_after_break(symbol, pos, rng_strat, rng_tac, px, tick)
+                    
                     if len(new_targets) > len(pos.ordinary_targets):
                         pos.ordinary_targets = new_targets
                         pos.extension_planned = True
                         pos.freeze_ordinary = False
-                        used_ord_now = pos.steps_filled - (1 if pos.reserve_used else 0)
-                        pos.ordinary_offset = max(0, used_ord_now - 1)
+                        pos.ordinary_offset = min(keep_idx, len(pos.ordinary_targets))
                         await say("↗️ Пробой подтверждён — расширил коридор и достроил уровни EXT. Возобновляю обычные усреднения.")
                         try:
                             await log_event_safely(with_banks({
@@ -1514,14 +1528,16 @@ async def scanner_main_loop(
                         if not seg:
                             seg = [end]
 
-                        # Не кладём уровни на цене входа (px), чтобы next всегда указывал на реальную следующую цель.
                         full_targets = []
-                        if len(seg) >= 1:
+                        if len(seg) == 1:
+                            full_targets.append({"price": seg[0], "label": "STRAT 100%"})
+                        elif len(seg) == 2:
                             full_targets.append({"price": seg[0], "label": "STRAT 33%"})
-                        if len(seg) >= 2:
+                            full_targets.append({"price": seg[1], "label": "STRAT 100%"})
+                        else:
+                            full_targets.append({"price": seg[0], "label": "STRAT 33%"})
                             full_targets.append({"price": seg[1], "label": "STRAT 67%"})
-                        # Последний — всегда STRAT 100% (даже если seg всего один)
-                        full_targets.append({"price": seg[-1], "label": "STRAT 100%"})
+                            full_targets.append({"price": seg[-1], "label": "STRAT 100%"})
                         pos.ordinary_targets = full_targets[:max(1, min(len(full_targets), pos.ord_levels - 1))]
                         
                         target_used_steps = min(CONFIG.BOOST_MAX_STEPS, pos.ord_levels)
@@ -1623,17 +1639,16 @@ async def scanner_main_loop(
                             pos.rebalance_tail_margins_excluding_reserve(alloc_bank)
                             # пометим уровень как «израсходованный»
                             pos.last_filled_q = quantize_to_tick(nxt["price"], tick) if nxt else None
+                            _advance_pointer(pos, tick)
                         else:
                             margin = pos.step_margins[0]
 
-                        used_ord_after = pos.steps_filled - (1 if pos.reserve_used else 0)
-                        used_dca = max(0, used_ord_after - 1)
-                        # сдвинем базу так, чтобы индексация шла строго на «следующий» уровень
-                        pos.ordinary_offset = max(0, (pos.steps_filled - (1 if pos.reserve_used else 0)) - 1)
                         nxt2 = next_pct_target(pos)
                         base = getattr(pos, "ordinary_offset", 0)
-                        total_ord = max(0, min(pos.ord_levels - 1 - base, len(pos.ordinary_targets)))
-                        remaining = max(0, total_ord - max(0, used_dca - base))
+                        total_ord = max(0, min(len(pos.ordinary_targets) - base, pos.ord_levels - 1 - base))
+                        used_ord_after = pos.steps_filled - (1 if pos.reserve_used else 0)
+                        used_dca = max(0, used_ord_after - 1)
+                        remaining = max(0, total_ord - used_dca)
                         next_idx = used_ord_after
                         nxt2_margin = pos.step_margins[next_idx] if next_idx < len(pos.step_margins) else None
                         
