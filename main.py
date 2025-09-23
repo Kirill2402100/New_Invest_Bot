@@ -75,8 +75,11 @@ HELP_TEXT = (
     "• <code>/setbank SYMBOL USD</code> — задать банк для пары (пример: <code>/setbank GBPUSD 6000</code>)\n"
     "• <code>/setbank USD</code> — задать банк для ранее выбранной пары в этом чате\n"
     "• <code>/run SYMBOL</code> — запустить сканер пары (требуется заданный банк)\n"
-    "• <code>/stop SYMBOL</code> — остановить сканер пары\n"
+    "• <code>/stop SYMBOL</code> — остановить сканер пары (доп. флаг: <code>hard</code>)\n"
     "• <code>/status</code> — краткий статус\n"
+    "• <code>/open [SYMBOL] [long|short] [steps=N]</code> — взвод ручного входа (side/steps необяз.)\n"
+    "• <code>/close [SYMBOL]</code> — ручное закрытие позиции\n"
+    "• <code>/diag [SYMBOL]</code> — диагностика (снапшот FUND_BOT)\n"
 )
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -93,8 +96,8 @@ async def cmd_setbank(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args or []
 
     # формы:
-    # 1) /setbank 6000                 -> для уже выбранной пары (в этом чате)
-    # 2) /setbank GBPUSD 6000          -> явная пара + сумма (можно до /run)
+    # 1) /setbank 6000             -> для уже выбранной пары (в этом чате)
+    # 2) /setbank GBPUSD 6000       -> явная пара + сумма (можно до /run)
     if len(args) == 1:
         amt = _parse_amount(args[0])
         if amt is None or amt <= 0:
@@ -177,15 +180,19 @@ async def cmd_run(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = _chat_id(update)
     args = context.args or []
-    if not args:
+    # Разрешаем: /stop, /stop SYMBOL, /stop hard, /stop SYMBOL hard
+    hard = any(a.lower() == "hard" for a in args)
+    # уберём 'hard' и возьмём первый оставшийся аргумент как символ (если есть)
+    non_flags = [a for a in args if a.lower() != "hard"]
+    if non_flags:
+        sym = _norm_symbol(non_flags[0])
+        context.chat_data["current_symbol"] = sym
+    else:
         sym = context.chat_data.get("current_symbol")
         if not sym:
-            return await update.message.reply_html("Укажите символ: <code>/stop SYMBOL</code>")
-    else:
-        sym = _norm_symbol(args[0])
-        context.chat_data["current_symbol"] = sym
+            return await update.message.reply_html("Укажите символ: <code>/stop SYMBOL</code> (или используйте <code>/run SYMBOL</code> сначала)")
 
-    msg = await stop_scanner_for_pair(context.application, symbol=sym, chat_id=chat_id, hard=False)
+    msg = await stop_scanner_for_pair(context.application, symbol=sym, chat_id=chat_id, hard=hard)
     await update.message.reply_html(msg)
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -194,18 +201,66 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ns = _ns_key(sym, chat_id)
     box = context.application.bot_data.get(ns) or {}
 
-    # короткий статус из снапшота (складёт его сам сканер)
+    # короткий статус из снапшота (кладёт его сам сканер)
     snap = box.get("status_snapshot") or {}
     state = snap.get("state", "N/A")
     bank_f = snap.get("bank_fact_usdt")
     bank_t = snap.get("bank_target_usdt")
     has_rng = "✅" if snap.get("has_ranges") else "❌"
-    await update.message.reply_html(
+    # если сканер уже сформировал готовую строку — покажем её
+    text = box.get("status_line") or (
         f"<b>Статус ({_norm_symbol(sym)})</b>\n"
         f"Сканер: <b>{state}</b>\n"
         f"Банк (факт/план): {bank_f if bank_f is not None else 'N/A'} / {bank_t if bank_t is not None else 'N/A'} USD\n"
         f"Диапазоны доступны: {has_rng}"
     )
+    await update.message.reply_html(text)
+
+async def cmd_open(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Взвод ручного входа: /open [SYMBOL] [long|short] [steps=N]"""
+    chat_id = _chat_id(update)
+    args = context.args or []
+    sym = _norm_symbol(args[0]) if args else (context.chat_data.get("current_symbol") or CONFIG.SYMBOL)
+    side = None
+    steps = None
+    for a in (args[1:] if args else []):
+        al = a.lower()
+        if al in ("long", "short"):
+            side = al.upper()
+        elif al.startswith("steps="):
+            try:
+                steps = int(float(al.split("=", 1)[1]))
+            except:
+                pass
+    ns = _ns_key(sym, chat_id)
+    box = context.application.bot_data.setdefault(ns, {})
+    box["manual_open"] = {"side": side, "max_steps": steps}  # side может быть None → авто по стратегии
+    box["user_manual_mode"] = False  # снять ручной режим после TP/SL/manual_close
+    context.chat_data["current_symbol"] = sym
+    await update.message.reply_html(
+        f"Готово. Взведён /open для <b>{sym}</b>: side={side or 'auto'}, steps={steps or 'auto'}"
+    )
+
+async def cmd_close(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Ручное закрытие текущей позиции."""
+    chat_id = _chat_id(update)
+    args = context.args or []
+    sym = _norm_symbol(args[0]) if args else (context.chat_data.get("current_symbol") or CONFIG.SYMBOL)
+    ns = _ns_key(sym, chat_id)
+    box = context.application.bot_data.setdefault(ns, {})
+    box["force_close"] = True
+    context.chat_data["current_symbol"] = sym
+    await update.message.reply_html(f"MANUAL_CLOSE запрошен для <b>{sym}</b>.")
+
+async def cmd_diag(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Разовая диагностика: снапшот таргетов FUND_BOT в канал."""
+    chat_id = _chat_id(update)
+    args = context.args or []
+    sym = _norm_symbol(args[0]) if args else (context.chat_data.get("current_symbol") or CONFIG.SYMBOL)
+    ns = _ns_key(sym, chat_id)
+    box = context.application.bot_data.setdefault(ns, {})
+    box["cmd_diag_targets"] = True
+    await update.message.reply_html("Диагностика: запросил снапшот таргетов FUND_BOT.")
 
 # ------------ сборка приложения ------------
 
@@ -222,6 +277,9 @@ def build_app() -> Application:
     application.add_handler(CommandHandler("run",   cmd_run))
     application.add_handler(CommandHandler("stop",  cmd_stop))
     application.add_handler(CommandHandler("status", cmd_status))
+    application.add_handler(CommandHandler("open",   cmd_open))
+    application.add_handler(CommandHandler("close",  cmd_close))
+    application.add_handler(CommandHandler("diag",   cmd_diag))
 
     log.info("Bot application built.")
     return application
