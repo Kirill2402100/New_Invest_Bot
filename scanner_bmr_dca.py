@@ -202,16 +202,16 @@ class CONFIG:
     ORDINARY_ADDS = 5  # столько обычных доборов после входа
 
     # Анти-слипание ценовых уровней
-    DCA_MIN_GAP_TICKS = 2       # минимум 2 тика между целями
+    DCA_MIN_GAP_TICKS = 2      # минимум 2 тика между целями
 
     # Показываем ML-цену при целевом Margin Level
-    ML_TARGET_PCT = 20.0        # "ML цена (20%)"
+    ML_TARGET_PCT = 20.0       # "ML цена (20%)"
 
     # Расширение коридора после пробоя
     EXT_AFTER_BREAK = {
-        "CONFIRM_BARS_5M": 6,   # сколько 5m-баров нужно удержаться за STRAT
+        "CONFIRM_BARS_5M": 6,  # сколько 5m-баров нужно удержаться за STRAT
         "EXTRA_LOOKBACK_DAYS": 10, # доп. история для «нового потолка/пола» (на TF_RANGE)
-        "ATR_MULT_MIN": 2.0,    # минимальная ширина экстеншена в ATR
+        "ATR_MULT_MIN": 2.0,   # минимальная ширина экстеншена в ATR
         "PRICE_EPS": 0.0015,     # небольшой буфер от уровня пробоя
     }
     
@@ -219,8 +219,26 @@ class CONFIG:
     BOOST_MAX_STEPS = 3
     BREAK_MSG_COOLDOWN_SEC = 45
 
+    # --- manual reopen policy ---
+    # После закрытия сделки требовать ручной запуск нового цикла командой /open
+    REQUIRE_MANUAL_REOPEN_ON = {
+        "manual_close": True,  # после ручного закрытия
+        "sl_hit": True,        # после SL/трейла
+        "tp_hit": True,        # ⬅ по умолчанию тоже ждём /open
+    }
+    REMIND_MANUAL_MSG_COOLDOWN_SEC = 120  # раз в N секунд напоминать про /open
+
+    # --- подтверждение пробоя STRAT ---
+    # Прежде чем «замораживать» обычные усреднения/строить EXT,
+    # проверяем пробой несколькими замерами
+    BREAK_PROBE = {
+        "SAMPLES": 3,          # число подтверждений
+        "INTERVAL_SEC": 5,     # интервал между замерами, сек
+        "TIMEOUT_SEC": 20,     # таймаут пробы, сек
+    }
+
 # ENV-переопределения
-CONFIG.SYMBOL   = os.getenv("FX_SYMBOL", CONFIG.SYMBOL)
+CONFIG.SYMBOL    = os.getenv("FX_SYMBOL", CONFIG.SYMBOL)
 CONFIG.TF_ENTRY = os.getenv("TF_ENTRY", CONFIG.TF_ENTRY)
 CONFIG.TF_RANGE = os.getenv("TF_RANGE", os.getenv("TF_TREND", CONFIG.TF_RANGE))
 
@@ -685,12 +703,12 @@ def compute_corridor_targets(entry: float, side: str, rng_strat: dict, rng_tac: 
     DESIRED_STRAT = 3
 
     if side == "LONG":
-        tac_b   = min(entry, rng_tac["lower"])
+        tac_b    = min(entry, rng_tac["lower"])
         strat_b = min(entry, rng_strat["lower"])
         seg1 = _place_segment(entry, tac_b,   DESIRED_TAC,   tick, include_end_last=False)  # TAC
         seg2 = _place_segment(tac_b,  strat_b, DESIRED_STRAT, tick, include_end_last=True)   # STRAT
     else:
-        tac_b   = max(entry, rng_tac["upper"])
+        tac_b    = max(entry, rng_tac["upper"])
         strat_b = max(entry, rng_strat["upper"])
         seg1 = _place_segment(entry, tac_b,   DESIRED_TAC,   tick, include_end_last=False)
         seg2 = _place_segment(tac_b,  strat_b, DESIRED_STRAT, tick, include_end_last=True)
@@ -754,7 +772,7 @@ def next_pct_target(pos):
         return None
     used_dca = max(0, (pos.steps_filled - (1 if pos.reserve_used else 0)) - 1)
     base = getattr(pos, "ordinary_offset", 0)
-    abs_idx = max(base, used_dca)      # <-- ключевая правка
+    abs_idx = max(base, used_dca)       # <-- ключевая правка
     return pos.ordinary_targets[abs_idx] if 0 <= abs_idx < len(pos.ordinary_targets) else None
 
 def choose_growth(ind: dict, rng_strat: dict, rng_tac: dict) -> float:
@@ -781,8 +799,8 @@ def _is_df_fresh(df: pd.DataFrame, max_age_min: int = 15) -> bool:
         return True
 
 async def plan_extension_after_break(symbol: str, pos: "Position",
-                                         rng_strat: dict, rng_tac: dict,
-                                         px: float, tick: float) -> list[dict]:
+                                     rng_strat: dict, rng_tac: dict,
+                                     px: float, tick: float) -> list[dict]:
     """
     Дорисовывает оставшиеся обычные уровни после подтверждённого пробоя STRAT.
     Не трогает уже 'израсходованные' цели. Возвращает новый список ordinary_targets.
@@ -900,8 +918,8 @@ def compute_indicators_5m(df: pd.DataFrame) -> dict:
     }
 
 class FSM(IntEnum):
-    IDLE = 0    # нет позиции
-    OPENED = 1  # открыт 1-й шаг, идёт первичное оповещение
+    IDLE = 0   # нет позиции
+    OPENED = 1 # открыт 1-й шаг, идёт первичное оповещение
     MANAGING = 2 # можно ADD/RETEST/TRAIL/EXIT
 
 # ---------------------------------------------------------------------------
@@ -942,8 +960,8 @@ class Position:
         self.extension_planned: bool = False
         self.ordinary_offset: int = 0
         # антидубли
-        self.last_filled_q: float | None = None    # последний исполненный уровень (квантованный в тик)
-        self.last_px: float | None = None          # предыдущая наблюдённая цена (для кросс-овера)
+        self.last_filled_q: float | None = None   # последний исполненный уровень (квантованный в тик)
+        self.last_px: float | None = None         # предыдущая наблюдённая цена (для кросс-овера)
 
     def plan_with_reserve(self, bank: float, growth: float, ord_levels: int):
         self.growth = growth
@@ -1110,6 +1128,14 @@ async def scanner_main_loop(
         b["last_msg_text"] = txt
         b["last_msg_ts"] = now_ts
         await broadcast(app, txt, target_chat_id=target_chat_id)
+
+    # Напоминание о ручном запуске нового цикла
+    async def _remind_manual_open():
+        if time.time() - b.get("manual_remind_ts", 0) >= CONFIG.REMIND_MANUAL_MSG_COOLDOWN_SEC:
+            await say("⏸ Ручной режим: чтобы запустить новый цикл, отправьте <b>/open</b>.")
+            b["manual_remind_ts"] = time.time()
+
+    # ---
 
     # ФА-политика
     fa = await read_fa_policy(symbol, sheet)
@@ -1368,7 +1394,8 @@ async def scanner_main_loop(
 
             # Ручное закрытие
             if pos and b.get("force_close"):
-                if not pos or b.get("fsm_state") != int(FSM.MANAGING) or pos.steps_filled <= 0:
+                # Разрешаем ручное закрытие как в OPENED, так и в MANAGING
+                if (not pos) or pos.steps_filled <= 0 or (b.get("fsm_state") not in (int(FSM.OPENED), int(FSM.MANAGING))):
                     await asyncio.sleep(1); continue
                 exit_p = px
                 time_min = (time.time()-pos.open_ts)/60.0
@@ -1389,13 +1416,66 @@ async def scanner_main_loop(
                     "FA_Risk": b.get("fa_risk") or "", "FA_Bias": b.get("fa_bias") or "",
                 }), sheet)
                 b["force_close"] = False
+                # Включаем «ручной режим» до явного /open
+                if CONFIG.REQUIRE_MANUAL_REOPEN_ON.get("manual_close", True):
+                    b["user_manual_mode"] = True
+                    await _remind_manual_open()
                 pos.last_sl_notified_price = None
                 b["position"] = None
                 b["fsm_state"] = int(FSM.IDLE)
                 continue
 
-            # Пробой диапазона — заморозка обычных усреднений, включаем режим ретеста
+            # --- Проба пробоя STRAT перед заморозкой обычных усреднений ---
             if pos:
+                brk_up, brk_dn = break_levels(rng_strat)
+                eps = CONFIG.EXT_AFTER_BREAK["PRICE_EPS"]
+
+                def _is_beyond(px_val, up, dn, eps_, direction):
+                    if direction == "up":
+                        return px_val >= up * (1.0 + eps_)
+                    else:
+                        return px_val <= dn * (1.0 - eps_)
+
+                # направление потенциального пробоя
+                dir_now = "up" if px >= brk_up * (1.0 + eps) else ("down" if px <= brk_dn * (1.0 - eps) else None)
+                probe = b.get("break_probe")  # {"dir","hits","started","last_ts"} | None
+                now_ts = time.time()
+
+                # старт пробы
+                if dir_now and (probe is None):
+                    b["break_probe"] = {"dir": dir_now, "hits": 1, "started": now_ts, "last_ts": now_ts}
+                    await say("🧪 Вижу возможный пробой STRAT — жду подтверждения…")
+
+                # апдейт пробы
+                probe = b.get("break_probe")
+                if probe:
+                    if not _is_beyond(px, brk_up, brk_dn, eps, probe["dir"]):
+                        # вышли из зоны — отменяем пробу
+                        b["break_probe"] = None
+                    else:
+                        # добираем замеры раз в INTERVAL_SEC
+                        if now_ts - probe["last_ts"] >= CONFIG.BREAK_PROBE["INTERVAL_SEC"]:
+                            probe["hits"] += 1
+                            probe["last_ts"] = now_ts
+                        # таймаут пробы
+                        if now_ts - probe["started"] > CONFIG.BREAK_PROBE["TIMEOUT_SEC"]:
+                            b["break_probe"] = None
+                        # подтверждение пробы — включаем штатную механику пробоя
+                        probe = b.get("break_probe")
+                        if probe and probe["hits"] >= CONFIG.BREAK_PROBE["SAMPLES"]:
+                            pos.freeze_ordinary = True
+                            pos.break_dir = probe["dir"]
+                            pos.break_confirm_bars = 0
+                            pos.extension_planned = False
+                            b["break_last_bar_id"] = None
+                            b["break_probe"] = None
+                            if now_ts - b.get("break_toggle_ts", 0) >= CONFIG.BREAK_MSG_COOLDOWN_SEC:
+                                b["break_toggle_ts"] = now_ts
+                                await say("📌 Пробой STRAT подтверждён — обычные усреднения заморожены. Резерв держим на ретест.")
+
+            # Пробой диапазона — заморозка обычных усреднений, включаем режим ретеста (штатная логика)
+            # Не замораживаем, пока идёт «проба» подтверждения (break_probe)
+            if pos and not b.get("break_probe"):
                 if not pos or b.get("fsm_state") != int(FSM.MANAGING) or pos.steps_filled <= 0:
                     await asyncio.sleep(1); continue
                 brk_up, brk_dn = break_levels(rng_strat)
@@ -1410,7 +1490,7 @@ async def scanner_main_loop(
                     if now_ts - b.get("break_toggle_ts", 0) >= CONFIG.BREAK_MSG_COOLDOWN_SEC:
                         b["break_toggle_ts"] = now_ts
                         await say("📌 Пробой STRAT — обычные усреднения заморожены. Резерв держим на ретест.")
-                
+            
             # --- Подтверждение пробоя и дорисовка коридора ---
             if pos and pos.freeze_ordinary:
                 brk_up, brk_dn = break_levels(rng_strat)
@@ -1467,9 +1547,12 @@ async def scanner_main_loop(
                             log.exception("log EXT_PLAN failed")
 
             # Открытие
-            if not pos and (b.get("manual_open") is not None or not manage_only_flag):
-                manual = b.pop("manual_open", None)
-                if manual:
+            if not pos and ( b.get("manual_open") is not None
+                             or (not manage_only_flag and not b.get("user_manual_mode", False)) ):
+                # Взвод /open должен сохраняться до фактического входа
+                manual = b.get("manual_open")
+                # /open без стороны = «взвод»: входим только по условиям стратегии
+                if (manual is not None) and manual.get("side"):
                     side_cand = manual.get("side")
                 else:
                     pos_in = max(0.0, min(1.0, (px - rng_tac["lower"]) / max(rng_tac["width"], 1e-9)))
@@ -1484,7 +1567,7 @@ async def scanner_main_loop(
 
                 if side_cand:
                     pos = Position(side_cand, signal_id=f"{symbol.replace('/','')} {int(now)}",
-                                     leverage=CONFIG.LEVERAGE, owner_key=b["owner_key"])
+                                   leverage=CONFIG.LEVERAGE, owner_key=b["owner_key"])
 
                     ord_levels = min(CONFIG.DCA_LEVELS - 1, 1 + CONFIG.ORDINARY_ADDS)
                     if manual and manual.get("max_steps") is not None:
@@ -1556,6 +1639,8 @@ async def scanner_main_loop(
                         pos.ordinary_offset = used_ord_after - 1
                         
                         b["position"] = pos
+                        # После успешного входа очищаем «взвод» /open
+                        b["manual_open"] = None
                         b["fsm_state"] = int(FSM.MANAGING)
                         
                         nxt = next_pct_target(pos)
@@ -1604,6 +1689,8 @@ async def scanner_main_loop(
                     margin, _ = pos.add_step(px)
                     pos.rebalance_tail_margins_excluding_reserve(alloc_bank)
                     b["position"] = pos
+                    # После успешного входа очищаем «взвод» /open
+                    b["manual_open"] = None
                     b["fsm_state"] = int(FSM.OPENED)
 
             if pos:
@@ -1711,72 +1798,78 @@ async def scanner_main_loop(
                         if is_open_event:
                             b["fsm_state"] = int(FSM.MANAGING) # Переключаем после первого сообщения
 
-                # Трейл-стоп, TP/SL выходы (без изменений) ...
-                if pos and b.get("fsm_state") == int(FSM.MANAGING) and pos.steps_filled > 0:
-                    if pos.side == "LONG": gain_to_tp = max(0.0, (px / max(pos.avg, 1e-9) - 1.0) / CONFIG.TP_PCT)
-                    else: gain_to_tp = max(0.0, (pos.avg / max(px, 1e-9) - 1.0) / CONFIG.TP_PCT)
-                    for stage_idx, (arm, lock) in enumerate(CONFIG.TRAILING_STAGES):
-                        if pos.trail_stage >= stage_idx: continue
-                        if gain_to_tp < arm: break
-                        lock_pct = lock * CONFIG.TP_PCT
-                        locked = pos.avg * (1 + lock_pct) if pos.side == "LONG" else pos.avg * (1 - lock_pct)
-                        chand = chandelier_stop(pos.side, px, ind["atr5m"])
-                        new_sl = max(locked, chand) if pos.side == "LONG" else min(locked, chand)
+                    # Трейл-стоп, TP/SL выходы (без изменений) ...
+                    # Во время пробы пробоя (break_probe) трейлинг не двигаем
+                    if pos and b.get("fsm_state") == int(FSM.MANAGING) and pos.steps_filled > 0 and not b.get("break_probe"):
+                        if pos.side == "LONG": gain_to_tp = max(0.0, (px / max(pos.avg, 1e-9) - 1.0) / CONFIG.TP_PCT)
+                        else: gain_to_tp = max(0.0, (pos.avg / max(px, 1e-9) - 1.0) / CONFIG.TP_PCT)
+                        for stage_idx, (arm, lock) in enumerate(CONFIG.TRAILING_STAGES):
+                            if pos.trail_stage >= stage_idx: continue
+                            if gain_to_tp < arm: break
+                            lock_pct = lock * CONFIG.TP_PCT
+                            locked = pos.avg * (1 + lock_pct) if pos.side == "LONG" else pos.avg * (1 - lock_pct)
+                            chand = chandelier_stop(pos.side, px, ind["atr5m"])
+                            new_sl = max(locked, chand) if pos.side == "LONG" else min(locked, chand)
 
-                        t = b.get("price_tick", 1e-4)
-                        new_sl_q  = quantize_to_tick(new_sl, t)
-                        curr_sl_q = quantize_to_tick(pos.sl_price, t)
-                        last_notif_q = quantize_to_tick(pos.last_sl_notified_price, t)
+                            t = b.get("price_tick", 1e-4)
+                            new_sl_q   = quantize_to_tick(new_sl, t)
+                            curr_sl_q = quantize_to_tick(pos.sl_price, t)
+                            last_notif_q = quantize_to_tick(pos.last_sl_notified_price, t)
 
-                        improves = (curr_sl_q is None) or \
-                                   (pos.side == "LONG" and new_sl_q > curr_sl_q) or \
-                                   (pos.side == "SHORT" and new_sl_q < curr_sl_q)
-                        if improves:
-                            pos.sl_price = new_sl_q
-                            pos.trail_stage = stage_idx
-                            if (last_notif_q is None) or \
-                               (pos.side == "LONG" and new_sl_q > (last_notif_q + t)) or \
-                               (pos.side == "SHORT" and new_sl_q < (last_notif_q - t)):
-                                await say(f"🛡️ Трейлинг-SL (стадия {stage_idx+1}) → <code>{fmt(pos.sl_price)}</code>")
-                                pos.last_sl_notified_price = pos.sl_price
-                                await log_event_safely(with_banks({
-                                    "Event_ID": f"TRAIL_SET_{pos.signal_id}_{int(now)}", "Signal_ID": pos.signal_id,
-                                    "Timestamp_UTC": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
-                                    "Pair": symbol, "Side": pos.side, "Event": "TRAIL_SET",
-                                    "SL_Price": pos.sl_price, "Avg_Price": pos.avg, "Trail_Stage": stage_idx + 1,
-                                    "Chat_ID": b.get("chat_id") or "", "Owner_Key": b.get("owner_key") or "",
-                                    "FA_Risk": b.get("fa_risk") or "", "FA_Bias": b.get("fa_bias") or "",
-                                }), sheet)
+                            improves = (curr_sl_q is None) or \
+                                       (pos.side == "LONG" and new_sl_q > curr_sl_q) or \
+                                       (pos.side == "SHORT" and new_sl_q < curr_sl_q)
+                            if improves:
+                                pos.sl_price = new_sl_q
+                                pos.trail_stage = stage_idx
+                                if (last_notif_q is None) or \
+                                   (pos.side == "LONG" and new_sl_q > (last_notif_q + t)) or \
+                                   (pos.side == "SHORT" and new_sl_q < (last_notif_q - t)):
+                                    await say(f"🛡️ Трейлинг-SL (стадия {stage_idx+1}) → <code>{fmt(pos.sl_price)}</code>")
+                                    pos.last_sl_notified_price = pos.sl_price
+                                    await log_event_safely(with_banks({
+                                        "Event_ID": f"TRAIL_SET_{pos.signal_id}_{int(now)}", "Signal_ID": pos.signal_id,
+                                        "Timestamp_UTC": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+                                        "Pair": symbol, "Side": pos.side, "Event": "TRAIL_SET",
+                                        "SL_Price": pos.sl_price, "Avg_Price": pos.avg, "Trail_Stage": stage_idx + 1,
+                                        "Chat_ID": b.get("chat_id") or "", "Owner_Key": b.get("owner_key") or "",
+                                        "FA_Risk": b.get("fa_risk") or "", "FA_Bias": b.get("fa_bias") or "",
+                                    }), sheet)
                         
-                    tp_hit = (pos.side == "LONG" and px >= pos.tp_price) or (pos.side == "SHORT" and px <= pos.tp_price)
-                    sl_hit = pos.sl_price and (
-                        (pos.side == "LONG" and px <= pos.sl_price) or (pos.side == "SHORT" and px >= pos.sl_price)
-                    )
-                    if tp_hit or sl_hit:
-                        reason = "TP_HIT" if tp_hit else "SL_HIT"
-                        exit_p = pos.tp_price if tp_hit else pos.sl_price
-                        time_min = (time.time() - pos.open_ts) / 60.0
-                        net_usd, net_pct = compute_net_pnl(pos, exit_p, fee_taker, fee_taker)
-                        atr_now = ind["atr5m"]
-                        await say(
-                            f"{'✅' if net_usd > 0 else '❌'} <b>{reason}</b>\n"
-                            f"Цена выхода: <code>{fmt(exit_p)}</code>\n"
-                            f"P&L (net)≈ {net_usd:+.2f} USD ({net_pct:+.2f}%)\n"
-                            f"ATR(5m): {atr_now:.6f}\n"
-                            f"Время в сделке: {time_min:.1f} мин"
+                        tp_hit = (pos.side == "LONG" and px >= pos.tp_price) or (pos.side == "SHORT" and px <= pos.tp_price)
+                        sl_hit = pos.sl_price and (
+                            (pos.side == "LONG" and px <= pos.sl_price) or (pos.side == "SHORT" and px >= pos.sl_price)
                         )
-                        await log_event_safely(with_banks({
-                            "Event_ID": f"{reason}_{pos.signal_id}", "Signal_ID": pos.signal_id,
-                            "Timestamp_UTC": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
-                            "Pair": symbol, "Side": pos.side, "Event": reason,
-                            "PNL_Realized_USDT": net_usd, "PNL_Realized_Pct": net_pct,
-                            "Time_In_Trade_min": time_min, "ATR_5m": atr_now,
-                            "Chat_ID": b.get("chat_id") or "", "Owner_Key": b.get("owner_key") or "",
-                            "FA_Risk": b.get("fa_risk") or "", "FA_Bias": b.get("fa_bias") or "",
-                        }), sheet)
-                        pos.last_sl_notified_price = None
-                        b["position"] = None
-                        b["fsm_state"] = int(FSM.IDLE)
+                        if tp_hit or sl_hit:
+                            reason = "TP_HIT" if tp_hit else "SL_HIT"
+                            exit_p = pos.tp_price if tp_hit else pos.sl_price
+                            time_min = (time.time() - pos.open_ts) / 60.0
+                            net_usd, net_pct = compute_net_pnl(pos, exit_p, fee_taker, fee_taker)
+                            atr_now = ind["atr5m"]
+                            await say(
+                                f"{'✅' if net_usd > 0 else '❌'} <b>{reason}</b>\n"
+                                f"Цена выхода: <code>{fmt(exit_p)}</code>\n"
+                                f"P&L (net)≈ {net_usd:+.2f} USD ({net_pct:+.2f}%)\n"
+                                f"ATR(5m): {atr_now:.6f}\n"
+                                f"Время в сделке: {time_min:.1f} мин"
+                            )
+                            await log_event_safely(with_banks({
+                                "Event_ID": f"{reason}_{pos.signal_id}", "Signal_ID": pos.signal_id,
+                                "Timestamp_UTC": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+                                "Pair": symbol, "Side": pos.side, "Event": reason,
+                                "PNL_Realized_USDT": net_usd, "PNL_Realized_Pct": net_pct,
+                                "Time_In_Trade_min": time_min, "ATR_5m": atr_now,
+                                "Chat_ID": b.get("chat_id") or "", "Owner_Key": b.get("owner_key") or "",
+                                "FA_Risk": b.get("fa_risk") or "", "FA_Bias": b.get("fa_bias") or "",
+                            }), sheet)
+                            # После SL/TP — включаем ручной режим (по конфигу) и просим /open
+                            if (reason == "SL_HIT" and CONFIG.REQUIRE_MANUAL_REOPEN_ON.get("sl_hit", True)) \
+                               or (reason == "TP_HIT" and CONFIG.REQUIRE_MANUAL_REOPEN_ON.get("tp_hit", True)):
+                                b["user_manual_mode"] = True
+                                await _remind_manual_open()
+                            pos.last_sl_notified_price = None
+                            b["position"] = None
+                            b["fsm_state"] = int(FSM.IDLE)
 
             # Периодический флэш логов в Sheets
             if (time.time() - last_flush) >= 10:
@@ -1873,13 +1966,11 @@ async def stop_scanner_for_pair(
     t: asyncio.Task | None = tasks.get(ns_key)
 
     # погасим флаг цикла
-    slot = (app.bot_data if "bot_on" in app.bot_data.get(ns_key, {}) else app.bot_data).setdefault(ns_key, {})
+    slot = app.bot_data.setdefault(ns_key, {})
     slot["bot_on"] = False
 
     if hard:
-        slot["position"] = None
-        slot["fsm_state"] = int(FSM.IDLE)
-        slot["intro_done"] = False
+        slot.update(position=None, fsm_state=int(FSM.IDLE), intro_done=False)
 
     # если есть реальная задача — подождём мягкое завершение и при необходимости отменим
     if t:
