@@ -77,7 +77,7 @@ HELP_TEXT = (
     "• <code>/run SYMBOL</code> — запустить сканер пары (требуется заданный банк)\n"
     "• <code>/stop SYMBOL</code> — остановить сканер пары (доп. флаг: <code>hard</code>)\n"
     "• <code>/status</code> — краткий статус\n"
-    "• <code>/open [SYMBOL] [long|short] [steps=N]</code> — взвод ручного входа (side/steps необяз.)\n"
+    "• <code>/open SYMBOL</code> — взвод ручного входа (направление выберет сканер)\n"
     "• <code>/close [SYMBOL]</code> — ручное закрытие позиции\n"
     "• <code>/diag [SYMBOL]</code> — диагностика (снапшот FUND_BOT)\n"
 )
@@ -217,29 +217,18 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_html(text)
 
 async def cmd_open(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Взвод ручного входа: /open [SYMBOL] [long|short] [steps=N]"""
+    """Взвод ручного входа: /open SYMBOL (направление выберет сканер)."""
     chat_id = _chat_id(update)
     args = context.args or []
-    sym = _norm_symbol(args[0]) if args else (context.chat_data.get("current_symbol") or CONFIG.SYMBOL)
-    side = None
-    steps = None
-    for a in (args[1:] if args else []):
-        al = a.lower()
-        if al in ("long", "short"):
-            side = al.upper()
-        elif al.startswith("steps="):
-            try:
-                steps = int(float(al.split("=", 1)[1]))
-            except:
-                pass
+    if not args:
+        return await update.message.reply_html("Укажите символ: <code>/open SYMBOL</code>")
+    sym = _norm_symbol(args[0])
     ns = _ns_key(sym, chat_id)
     box = context.application.bot_data.setdefault(ns, {})
-    box["manual_open"] = {"side": side, "max_steps": steps}  # side может быть None → авто по стратегии
-    box["user_manual_mode"] = False  # снять ручной режим после TP/SL/manual_close
+    box["manual_open"] = {}        # авто-направление и авто-кол-во шагов
+    box["user_manual_mode"] = False   # снять ручной режим после TP/SL/manual_close
     context.chat_data["current_symbol"] = sym
-    await update.message.reply_html(
-        f"Готово. Взведён /open для <b>{sym}</b>: side={side or 'auto'}, steps={steps or 'auto'}"
-    )
+    await update.message.reply_html(f"Готово. Взведён /open для <b>{sym}</b> (направление выберет сканер).")
 
 async def cmd_close(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Ручное закрытие текущей позиции."""
