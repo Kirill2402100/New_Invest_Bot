@@ -1700,22 +1700,20 @@ async def scanner_main_loop(
                     used_ord = pos.steps_filled - (1 if pos.reserve_used else 0)
                     nxt = next_pct_target(pos)
                     is_open_event = b.get("fsm_state") == int(FSM.OPENED) and pos.steps_filled == 1
-                    # --- АНТИДУБЛЬ: триггер только при реальном "кросс-овере" уровня ---
-                    crossed = False
-                    if (b.get("fsm_state") == int(FSM.MANAGING)) and (nxt is not None) and (prev_px is not None):
+                    
+                    reached = False
+                    if (b.get("fsm_state") == int(FSM.MANAGING)) and (nxt is not None):
                         tgt = nxt["price"]
                         if pos.side == "LONG":
-                            # раньше были выше, теперь ушли НИЖЕ уровня на >= 1 тик
-                            crossed = (prev_px > tgt) and (px <= tgt - tick)
+                            reached = (px <= tgt - tick)
                         else:
-                            # раньше были ниже, теперь ушли ВЫШЕ уровня на >= 1 тик
-                            crossed = (prev_px < tgt) and (px >= tgt + tick)
-                    # блокируем повтор на том же самом уровне (квантованном)
-                    if crossed and nxt is not None:
-                        tgt_q = quantize_to_tick(nxt["price"], tick)
-                        if pos.last_filled_q is not None and tgt_q == pos.last_filled_q:
-                            crossed = False
-                    is_add_event = crossed
+                            reached = (px >= tgt + tick)
+                        # не триггерим тот же самый уровень повторно
+                        if reached:
+                            tgt_q = quantize_to_tick(tgt, tick)
+                            if pos.last_filled_q is not None and tgt_q == pos.last_filled_q:
+                                reached = False
+                    is_add_event = reached
                     
                     now_ts = time.time()
                     allowed_now = is_open_event or (pos.last_add_ts is None) or ((now_ts - pos.last_add_ts) >= CONFIG.ADD_COOLDOWN_SEC)
