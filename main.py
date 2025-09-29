@@ -85,6 +85,30 @@ HELP_TEXT = (
     "• <code>/diag [SYMBOL]</code> — диагностика (снапшот FUND_BOT)\n"
 )
 
+# --- меню команд для Telegram ---
+COMMANDS = [
+    BotCommand("start", "Запустить/перезапустить бота"),
+    BotCommand("help", "Показать помощь"),
+    BotCommand("setbank", "Установить банк: SYMBOL USD"),
+    BotCommand("run", "Запустить сканер SYMBOL"),
+    BotCommand("stop", "Остановить сканер [SYMBOL] [hard]"),
+    BotCommand("status", "Краткий статус"),
+    BotCommand("open", "Снять ручной режим и разрешить новый цикл"),
+    BotCommand("pause", "Включить ручной режим (входы не стартуют)"),
+    BotCommand("close", "Ручное закрытие позиции [SYMBOL]"),
+    BotCommand("fees", "Комиссии: maker taker [SYMBOL]"),
+    BotCommand("hedge_close", "Подтвердить закрытие прибыльной ноги хеджа"),
+    BotCommand("diag", "Диагностика FUND_BOT"),
+]
+
+async def _post_init(app: Application):
+    try:
+        await app.bot.set_my_commands(COMMANDS)
+        log.info("Bot commands set: %s", ", ".join(c.command for c in COMMANDS))
+    except Exception:
+        log.exception("Failed to set bot commands")
+
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_html(
         "Бот запущен. Сначала установите банк: "
@@ -315,27 +339,6 @@ async def cmd_hedge_close_alias(update: Update, context: ContextTypes.DEFAULT_TY
 
 async def cmd_unknown(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_html("Неизвестная команда. Вот список:\n\n" + HELP_TEXT)
-
-# --- обновляем меню команд у клиентов ---
-async def _post_init(application: Application):
-    cmds = [
-        BotCommand("start", "Запустить/перезапустить бота"),
-        BotCommand("help", "Справка"),
-        BotCommand("setbank", "Установить банк <SYMBOL USD>"),
-        BotCommand("run", "Запустить сканер пары"),
-        BotCommand("stop", "Остановить сканер пары"),
-        BotCommand("status", "Показать краткий статус"),
-        BotCommand("open", "Снять ручной режим и разрешить новый цикл"),
-        BotCommand("pause", "Включить ручной режим (входы не стартуют)"),
-        BotCommand("close", "Ручное закрытие позиции"),
-        BotCommand("diag", "Диагностика FUND_BOT"),
-        BotCommand("fees", "Задать комиссии maker/taker"),
-        BotCommand("hedge_close", "Подтвердить закрытие прибыли хеджа"),
-    ]
-    try:
-        await application.bot.set_my_commands(cmds)
-    except Exception as e:
-        log.warning(f"set_my_commands failed: {e}")
 
 # ------------ сборка приложения ------------
 
