@@ -7,9 +7,10 @@ import re
 import time
 from typing import Optional
 
-from telegram import Update
+from telegram import Update, BotCommand
 from telegram.ext import (
-    Application, ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
+    Application, ApplicationBuilder, CommandHandler, ContextTypes,
+    MessageHandler, filters
 )
 
 # наш DCA-сканер
@@ -305,14 +306,36 @@ async def cmd_hedge_close(update: Update, context: ContextTypes.DEFAULT_TYPE):
         box["hedge_close_price"] = None
         await update.message.reply_html(f"⚠️ Цена не распознана — сканер возьмёт рыночную. Пара: <b>{sym}</b>.")
 
-# --- алиас на кириллице: /хедж_закрытие ---
-# Telegram не разрешает регистрировать такие команды напрямую, поэтому ловим их regex-ом
-async def hedge_close_alias(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (update.effective_message.text or "").strip()
-    parts = text.split()
-    # эмулируем context.args как у обычной команды: всё после 1-го токена
+# --- кириллический алиас /хедж_закрытие (CommandHandler не принимает нелатиницу) ---
+async def cmd_hedge_close_alias(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (update.message.text or "")
+    parts = text.split(maxsplit=2)  # "/хедж_закрытие 1.2345 EURUSD"
     context.args = parts[1:] if len(parts) > 1 else []
     return await cmd_hedge_close(update, context)
+
+async def cmd_unknown(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_html("Неизвестная команда. Вот список:\n\n" + HELP_TEXT)
+
+# --- обновляем меню команд у клиентов ---
+async def _post_init(application: Application):
+    cmds = [
+        BotCommand("start", "Запустить/перезапустить бота"),
+        BotCommand("help", "Справка"),
+        BotCommand("setbank", "Установить банк <SYMBOL USD>"),
+        BotCommand("run", "Запустить сканер пары"),
+        BotCommand("stop", "Остановить сканер пары"),
+        BotCommand("status", "Показать краткий статус"),
+        BotCommand("open", "Снять ручной режим и разрешить новый цикл"),
+        BotCommand("pause", "Включить ручной режим (входы не стартуют)"),
+        BotCommand("close", "Ручное закрытие позиции"),
+        BotCommand("diag", "Диагностика FUND_BOT"),
+        BotCommand("fees", "Задать комиссии maker/taker"),
+        BotCommand("hedge_close", "Подтвердить закрытие прибыли хеджа"),
+    ]
+    try:
+        await application.bot.set_my_commands(cmds)
+    except Exception as e:
+        log.warning(f"set_my_commands failed: {e}")
 
 # ------------ сборка приложения ------------
 
@@ -321,7 +344,7 @@ def build_app() -> Application:
     if not token:
         raise RuntimeError("TELEGRAM_TOKEN/BOT_TOKEN is not set")
 
-    application = ApplicationBuilder().token(token).build()
+    application = ApplicationBuilder().token(token).post_init(_post_init).build()
 
     application.add_handler(CommandHandler("start", cmd_start))
     application.add_handler(CommandHandler("help",  cmd_help))
@@ -335,12 +358,10 @@ def build_app() -> Application:
     application.add_handler(CommandHandler("diag",   cmd_diag))
     application.add_handler(CommandHandler("fees",   cmd_fees))
     application.add_handler(CommandHandler("hedge_close", cmd_hedge_close))
-    application.add_handler(
-        MessageHandler(
-            filters.Regex(r"^/хедж_закрытие(?:@\w+)?(?:\s|$)"),
-            hedge_close_alias
-        )
-    )
+    # кириллический алиас ловим как обычный текст:
+    application.add_handler(MessageHandler(filters.Regex(r"^/хедж_закрытие(\s|$)"), cmd_hedge_close_alias))
+    # обработчик неизвестных команд — в самом конце:
+    application.add_handler(MessageHandler(filters.COMMAND, cmd_unknown))
 
     log.info("Bot application built.")
     return application
