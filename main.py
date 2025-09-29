@@ -9,7 +9,7 @@ from typing import Optional
 
 from telegram import Update
 from telegram.ext import (
-    Application, ApplicationBuilder, CommandHandler, ContextTypes
+    Application, ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
 )
 
 # наш DCA-сканер
@@ -305,6 +305,15 @@ async def cmd_hedge_close(update: Update, context: ContextTypes.DEFAULT_TYPE):
         box["hedge_close_price"] = None
         await update.message.reply_html(f"⚠️ Цена не распознана — сканер возьмёт рыночную. Пара: <b>{sym}</b>.")
 
+# --- алиас на кириллице: /хедж_закрытие ---
+# Telegram не разрешает регистрировать такие команды напрямую, поэтому ловим их regex-ом
+async def hedge_close_alias(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (update.effective_message.text or "").strip()
+    parts = text.split()
+    # эмулируем context.args как у обычной команды: всё после 1-го токена
+    context.args = parts[1:] if len(parts) > 1 else []
+    return await cmd_hedge_close(update, context)
+
 # ------------ сборка приложения ------------
 
 def build_app() -> Application:
@@ -325,7 +334,13 @@ def build_app() -> Application:
     application.add_handler(CommandHandler("close",  cmd_close))
     application.add_handler(CommandHandler("diag",   cmd_diag))
     application.add_handler(CommandHandler("fees",   cmd_fees))
-    application.add_handler(CommandHandler(["hedge_close", "хедж_закрытие"], cmd_hedge_close))
+    application.add_handler(CommandHandler("hedge_close", cmd_hedge_close))
+    application.add_handler(
+        MessageHandler(
+            filters.Regex(r"^/хедж_закрытие(?:@\w+)?(?:\s|$)"),
+            hedge_close_alias
+        )
+    )
 
     log.info("Bot application built.")
     return application
