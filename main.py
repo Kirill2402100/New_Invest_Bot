@@ -1,4 +1,3 @@
-# main.py
 from __future__ import annotations
 
 import asyncio
@@ -77,8 +76,11 @@ HELP_TEXT = (
     "• <code>/run SYMBOL</code> — запустить сканер пары (требуется заданный банк)\n"
     "• <code>/stop SYMBOL</code> — остановить сканер пары (доп. флаг: <code>hard</code>)\n"
     "• <code>/status</code> — краткий статус\n"
-    "• <code>/open SYMBOL</code> — взвод ручного входа (направление выберет сканер)\n"
+    "• <code>/open SYMBOL</code> — снять ручной режим и разрешить новый цикл\n"
+    "• <code>/pause [SYMBOL]</code> — включить ручной режим (входы не стартуют)\n"
+    "• <code>/fees MAKER TAKER [SYMBOL]</code> — задать комиссии в долях (пример: <code>/fees 0.0002 0.0005 EURUSD</code>)\n"
     "• <code>/close [SYMBOL]</code> — ручное закрытие позиции\n"
+    "• <code>/hedge_close PRICE [SYMBOL]</code> / <code>/хедж_закрытие PRICE [SYMBOL]</code> — подтвердить закрытие прибыльной ноги хеджа\n"
     "• <code>/diag [SYMBOL]</code> — диагностика (снапшот FUND_BOT)\n"
 )
 
@@ -241,6 +243,37 @@ async def cmd_close(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.chat_data["current_symbol"] = sym
     await update.message.reply_html(f"MANUAL_CLOSE запрошен для <b>{sym}</b>.")
 
+async def cmd_pause(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Включить ручной режим (входы не стартуют)."""
+    chat_id = _chat_id(update)
+    args = context.args or []
+    sym = _norm_symbol(args[0]) if args else (context.chat_data.get("current_symbol") or CONFIG.SYMBOL)
+    ns = _ns_key(sym, chat_id)
+    box = context.application.bot_data.setdefault(ns, {})
+    box["user_manual_mode"] = True
+    context.chat_data["current_symbol"] = sym
+    await update.message.reply_html(f"⏸ Включён ручной режим по <b>{sym}</b>. Используйте <code>/open {sym}</code> для продолжения.")
+
+async def cmd_fees(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Установить комиссии: maker taker (в долях). /fees 0.0002 0.0005 [SYMBOL]"""
+    args = context.args or []
+    if len(args) < 2:
+        return await update.message.reply_html("Формат: <code>/fees 0.0000 0.0000 [SYMBOL]</code>")
+    try:
+        maker = float(str(args[0]).replace(",", "."))
+        taker = float(str(args[1]).replace(",", "."))
+    except Exception:
+        return await update.message.reply_html("Не могу разобрать комиссии. Пример: <code>/fees 0.0002 0.0005</code>")
+    sym = _norm_symbol(args[2]) if len(args) > 2 else (context.chat_data.get("current_symbol") or CONFIG.SYMBOL)
+    chat_id = _chat_id(update)
+    box = _get_slot(context.application, sym, chat_id)
+    box["fee_maker"] = maker
+    box["fee_taker"] = taker
+    context.chat_data["current_symbol"] = sym
+    await update.message.reply_html(
+        f"⚙️ Комиссии для <b>{sym}</b> заданы: maker={maker:.6f}, taker={taker:.6f}"
+    )
+
 async def cmd_diag(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Разовая диагностика: снапшот таргетов FUND_BOT в канал."""
     chat_id = _chat_id(update)
@@ -250,6 +283,27 @@ async def cmd_diag(update: Update, context: ContextTypes.DEFAULT_TYPE):
     box = context.application.bot_data.setdefault(ns, {})
     box["cmd_diag_targets"] = True
     await update.message.reply_html("Диагностика: запросил снапшот таргетов FUND_BOT.")
+
+async def cmd_hedge_close(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Подтвердить закрытие прибыльной ноги хеджа и передать фактическую цену.
+    Команды: /hedge_close PRICE [SYMBOL]  и  /хедж_закрытие PRICE [SYMBOL]
+    """
+    args = context.args or []
+    if not args:
+        return await update.message.reply_html("Формат: <code>/hedge_close 150.123 [SYMBOL]</code>")
+    price_raw = args[0]
+    sym = _norm_symbol(args[1]) if len(args) > 1 else (context.chat_data.get("current_symbol") or CONFIG.SYMBOL)
+    chat_id = _chat_id(update)
+    ns = _ns_key(sym, chat_id)
+    box = context.application.bot_data.setdefault(ns, {})
+    try:
+        px = float(str(price_raw).replace(",", "."))
+        box["hedge_close_price"] = px
+        context.chat_data["current_symbol"] = sym
+        await update.message.reply_html(f"✅ Принял цену закрытия хеджа по <b>{sym}</b>: <code>{px:.6f}</code>")
+    except Exception:
+        box["hedge_close_price"] = None
+        await update.message.reply_html(f"⚠️ Цена не распознана — сканер возьмёт рыночную. Пара: <b>{sym}</b>.")
 
 # ------------ сборка приложения ------------
 
@@ -267,8 +321,11 @@ def build_app() -> Application:
     application.add_handler(CommandHandler("stop",  cmd_stop))
     application.add_handler(CommandHandler("status", cmd_status))
     application.add_handler(CommandHandler("open",   cmd_open))
+    application.add_handler(CommandHandler("pause",  cmd_pause))
     application.add_handler(CommandHandler("close",  cmd_close))
     application.add_handler(CommandHandler("diag",   cmd_diag))
+    application.add_handler(CommandHandler("fees",   cmd_fees))
+    application.add_handler(CommandHandler(["hedge_close", "хедж_закрытие"], cmd_hedge_close))
 
     log.info("Bot application built.")
     return application
