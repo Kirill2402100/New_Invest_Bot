@@ -7,7 +7,11 @@ import re
 import time
 from typing import Optional
 
-from telegram import Update, BotCommand
+from telegram import (
+    Update, BotCommand,
+    BotCommandScopeDefault, BotCommandScopeAllPrivateChats,
+    BotCommandScopeAllGroupChats, BotCommandScopeChat,
+)
 from telegram.ext import (
     Application, ApplicationBuilder, CommandHandler, ContextTypes,
     MessageHandler, filters
@@ -103,19 +107,37 @@ COMMANDS = [
 
 async def _post_init(app: Application):
     try:
-        await app.bot.set_my_commands(COMMANDS)
-        log.info("Bot commands set: %s", ", ".join(c.command for c in COMMANDS))
+        # 1) на все чаты по умолчанию
+        await app.bot.set_my_commands(COMMANDS, scope=BotCommandScopeDefault())
+        # 2) на все личные чаты
+        await app.bot.set_my_commands(COMMANDS, scope=BotCommandScopeAllPrivateChats())
+        # 3) на все групповые чаты
+        await app.bot.set_my_commands(COMMANDS, scope=BotCommandScopeAllGroupChats())
+        log.info("Bot commands set for default/private/group scopes.")
     except Exception:
         log.exception("Failed to set bot commands")
 
+async def _ensure_chat_commands(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Принудительно обновить список команд для конкретного чата (перебивает BotFather-списки чата)."""
+    try:
+        cid = update.effective_chat.id if update.effective_chat else None
+        if cid:
+            await context.bot.set_my_commands(COMMANDS, scope=BotCommandScopeChat(cid))
+            log.info("Commands set for chat %s", cid)
+    except Exception:
+        log.exception("Failed to set chat-scoped commands")
+
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _ensure_chat_commands(update, context)
     await update.message.reply_html(
         "Бот запущен. Сначала установите банк: "
         "<code>/setbank SYMBOL USD</code>\n\n" + HELP_TEXT
     )
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # на всякий случай тоже обновим список для текущего чата
+    await _ensure_chat_commands(update, context)
     await update.message.reply_html(HELP_TEXT)
 
 async def cmd_setbank(update: Update, context: ContextTypes.DEFAULT_TYPE):
