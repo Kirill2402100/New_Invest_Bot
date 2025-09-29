@@ -1734,10 +1734,80 @@ async def scanner_main_loop(
                         "lots_per_leg": lots_per_leg,
                         "ts": time.time()
                     }
+                    # --- Плановая точка закрытия хеджа = противоположный TAC ---
+                    planned_hc_px = (rng_tac["lower"] + 0.70 * rng_tac["width"]) if bias_side == "LONG" \
+                                    else (rng_tac["lower"] + 0.30 * rng_tac["width"])
+                    _hc_dticks = abs((planned_hc_px - px) / max(tick, 1e-12))
+                    _hc_dpct   = abs((planned_hc_px / max(px, 1e-12) - 1.0) * 100.0)
+
+                    # --- Превью после закрытия хеджа: остаётся противоположная нога ---
+                    remain_side = "SHORT" if bias_side == "LONG" else "LONG"
+                    ord_levels_after = CONFIG.STRAT_LEVELS_AFTER_HEDGE
+                    growth_after = choose_growth(ind, rng_strat, rng_tac)
+                    if fa_risk == "Amber":
+                        growth_after = min(growth_after, CONFIG.AUTO_ALLOC["growth_A"])
+                    alloc_bank_after = _alloc_bank(bank, weight)
+
+                    # Собираем «виртуальную» позицию как если бы хедж уже закрыли
+                    _pos = Position(remain_side, signal_id=f"{symbol.replace('/','')} PREVIEW",
+                                    leverage=CONFIG.LEVERAGE, owner_key=b["owner_key"])
+                    _pos.plan_with_reserve(alloc_bank_after, growth_after, ord_levels_after)
+                    _pos.step_margins[0] = margin_3          # первый шаг = оставшаяся нога хеджа
+                    if bool(fa.get("reserve_off")):
+                        _pos.reserve_available = False
+                        _pos.reserve_margin_usdt = 0.0
+                        _pos.max_steps = _pos.ord_levels
+                    _ = _pos.add_step(px)                      # оформляем первый шаг по текущей цене
+                    _pos.from_hedge = True
+                    _pos.hedge_entry_px = px
+                    _pos.hedge_close_px = planned_hc_px
+                    _pos.ordinary_targets = compute_strategic_targets_only(
+                        entry=px, side=remain_side, rng_strat=rng_strat, tick=tick, levels=ord_levels_after
+                    )
+                    _pos.ordinary_offset = 0
+
+                    # ML/риски и план следующего добора
+                    _cum_margin = _pos_total_margin(_pos)
+                    _fees_est   = (_cum_margin * _pos.leverage) * CONFIG.FEE_TAKER * CONFIG.LIQ_FEE_BUFFER
+                    _ml_now     = ml_price_at(_pos, CONFIG.ML_TARGET_PCT, bank, _fees_est)
+                    _ml_arrow   = "↓" if remain_side == "LONG" else "↑"
+                    _dist_now   = ml_distance_pct(_pos.side, px, _ml_now)
+                    _scen       = _ml_multi_scenarios(_pos, bank, _fees_est, k_list=(1,2,3))
+                    def _fmt_ml(v): return "N/A" if (v is None or np.isnan(v)) else fmt(v)
+
+                    _nxt = _pos.ordinary_targets[0] if _pos.ordinary_targets else None
+                    _nxt_txt = "N/A" if _nxt is None else f"{fmt(_nxt['price'])} ({_nxt['label']})"
+                    _nxt_margin = _pos.step_margins[1] if len(_pos.step_margins) > 1 else None
+                    if _nxt and _nxt_margin:
+                        _nxt_lots = margin_to_lots(symbol, _nxt_margin, price=_nxt['price'], leverage=_pos.leverage)
+                        _nxt_dep_txt = f"{_nxt_margin:.2f} USD ≈ {_nxt_lots:.2f} lot"
+                    else:
+                        _nxt_dep_txt = "N/A"
+                    _total_ord = max(0, _pos.ord_levels - 1)   # первый шаг уже «занят»
+                    _remaining = _total_ord                      # до усреднений ещё не доходили
+
+                    # Ближайшие цели (HC + первые 3 STRAT) с расстояниями
+                    _targets_lines = []
+                    _hc_dticks_txt = f"{_hc_dticks:.0f} тик."
+                    _hc_dpct_txt   = f"{_hc_dpct:.2f}%"
+                    _targets_lines.append(f"HC) <code>{fmt(planned_hc_px)}</code> (opp. TAC) — Δ≈ {_hc_dticks_txt} ({_hc_dpct_txt})")
+                    for i, t in enumerate(_pos.ordinary_targets[:3], start=1):
+                        _dticks = abs((t['price'] - px) / max(tick, 1e-12))
+                        _dpct   = abs((t['price'] / max(px, 1e-12) - 1.0) * 100.0)
+                        _targets_lines.append(f"{i}) <code>{fmt(t['price'])}</code> ({t['label']}) — Δ≈ {_dticks:.0f} тик. ({_dpct:.2f}%)")
+                    _targets_block = "\n".join(_targets_lines) if _targets_lines else "—"
+
                     await say(
                         f"🧷 HEDGE OPEN [{bias_side}] \n"
                         f"Цена: <code>{fmt(px)}</code> | Обе ноги по <b>{lots_per_leg:.2f} lot</b>\n"
                         f"Депозит (суммарно): <b>{dep_total:.2f} USD</b> (по <b>{margin_3:.2f}</b> на ногу)\n"
+                        f"План HC: HC) <code>{fmt(planned_hc_px)}</code> — Δ≈ {_hc_dticks:.0f} тик. ({_hc_dpct:.2f}%)\n"
+                        f"⚙️ Превью после закрытия хеджа (останется <b>{remain_side}</b>):\n"
+                        f"ML(20%): {_ml_arrow}<code>{fmt(_ml_now)}</code> ({'N/A' if np.isnan(_dist_now) else f'{_dist_now:.2f}%'} от текущей)\n"
+                        f"ML после +1: {_fmt_ml(_scen.get(1))} | +2: {_fmt_ml(_scen.get(2))} | +3: {_fmt_ml(_scen.get(3))}\n"
+                        f"След. STRAT: <code>{_nxt_txt}</code>\n"
+                        f"Ближайшие STRAT цели:\n{_targets_block}\n"
+                        f"Плановый добор: <b>{_nxt_dep_txt}</b> (осталось: {_remaining} из {_total_ord})\n"
                         f"Сигнал на ЗАКРЫТИЕ хеджа придёт при касании противоположного TAC по 1m-хвосту."
                     )
                     # запишем в лог
