@@ -1,25 +1,25 @@
 # fx_mt5_adapter.py
 from __future__ import annotations
+import os
 
-# Минимальный адаптер под Forex (без yfinance).
-# Держим только размеры тика и конвертацию маржа↔︎лоты.
+# Минимальный адаптер под Forex (без внешних фидов).
+# Держим размеры тика и конвертацию маржа↔︎лоты в USD.
 
-# Каноничные пары и параметры
 # 1 стандартный лот = 100_000 базовой валюты
 FX = {
     "USDJPY": {"tick": 0.001,   "contract": 100_000},  # pip=0.01, часто котируют 3 знака
     "EURUSD": {"tick": 0.00001, "contract": 100_000},  # 5 знаков после запятой
     "GBPUSD": {"tick": 0.00001, "contract": 100_000},
-    "AUDUSD": {"tick": 0.00001, "contract": 100_000},
+    "EURCHF": {"tick": 0.00001, "contract": 100_000},  # заменили AUDUSD -> EURCHF
 }
 
 def _norm(sym: str) -> str:
     """USD/JPY -> USDJPY, eurusd -> EURUSD."""
-    return sym.replace("/", "").upper()
+    return (sym or "").replace("/", "").upper()
 
 def default_tick(symbol: str) -> float:
     s = _norm(symbol)
-    return FX.get(s, {"tick": 0.0001})["tick"]
+    return FX.get(s, {}).get("tick", 0.0001)
 
 def quantize_price(symbol: str, price: float) -> float:
     """Округление цены к шагу тика пары."""
@@ -29,18 +29,30 @@ def quantize_price(symbol: str, price: float) -> float:
 def _lot_value_usd(symbol: str, price: float) -> float:
     """
     USD-стоимость 1 стандартного лота (100k base).
-    - base == USD (напр. USDJPY): ~100_000 USD
-    - quote == USD (напр. EURUSD): ~100_000 * price USD
+    - base == USD (напр. USDJPY): ≈ 100_000 USD
+    - quote == USD (напр. EURUSD): ≈ 100_000 * price USD
+    - кроссы без USD (напр. EURCHF): ≈ 100_000 * (price * CHFUSD)
+      где CHFUSD = 1 / USDCHF. Берём USDCHF из ENV (USDCHF_SPOT/ USDCHF) или 0.90 по умолчанию.
     """
     s = _norm(symbol)
     base, quote = s[:3], s[3:]
-    contract = FX.get(s, {"contract": 100_000})["contract"]
+    contract = float(FX.get(s, {}).get("contract", 100_000))
+
     if base == "USD":
-        return float(contract)
-    elif quote == "USD":
-        return float(contract) * float(price)
-    # На случай экзотических пар: грубая оценка
-    return float(contract)
+        return contract
+    if quote == "USD":
+        return contract * float(price)
+
+    # --- Кросс без USD: используем прокси-конвертацию quote->USD ---
+    # сейчас нужен только CHF; добавим при необходимости другие.
+    if quote == "CHF":
+        usdchf = float(os.getenv("USDCHF_SPOT") or os.getenv("USDCHF") or 0.90)  # USD/CHF
+        chfusd = 1.0 / max(usdchf, 1e-12)  # CHFUSD
+        # EURCHF = EUR/CHF, значит USD/лот ≈ 100k * (EUR/CHF) * (CHF/USD)^{-1} = 100k * EURUSD
+        return contract * float(price) * chfusd
+
+    # Фолбэк: грубая оценка (предположим quote≈USD)
+    return contract * float(price)
 
 def margin_to_lots(symbol: str, margin_usd: float, price: float, leverage: float | int) -> float:
     """
