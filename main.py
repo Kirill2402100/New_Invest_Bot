@@ -86,6 +86,9 @@ HELP_TEXT = (
     "• <code>/fees MAKER TAKER [SYMBOL]</code> — задать комиссии в долях (пример: <code>/fees 0.0002 0.0005 EURUSD</code>)\n"
     "• <code>/close [SYMBOL]</code> — ручное закрытие позиции\n"
     "• <code>/hedge_close PRICE [SYMBOL]</code> / <code>/хедж_закрытие PRICE [SYMBOL]</code> — подтвердить закрытие прибыльной ноги хеджа\n"
+    "• <code>/strat show [SYMBOL]</code> — показать текущий STRAT-план\n"
+    "• <code>/strat set P1 [P2 P3] [SYMBOL]</code> — задать 1–3 цены STRAT\n"
+    "• <code>/strat reset [SYMBOL]</code> — вернуть авто-план STRAT\n"
     "• <code>/diag [SYMBOL]</code> — диагностика (снапшот FUND_BOT)\n"
 )
 
@@ -102,6 +105,7 @@ COMMANDS = [
     BotCommand("close", "Ручное закрытие позиции [SYMBOL]"),
     BotCommand("fees", "Комиссии: maker taker [SYMBOL]"),
     BotCommand("hedge_close", "Подтвердить закрытие прибыльной ноги хеджа"),
+    BotCommand("strat", "STRAT: show | set | reset"),
     BotCommand("diag", "Диагностика FUND_BOT"),
 ]
 
@@ -146,7 +150,7 @@ async def cmd_setbank(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # формы:
     # 1) /setbank 6000             -> для уже выбранной пары (в этом чате)
-    # 2) /setbank GBPUSD 6000       -> явная пара + сумма (можно до /run)
+    # 2) /setbank GBPUSD 6000      -> явная пара + сумма (можно до /run)
     if len(args) == 1:
         amt = _parse_amount(args[0])
         if amt is None or amt <= 0:
@@ -274,8 +278,7 @@ async def cmd_open(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sym = _norm_symbol(args[0])
     ns = _ns_key(sym, chat_id)
     box = context.application.bot_data.setdefault(ns, {})
-    box["manual_open"] = {}        # авто-направление и авто-кол-во шагов
-    box["user_manual_mode"] = False   # снять ручной режим после TP/SL/manual_close
+    box["user_manual_mode"] = False  # снять ручной режим после TP/SL/manual_close
     context.chat_data["current_symbol"] = sym
     await update.message.reply_html(f"Готово. Взведён /open для <b>{sym}</b> (направление выберет сканер).")
 
@@ -331,6 +334,71 @@ async def cmd_diag(update: Update, context: ContextTypes.DEFAULT_TYPE):
     box["cmd_diag_targets"] = True
     await update.message.reply_html("Диагностика: запросил снапшот таргетов FUND_BOT.")
 
+async def cmd_strat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = _chat_id(update)
+    args = context.args or []
+    if not args:
+        return await update.message.reply_html(
+            "Использование:\n"
+            "• <code>/strat show [SYMBOL]</code>\n"
+            "• <code>/strat set P1 [P2 P3] [SYMBOL]</code>\n"
+            "• <code>/strat reset [SYMBOL]</code>"
+        )
+
+    sub = args[0].lower()
+    tail = args[1:]
+
+    def _is_num(s: str) -> bool:
+        try:
+            float(str(s).replace(",", "."))
+            return True
+        except Exception:
+            return False
+
+    # SYMBOL — последний нечисловой аргумент (если есть)
+    sym = None
+    if tail:
+        if not all(_is_num(x) for x in tail):
+            # возьмём последний нечисловой как символ
+            for x in reversed(tail):
+                if not _is_num(x):
+                    sym = _norm_symbol(x); break
+    if sym is None:
+        sym = context.chat_data.get("current_symbol") or CONFIG.SYMBOL
+
+    ns = _ns_key(sym, chat_id)
+    box = context.application.bot_data.setdefault(ns, {})
+
+    if sub == "show":
+        box["cmd_strat_show"] = True
+        context.chat_data["current_symbol"] = sym
+        return await update.message.reply_html(f"Запросил STRAT-отчёт по <b>{sym}</b>.")
+
+    if sub == "reset":
+        box["cmd_strat_reset"] = True
+        context.chat_data["current_symbol"] = sym
+        return await update.message.reply_html(f"Запросил сброс STRAT до авто-плана по <b>{sym}</b>.")
+
+    if sub == "set":
+        # соберём до трёх цен слева направо
+        prices = []
+        for x in tail:
+            if _is_num(x):
+                prices.append(float(str(x).replace(",", ".")))
+            else:
+                # дальше пошли флаги/символ — останавливаем сбор
+                break
+        if not prices:
+            return await update.message.reply_html("Укажите 1–3 цены: <code>/strat set P1 [P2 P3] [SYMBOL]</code>")
+        box["cmd_strat_set"] = prices[:3]
+        context.chat_data["current_symbol"] = sym
+        return await update.message.reply_html(
+            f"Запросил установку STRAT точек по <b>{sym}</b>: " +
+            ", ".join(f"<code>{p:.6f}</code>" for p in prices[:3])
+        )
+
+    return await update.message.reply_html("Неизвестная подкоманда. Используйте: <code>/strat show|set|reset</code>")
+
 async def cmd_hedge_close(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Подтвердить закрытие прибыльной ноги хеджа и передать фактическую цену.
     Команды: /hedge_close PRICE [SYMBOL]  и  /хедж_закрытие PRICE [SYMBOL]
@@ -383,8 +451,9 @@ def build_app() -> Application:
     application.add_handler(CommandHandler("diag",   cmd_diag))
     application.add_handler(CommandHandler("fees",   cmd_fees))
     application.add_handler(CommandHandler("hedge_close", cmd_hedge_close))
+    application.add_handler(CommandHandler("strat", cmd_strat))
     # кириллический алиас ловим как обычный текст:
-    application.add_handler(MessageHandler(filters.Regex(r"^/хедж_закрытие(\s|$)"), cmd_hedge_close_alias))
+    application.add_handler(MessageHandler(filters.Regex(r"^/хедж_закрытие(?:@[\w_]+)?(?:\s|$)"), cmd_hedge_close_alias))
     # обработчик неизвестных команд — в самом конце:
     application.add_handler(MessageHandler(filters.COMMAND, cmd_unknown))
 
@@ -393,4 +462,4 @@ def build_app() -> Application:
 
 if __name__ == "__main__":
     app = build_app()
-    app.run_polling(close_loop=False)
+    app.run_polling(close_loop=False, drop_pending_updates=True)
