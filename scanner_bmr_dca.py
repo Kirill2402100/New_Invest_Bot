@@ -18,6 +18,9 @@ from telegram.ext import Application
 import gspread
 from gspread.utils import rowcol_to_a1
 
+# Глобальное отключение FA (можно через ENV DISABLE_FA=1/true)
+DISABLE_FA = os.getenv("DISABLE_FA", "1").lower() in ("1", "true", "yes", "on")
+
 # === Forex адаптеры и фид ===
 from fx_mt5_adapter import FX, margin_to_lots, default_tick
 from fx_feed import fetch_ohlcv
@@ -465,10 +468,12 @@ async def log_event_safely(payload: dict, sh: gspread.Spreadsheet | None = None)
 # ---- FA POLICY & WEIGHTS ----
 
 async def read_fa_policy(symbol: str, sh: gspread.Spreadsheet | None = None) -> dict:
-    """Читает политику из листа FA_Signals:
+    """Читает политику из листа FA_Signals (ВЫКЛ, если DISABLE_FA):
     pair, risk(Green/Amber/Red), bias(neutral/long-only/short-only), ttl (мин), updated_at (ISO),
     scan_lock_until, reserve_off, dca_scale, reason. При просрочке TTL возвращает {}.
     """
+    if DISABLE_FA:
+        return {}
     try:
         if sh is None:
             creds_json = os.environ.get("GOOGLE_CREDENTIALS"); sheet_key = os.environ.get("SHEET_ID")
@@ -1433,6 +1438,8 @@ async def scanner_main_loop(
 
     # ФА-политика
     fa = await read_fa_policy(symbol, sheet)
+    if DISABLE_FA:
+        fa = {}
     fund_weights = await read_fund_bot_weights(sheet) if sheet else {}
     last_fa_read = 0.0
     last_targets_read = 0.0
@@ -1484,82 +1491,35 @@ async def scanner_main_loop(
 
             # периодически перечитываем ФА и таргеты
             if now - last_fa_read > CONFIG.FA_REFRESH_SEC:
-                fa = await read_fa_policy(symbol, sheet)
-                if sheet:
-                    fund_weights = await read_fund_bot_weights(sheet)
-                last_fa_read = now
-
-                # тихое окно от фунд-бота
-                scan_until = pd.to_datetime(fa.get("scan_lock_until"), utc=True) if fa.get("scan_lock_until") else None
-                b["fa_scan_lock"] = bool(scan_until and pd.Timestamp.now(tz="UTC") < scan_until)
-                b["fa_scan_until_ts"] = float(scan_until.timestamp()) if scan_until is not None else None
-
-                # --- детекция изменения FA и оповещение/логирование ---
-                prev = (
-                    b.get("fa_risk"),
-                    b.get("fa_bias"),
-                    b.get("fa_dca_scale"),
-                    b.get("fa_reserve_off"),
-                    b.get("fa_scan_until_iso"),
-                )
-
-                # записываем свежие значения в box
-                b["fa_risk"] = (fa.get("risk") or "Green").capitalize()
-                b["fa_bias"] = (fa.get("bias") or "neutral").lower()
-                b["fa_dca_scale"] = float(fa.get("dca_scale") or 1.0)
-                b["fa_reserve_off"] = bool(fa.get("reserve_off"))
-                b["fa_scan_until_iso"] = fa.get("scan_lock_until") or ""
-                b["fa_reason"] = (fa.get("reason") or "").strip()
-
-                changed = prev != (
-                    b["fa_risk"], b["fa_bias"], b["fa_dca_scale"], b["fa_reserve_off"], b["fa_scan_until_iso"]
-                )
-
-                if changed:
-                    # 1) короткое уведомление в канал
-                    emoji = {"Green":"✅","Amber":"🟡","Red":"🛑"}.get(b["fa_risk"], "✅")
-                    lock_txt = ""
-                    if b["fa_scan_until_iso"]:
+                if not DISABLE_FA:
+                    fa = await read_fa_policy(symbol, sheet)
+                    if sheet:
+                        fund_weights = await read_fund_bot_weights(sheet)
+                    last_fa_read = now
+                    # (оставьте ваш существующий существующий код оповещения об изменении FA здесь,
+                    #  если хотите — он сработает только когда DISABLE_FA=False)
+                else:
+                    # принудительно «зелёный нейтральный», без тихих окон/резерва/ограничений
+                    b["fa_scan_lock"] = False
+                    b["fa_scan_until_ts"] = None
+                    b["fa_risk"] = "Green"
+                    b["fa_bias"] = "neutral"
+                    b["fa_dca_scale"] = 1.0
+                    b["fa_reserve_off"] = False
+                    b["fa_scan_until_iso"] = ""
+                    b["fa_reason"] = ""
+                    # веса FUND_BOT можно перечитывать как раньше
+                    if sheet:
                         try:
-                            hhmm = pd.to_datetime(b["fa_scan_until_iso"], utc=True).strftime("%H:%M")
-                            lock_txt = f"\n• тихое окно до {hhmm} (UTC)"
+                            fund_weights = await read_fund_bot_weights(sheet)
                         except Exception:
                             pass
-                    dca_txt = ""
-                    if b["fa_dca_scale"] < 1.0:
-                        dca_txt = f"\n• dca_scale={b['fa_dca_scale']:.2f}"
-                    res_txt = " (резерв отключён)" if b["fa_reserve_off"] else ""
-                    rsn_txt = f"\n• reason: {b['fa_reason']}" if b.get("fa_reason") else ""
-
-                    await say(
-                        f"🔔 Обновлён FA-статус по <b>{symbol}</b> → {emoji} <b>{b['fa_risk']}</b>{res_txt}\n"
-                        f"• bias: <b>{b['fa_bias']}</b>{dca_txt}{lock_txt}{rsn_txt}"
-                    )
-
-                    # 2) «маячок» в BMR_DCA_<SYM>, чтобы FA_Risk/FA_Bias были актуальны в логах
-                    try:
-                        await log_event_safely(with_banks({
-                            "Event": "FA_STATUS",
-                            "Event_ID": f"FA_{symbol}_{int(time.time())}",
-                            "Timestamp_UTC": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
-                            "Pair": symbol, "FA_Risk": b["fa_risk"], "FA_Bias": b["fa_bias"],
-                            "Chat_ID": b.get("chat_id") or "", "Owner_Key": b.get("owner_key") or "",
-                        }), sheet)
-                    except Exception:
-                        log.exception("log_event_safely(FA_STATUS) failed")
-
-            if sheet and (now - last_targets_read > 180):  # ~3 минуты
-                try:
-                    refreshed = await refresh_targets_from_fund_ws(sheet, root)
-                    if refreshed:
-                        log.info("FUND_BOT targets refreshed.")
-                except Exception:
-                    log.exception("periodic refresh_targets_from_fund_ws failed")
-                last_targets_read = now
+                    last_fa_read = now
 
             # применяем FA: risk Red -> управляем, но не открываем; Amber -> консервативней
-            fa_risk = b.get("fa_risk", (fa.get("risk") or "Green").capitalize())
-            fa_bias = b.get("fa_bias", (fa.get("bias") or "neutral").lower())
+            # FA выключен: всегда «Green/neutral»
+            fa_risk = "Green"
+            fa_bias = "neutral"
 
             # --- вес из FUND_BOT (для политики), но банк пары не масштабируем по умолчанию
             weight = target_weight_for_pair(symbol, fund_weights)
@@ -1571,7 +1531,7 @@ async def scanner_main_loop(
                     return bank * w
                 return bank # по умолчанию банк уже "пер-пара"
             
-            reserve_off = bool(fa.get("reserve_off"))
+            reserve_off = False
 
             idle_for_rebuild = not (b.get("position") or _hedge_active())
             need_build_strat = (rng_strat is None) or ((now - last_build_strat > CONFIG.REBUILD_RANGE_EVERY_MIN*60) and idle_for_rebuild)
@@ -1621,22 +1581,19 @@ async def scanner_main_loop(
                                       rng_strat=rng_strat, rng_tac=rng_tac)
                 await asyncio.sleep(30); continue
 
-            fa_ts = b.get("fa_scan_until_ts")
-            if fa_ts is not None and time.time() < fa_ts:
-                b["scan_paused"] = True
-            elif not _is_df_fresh(ohlc5_df, max_age_min=15):
+            # Пауза — только из-за несвежих данных; FA не влияет
+            if not _is_df_fresh(ohlc5_df, max_age_min=15):
                 b["scan_paused"] = True
             else:
-                b["scan_paused"] = bool(b.get("fa_scan_lock", False))
-            
-            manage_only_flag = b.get("scan_paused", False) or (fa_risk == "Red")
+                b["scan_paused"] = False
+            manage_only_flag = b.get("scan_paused", False)
             
             pos: Position | None = b.get("position")
             if pos and getattr(pos, "owner_key", None) not in (None, b["owner_key"]):
                 await asyncio.sleep(1); continue # На всякий случай не трогаем чужую позицию
 
             if pos and b.get("fsm_state") == int(FSM.MANAGING) and pos.steps_filled > 0:
-                if bool(fa.get("reserve_off")) and pos.reserve_available and not pos.reserve_used:
+                if False and pos.reserve_available and not pos.reserve_used:
                     pos.reserve_available = False
                     pos.reserve_margin_usdt = 0.0
                     pos.max_steps = max(pos.steps_filled, pos.ord_levels)
@@ -1705,22 +1662,18 @@ async def scanner_main_loop(
                 pct_to_short = (d_to_short / max(px, 1e-9)) * 100
                 brk_up, brk_dn = break_levels(rng_strat)
                 width_ratio = (rng_tac["width"] / max(rng_strat["width"], 1e-9)) * 100.0
-                fa_line = ""
-                if fa_risk != "Green" or fa_bias != "neutral":
-                    fa_line = f"\nFA: risk=<b>{fa_risk}</b>, bias=<b>{fa_bias}</b>"
                 await say(
                     "🎯 Пороги входа (<b>TAC 30/70</b>): LONG ≤ <code>{}</code>, SHORT ≥ <code>{}</code>\n"
                     "📏 Диапазоны:\n"
                     "• STRAT: [{} … {}] w={}\n"
                     "• TAC (3d): [{} … {}] w={} (≈{:.0f}% от STRAT)\n"
                     "🔓 Пробой STRAT: ↑{} | ↓{}\n"
-                    "Текущая: {}. До LONG: {} ({:.2f}%), до SHORT: {} ({:.2f}%).{}".format(
+                    "Текущая: {}. До LONG: {} ({:.2f}%), до SHORT: {} ({:.2f}%).".format(
                         fmt(p30_t), fmt(p70_t),
                         fmt(rng_strat['lower']), fmt(rng_strat['upper']), fmt(rng_strat['width']),
                         fmt(rng_tac['lower']),   fmt(rng_tac['upper']),   fmt(rng_tac['width']), width_ratio,
                         fmt(brk_up), fmt(brk_dn),
-                        fmt(px), fmt(d_to_long), pct_to_long, fmt(d_to_short), pct_to_short,
-                        fa_line
+                        fmt(px), fmt(d_to_long), pct_to_long, fmt(d_to_short), pct_to_short
                     )
                 )
                 b["intro_done"] = True
@@ -1986,11 +1939,6 @@ async def scanner_main_loop(
                 tac_hi = rng_tac["lower"] + 0.70 * rng_tac["width"]
                 can_long  = (m1_lo is not None) and (m1_lo <= tac_lo - CONFIG.WICK_HYST_TICKS * tick)
                 can_short = (m1_hi is not None) and (m1_hi >= tac_hi + CONFIG.WICK_HYST_TICKS * tick)
-                # bias от FA
-                if fa_bias == "long-only":
-                    can_short = False
-                if fa_bias == "short-only":
-                    can_long = False
                 # разрешаем вход, если коснулись одного из TAC
                 if can_long or can_short:
                     bias_side = "LONG" if can_long else "SHORT"
@@ -1998,9 +1946,7 @@ async def scanner_main_loop(
                     # план «старой» лестницы, чтобы посчитать сумму (OPEN + TAC-33 + TAC-67)
                     ord_levels_tmp = min(CONFIG.DCA_LEVELS - 1, 1 + CONFIG.ORDINARY_ADDS)
                     growth = choose_growth(ind, rng_strat, rng_tac)
-                    if fa_risk == "Amber":
-                        ord_levels_tmp = max(1, ord_levels_tmp - 1)
-                        growth = min(growth, CONFIG.AUTO_ALLOC["growth_A"])
+                    # FA OFF: без урезаний
                     alloc_bank = _alloc_bank(bank, weight)
                     total_target = alloc_bank * CONFIG.CUM_DEPOSIT_FRAC_AT_FULL
                     margins_full = plan_margins_bank_first(total_target, ord_levels_tmp + 1, growth)
@@ -2031,8 +1977,6 @@ async def scanner_main_loop(
                     remain_side = "SHORT" if bias_side == "LONG" else "LONG"
                     ord_levels_after = CONFIG.STRAT_LEVELS_AFTER_HEDGE
                     growth_after = choose_growth(ind, rng_strat, rng_tac)
-                    if fa_risk == "Amber":
-                        growth_after = min(growth_after, CONFIG.AUTO_ALLOC["growth_A"])
                     alloc_bank_after = _alloc_bank(bank, weight)
 
                     # Собираем «виртуальную» позицию как если бы хедж уже закрыли
@@ -2040,10 +1984,7 @@ async def scanner_main_loop(
                                     leverage=CONFIG.LEVERAGE, owner_key=b["owner_key"])
                     _pos.plan_with_reserve(alloc_bank_after, growth_after, ord_levels_after)
                     _pos.step_margins[0] = margin_3         # первый шаг = оставшаяся нога хеджа
-                    if bool(fa.get("reserve_off")):
-                        _pos.reserve_available = False
-                        _pos.reserve_margin_usdt = 0.0
-                        _pos.max_steps = _pos.ord_levels
+                    # FA OFF: резерв политика по умолчанию
                     # чтобы суммарное потребление ≤ 70% банка:
                     _pos.rebalance_tail_margins_excluding_reserve(alloc_bank_after)
                     _ = _pos.add_step(px)                   # оформляем первый шаг по текущей цене
@@ -2152,16 +2093,11 @@ async def scanner_main_loop(
                     leg_margin  = float(b["hedge"]["leg_margin"])
                     alloc_bank_after = _alloc_bank(bank, target_weight_for_pair(symbol, fund_weights))
                     growth_after = choose_growth(ind, rng_strat, rng_tac)
-                    if fa_risk == "Amber":
-                        growth_after = min(growth_after, CONFIG.AUTO_ALLOC["growth_A"])
                     _pos = Position(remain_side, signal_id=f"{symbol.replace('/','')} PREVIEW",
                                     leverage=CONFIG.LEVERAGE, owner_key=b["owner_key"])
                     _pos.plan_with_reserve(alloc_bank_after, growth_after, CONFIG.STRAT_LEVELS_AFTER_HEDGE)
                     _pos.step_margins[0] = leg_margin
-                    if bool(fa.get("reserve_off")):
-                        _pos.reserve_available = False
-                        _pos.reserve_margin_usdt = 0.0
-                        _pos.max_steps = _pos.ord_levels
+                    # FA OFF: резерв политика по умолчанию
                     _pos.rebalance_tail_margins_excluding_reserve(alloc_bank_after)
                     _ = _pos.add_step(entry_px0)
                     _pos.from_hedge = True
@@ -2186,12 +2122,40 @@ async def scanner_main_loop(
                     else:
                         _nxt_dep_txt = "N/A"
                     _nxt_txt = "N/A" if not _nxt else f"{fmt(_nxt['price'])} ({_nxt['label']})"
+                    # Блок «ближайшие цели»: HC + 1–3 STRAT с расстояниями
+                    _targets_lines = []
+                    _hc_dticks = abs((planned_hc_px - px) / max(tick, 1e-12))
+                    _hc_dpct   = abs((planned_hc_px / max(px, 1e-12) - 1.0) * 100.0)
+                    _targets_lines.append(
+                        f"HC) <code>{fmt(planned_hc_px)}</code> — Δ≈ {_hc_dticks:.0f} тик. ({_hc_dpct:.2f}%)"
+                    )
+                    for i, t in enumerate(_pos.ordinary_targets[:3], start=1):
+                        _dt = abs((t['price'] - px) / max(tick, 1e-12))
+                        _dp = abs((t['price'] / max(px, 1e-12) - 1.0) * 100.0)
+                        _targets_lines.append(
+                            f"{i}) <code>{fmt(t['price'])}</code> ({t['label']}) — Δ≈ {_dt:.0f} тик. ({_dp:.2f}%)"
+                        )
+                    _targets_block = "\n".join(_targets_lines) if _targets_lines else "—"
+
+                    # Размеры STRAT-доборов (USD и лоты)
+                    _sizes_lines = []
+                    _next_idx = 1  # первый шаг уже занят ногой хеджа
+                    for j, t in enumerate(_pos.ordinary_targets[:3], start=1):
+                        idx = _next_idx + (j - 1)
+                        if idx >= len(_pos.step_margins): break
+                        _m = _pos.step_margins[idx]
+                        _lots_j = margin_to_lots(symbol, _m, price=t['price'], leverage=_pos.leverage)
+                        _sizes_lines.append(f"{j}) {_m:.2f} USD ≈ {_lots_j:.2f} lot")
+                    _sizes_block = "\n".join(_sizes_lines) if _sizes_lines else "—"
+
                     await say(
                         f"🔁 HEDGE UPDATE [{new_bias}] \n"
                         f"HC теперь: <code>{fmt(planned_hc_px)}</code>\n"
                         f"Останется: <b>{remain_side}</b> | ML(20%): {_ml_arrow}<code>{fmt(_ml_now)}</code> "
                         f"({_dist_now_txt} от текущей)\n"
                         f"След. STRAT: <code>{_nxt_txt}</code>\n"
+                        f"Ближайшие STRAT цели:\n{_targets_block}\n"
+                        f"Размеры STRAT доборов:\n{_sizes_block}\n"
                         f"Плановый добор: <b>{_nxt_dep_txt}</b>"
                     )
 
@@ -2224,17 +2188,12 @@ async def scanner_main_loop(
                 # план STRAT: только стратегические уровни
                 ord_levels = CONFIG.STRAT_LEVELS_AFTER_HEDGE
                 growth = choose_growth(ind, rng_strat, rng_tac)
-                if fa_risk == "Amber":
-                    growth = min(growth, CONFIG.AUTO_ALLOC["growth_A"])
                 alloc_bank = _alloc_bank(bank, weight)
                 pos.plan_with_reserve(alloc_bank, growth, ord_levels)
                 # первый шаг = объём оставшейся ноги хеджа
                 pos.step_margins[0] = leg_margin
                 pos.alloc_bank_planned = alloc_bank
-                if reserve_off:
-                    pos.reserve_available = False
-                    pos.reserve_margin_usdt = 0.0
-                    pos.max_steps = pos.ord_levels
+                # FA OFF: резерв политика по умолчанию
                 # чтобы суммарное потребление ≤ 70% банка:
                 pos.rebalance_tail_margins_excluding_reserve(alloc_bank)
                 # оформить «первый шаг» по цене входа хеджа
