@@ -135,7 +135,7 @@ class CONFIG:
     # Таймфреймы
     TF_ENTRY = "5m"
     TF_RANGE = "1h"
-    TF_TRIGGER = "1m"           # новый: поток для триггеров по хвостам
+    TF_TRIGGER = "1m"          # новый: поток для триггеров по хвостам
 
     # Сколько истории собирать под диапазоны
     STRATEGIC_LOOKBACK_DAYS = 60    # для TF_RANGE
@@ -204,10 +204,12 @@ class CONFIG:
     ORDINARY_ADDS = 5  # столько обычных доборов после входа
 
     # Анти-слипание ценовых уровней
-    DCA_MIN_GAP_TICKS = 2    # минимум 2 тика между целями
+    DCA_MIN_GAP_TICKS = 2   # минимум 2 тика между целями
 
     # Показываем ML-цену при целевом Margin Level
     ML_TARGET_PCT = 20.0     # "ML цена (20%)"
+    # Минимальный запас к ML(20%) после третьего STRAT-усреднения и пробоя STRAT
+    ML_BREAK_BUFFER_PCT = 3.0
 
     # Расширение коридора после пробоя
     EXT_AFTER_BREAK = {
@@ -244,7 +246,7 @@ class CONFIG:
     STRAT_LEVELS_AFTER_HEDGE = 4
 
 # ENV-переопределения
-CONFIG.SYMBOL   = os.getenv("FX_SYMBOL", CONFIG.SYMBOL)
+CONFIG.SYMBOL    = os.getenv("FX_SYMBOL", CONFIG.SYMBOL)
 CONFIG.TF_ENTRY = os.getenv("TF_ENTRY", CONFIG.TF_ENTRY)
 CONFIG.TF_RANGE = os.getenv("TF_RANGE", os.getenv("TF_TREND", CONFIG.TF_RANGE))
 
@@ -283,14 +285,14 @@ BMR_HEADERS_FALLBACK = [
 
 PAIR_KEY = {
     "USDJPY": "JPY",
-    "AUDUSD": "AUD",
+    "EURCHF": "CHF",
     "EURUSD": "EUR",
     "GBPUSD": "GBP",
 }
 
 # === FUND_BOT targets ===
 TARGET_WS = os.getenv("TARGET_WS", "FUND_BOT")
-PAIR_LIST = ["USDJPY","AUDUSD","EURUSD","GBPUSD"]
+PAIR_LIST = ["USDJPY","EURCHF","EURUSD","GBPUSD"]
 
 # {"USDJPY": {"value": 1120.0, "ts": "2025-09-09T..."}, ...}
 targets_cache: dict[str, dict] = {}
@@ -794,7 +796,7 @@ def next_pct_target(pos):
         return None
     used_dca = max(0, (pos.steps_filled - (1 if pos.reserve_used else 0)) - 1)
     base = getattr(pos, "ordinary_offset", 0)
-    abs_idx = max(base, used_dca)       # <-- ключевая правка
+    abs_idx = max(base, used_dca)      # <-- ключевая правка
     return pos.ordinary_targets[abs_idx] if 0 <= abs_idx < len(pos.ordinary_targets) else None
 
 def choose_growth(ind: dict, rng_strat: dict, rng_tac: dict) -> float:
@@ -821,8 +823,8 @@ def _is_df_fresh(df: pd.DataFrame, max_age_min: int = 15) -> bool:
         return True
 
 async def plan_extension_after_break(symbol: str, pos: "Position",
-                                         rng_strat: dict, rng_tac: dict,
-                                         px: float, tick: float) -> list[dict]:
+                                     rng_strat: dict, rng_tac: dict,
+                                     px: float, tick: float) -> list[dict]:
     """
     Дорисовывает оставшиеся обычные уровни после подтверждённого пробоя STRAT.
     Не трогает уже 'израсходованные' цели. Возвращает новый список ordinary_targets.
@@ -938,6 +940,152 @@ def compute_indicators_5m(df: pd.DataFrame) -> dict:
         "ema20": float(ema20), "vol_z": float(vol_z),
         "ema_dev_atr": float(ema_dev_atr), "supertrend": st_state
     }
+
+# ---------------------------------------------------------------------------
+# STRAT ML-buffer helpers (3% после #3 и пробоя STRAT)
+# ---------------------------------------------------------------------------
+def _break_price_for_side(rng_strat: dict, side: str) -> float:
+    up, dn = break_levels(rng_strat)
+    return dn if side == "LONG" else up
+
+def _simulate_after_k(pos: "Position", prices: list[float], k: int) -> tuple[float, float, float]:
+    """
+    Симуляция состояния после k будущих стратегических шагов по заданным ценам (len(prices) >= k).
+    Возвращает (avg, qty, used_margin) после применения k шагов к текущему pos.
+    """
+    L = max(1, int(getattr(pos, "leverage", 1) or 1))
+    avg = float(pos.avg)
+    qty = float(pos.qty)
+    used = float(_pos_total_margin(pos))
+    used_ord = pos.steps_filled - (1 if pos.reserve_used else 0)
+    for i in range(k):
+        if used_ord + i >= len(pos.step_margins) or i >= len(prices): break
+        m = float(pos.step_margins[used_ord + i])
+        p = float(prices[i])
+        dq = (m * L) / max(p, 1e-12)
+        qty_new = qty + dq
+        avg = (avg * qty + p * dq) / max(qty_new, 1e-9)
+        qty = qty_new
+        used += m
+    return avg, qty, used
+
+def _ml_after_k(pos: "Position", bank: float, fees_est: float, targets: list[float], k: int) -> float:
+    """
+    ML(20%) после применения k будущих шагов по ценам из targets.
+    """
+    class _Tmp: pass
+    avg, qty, used = _simulate_after_k(pos, targets, k)
+    t = _Tmp()
+    t.side = pos.side; t.avg = avg; t.qty = qty; t.leverage = pos.leverage
+    t.steps_filled = 1; t.step_margins = [used]; t.reserve_used = False; t.reserve_margin_usdt = 0.0
+    return ml_price_at(t, CONFIG.ML_TARGET_PCT, bank, fees_est)
+
+def _ml_buffer_after_3(pos: "Position", bank: float, fees_est: float,
+                       rng_strat: dict, t1: float, t2: float, t3: float) -> float:
+    """
+    Возвращает запас к ML(20%) в процентах (>=0 — безопасный) от цены пробоя STRAT
+    после трёх будущих шагов по t1..t3.
+    """
+    ml3 = _ml_after_k(pos, bank, fees_est, [t1, t2, t3], 3)
+    brk = _break_price_for_side(rng_strat, pos.side)
+    return ml_distance_pct(pos.side, brk, ml3)
+
+def _linspace_exclusive(a: float, b: float, n: int, include_end: bool, tick: float, side: str) -> list[float]:
+    if n <= 0: return []
+    if include_end: fr = [(i+1)/n for i in range(n)]
+    else:           fr = [(i+1)/(n+1) for i in range(n)]
+    raw = [a + (b - a)*f for f in fr]
+    out = []
+    min_gap = tick * CONFIG.DCA_MIN_GAP_TICKS
+    for x in raw:
+        q = quantize_to_tick(x, tick)
+        if not out:
+            # первый всегда должен отходить от a минимум на min_gap
+            if abs(q - a) < min_gap: 
+                q = a - min_gap if side=="LONG" else a + min_gap
+        if not out or (side=="LONG" and q <= out[-1]-min_gap) or (side=="SHORT" and q >= out[-1]+min_gap):
+            out.append(q)
+    return out
+
+def auto_strat_targets_with_ml_buffer(pos: "Position", rng_strat: dict, entry: float, tick: float,
+                                      bank: float, fees_est: float) -> list[dict]:
+    """
+    Строит 3 STRAT-цели от entry в сторону «ухудшения» так, чтобы запас
+    к ML(20%) от цены пробоя STRAT после 3-й ступени был >= CONFIG.ML_BREAK_BUFFER_PCT.
+    Алгоритм: якорим #3 у STRAT(100%), проверяем буфер; если < порога — углубляем #3,
+    #1/#2 — равномерно между entry и новым #3. Соблюдаем квантование и gap.
+    """
+    side = pos.side
+    # базовая конечная точка — STRAT 100%
+    end = rng_strat["lower"] if side=="LONG" else rng_strat["upper"]
+    # стартовая равномерная раскладка
+    p = _linspace_exclusive(entry, end, 3, include_end=True, tick=tick, side=side)
+    if len(p) < 3:
+        return [{"price": x, "label": lab} for x,lab in zip(p, ["STRAT 33%","STRAT 66%","STRAT 100%"][:len(p)])]
+    p1, p2, p3 = p
+    buf = _ml_buffer_after_3(pos, bank, fees_est, rng_strat, p1, p2, p3)
+    # если буфер уже ок — возвращаем
+    if pd.notna(buf) and buf >= CONFIG.ML_BREAK_BUFFER_PCT:
+        labs = ["STRAT 33%","STRAT 66%","STRAT 100%"]
+        return [{"price": p1, "label": labs[0]}, {"price": p2, "label": labs[1]}, {"price": p3, "label": labs[2]}]
+    # иначе — углубляем p3 ступенчато до выполнения условия или до стопа
+    atr = float(rng_strat.get("atr1h", 0.0)) or max(abs(end-entry), 1e-6)*0.02
+    step = max(tick*max(4, CONFIG.DCA_MIN_GAP_TICKS), atr*0.05)  # ~5% ATR шаг
+    max_depth = atr * 4.0  # не уходим слишком далеко: до ~4 ATR
+    moved = 0.0
+    while moved <= max_depth:
+        # двигаем p3 глубже в сторону «минуса»
+        p3 = (p3 - step) if side=="LONG" else (p3 + step)
+        p3 = quantize_to_tick(p3, tick)
+        # пересобираем p1,p2 равномерно между entry и p3 (end не нужен)
+        mid = _linspace_exclusive(entry, p3, 3, include_end=True, tick=tick, side=side)
+        if len(mid) < 3:
+            moved += step
+            continue
+        p1, p2, p3 = mid
+        buf = _ml_buffer_after_3(pos, bank, fees_est, rng_strat, p1, p2, p3)
+        if pd.notna(buf) and buf >= CONFIG.ML_BREAK_BUFFER_PCT:
+            break
+        moved += step
+    labs = ["STRAT 33%","STRAT 66%","STRAT 100%"]
+    return [{"price": p1, "label": labs[0]}, {"price": p2, "label": labs[1]}, {"price": p3, "label": labs[2]}]
+
+def _strat_report_text(pos: "Position", px: float, tick: float, bank: float,
+                       fees_est: float, rng_strat: dict, hdr: str) -> str:
+    """
+    Формирует текст отчёта для /strat show|set|reset: цели, размеры USD/лот,
+    ML сейчас и после +1/+2/+3, буфер после #3.
+    """
+    lines = [hdr]
+    # Ближайшие 3 цели c дистанциями
+    tgts = pos.ordinary_targets[getattr(pos, "ordinary_offset", 0):getattr(pos, "ordinary_offset", 0)+3]
+    if getattr(pos, "hedge_close_px", None) is not None:
+        dt = abs((pos.hedge_close_px - px) / max(tick,1e-12))
+        dp = abs((pos.hedge_close_px/max(px,1e-12)-1.0)*100.0)
+        lines.append(f"HC) <code>{fmt(pos.hedge_close_px)}</code> — Δ≈ {dt:.0f} тик. ({dp:.2f}%)")
+    for i, t in enumerate(tgts, start=1):
+        dt = abs((t["price"] - px) / max(tick,1e-12))
+        dp = abs((t["price"]/max(px,1e-12)-1.0)*100.0)
+        lines.append(f"{i}) <code>{fmt(t['price'])}</code> ({t['label']}) — Δ≈ {dt:.0f} тик. ({dp:.2f}%)")
+    # ML сейчас и после 1/2/3
+    ml_now = ml_price_at(pos, CONFIG.ML_TARGET_PCT, bank, fees_est)
+    avail = min(3, len(pos.step_margins)-(pos.steps_filled-(1 if pos.reserve_used else 0)), len(tgts))
+    ks = tuple(range(1, avail+1))
+    scen = _ml_multi_scenarios(pos, bank, fees_est, k_list=ks) if avail>0 else {}
+    def _fmt_ml(v): return "N/A" if (v is None or np.isnan(v)) else fmt(v)
+    arrow = "↓" if pos.side=="LONG" else "↑"
+    dist_now = ml_distance_pct(pos.side, px, ml_now)
+    dist_txt = "N/A" if np.isnan(dist_now) else f"{dist_now:.2f}%"
+    lines.append(f"ML(20%): {arrow}<code>{fmt(ml_now)}</code> ({dist_txt} от текущей)")
+    lines.append(f"ML после +1: {_fmt_ml(scen.get(1))} | +2: {_fmt_ml(scen.get(2))} | +3: {_fmt_ml(scen.get(3))}")
+    # Буфер к ML после #3 и пробоя
+    if len(tgts) >= 3:
+        buf = _ml_buffer_after_3(pos, bank, fees_est, rng_strat, tgts[0]["price"], tgts[1]["price"], tgts[2]["price"])
+        st = "OK" if (pd.notna(buf) and buf >= CONFIG.ML_BREAK_BUFFER_PCT) else "FAIL"
+        brk_up, brk_dn = break_levels(rng_strat)
+        brk = brk_dn if pos.side=="LONG" else brk_up
+        lines.append(f"Буфер после #3 и пробоя STRAT (от <code>{fmt(brk)}</code>) → {buf:.2f}% [{st}] (порог {CONFIG.ML_BREAK_BUFFER_PCT:.2f}%)")
+    return "\n".join(lines)
 
 class FSM(IntEnum):
     IDLE = 0   # нет позиции
@@ -1469,8 +1617,8 @@ async def scanner_main_loop(
                     b["stale_notice_ts"] = time.time()
                 b["scan_paused"] = True
                 _update_status_snapshot(b, symbol=symbol, bank_fact=bank, bank_target=bank_target,
-                                       pos=b.get("position"), scan_paused=True,
-                                       rng_strat=rng_strat, rng_tac=rng_tac)
+                                      pos=b.get("position"), scan_paused=True,
+                                      rng_strat=rng_strat, rng_tac=rng_tac)
                 await asyncio.sleep(30); continue
 
             fa_ts = b.get("fa_scan_until_ts")
@@ -1581,6 +1729,97 @@ async def scanner_main_loop(
             _update_status_snapshot(b, symbol=symbol, bank_fact=bank, bank_target=bank_target,
                                     pos=pos, scan_paused=b.get("scan_paused", False),
                                     rng_strat=rng_strat, rng_tac=rng_tac)
+
+            # -------- STRAT commands handling --------
+            # Работают ТОЛЬКО когда есть позиция после хеджа (3 стратегических шага «хвоста»)
+            if b.pop("cmd_strat_show", False):
+                if not pos or not pos.from_hedge or b.get("fsm_state") != int(FSM.MANAGING):
+                    await say("ℹ️ Нет активной позиции «после хеджа» — показать нечего.")
+                else:
+                    cum_margin = _pos_total_margin(pos)
+                    fees_est = (cum_margin * pos.leverage) * CONFIG.FEE_TAKER * CONFIG.LIQ_FEE_BUFFER
+                    await say(_strat_report_text(pos, px, tick, bank, fees_est, rng_strat, hdr="📋 STRAT (текущий план)"))
+
+            _set_req = b.pop("cmd_strat_set", None)
+            if _set_req is not None:
+                if not pos or not pos.from_hedge or b.get("fsm_state") != int(FSM.MANAGING):
+                    await say("ℹ️ Нет активной позиции «после хеджа» — менять STRAT-точки нельзя.")
+                else:
+                    # parse & sanitize
+                    vals = []
+                    for v in _set_req:
+                        try: vals.append(float(str(v).replace(",",".").strip()))
+                        except: pass
+                    if len(vals) < 1:
+                        await say("❗ Укажите 1–3 цен: /strat set P1 P2 P3")
+                    else:
+                        # дополним до 3 последним значением
+                        while len(vals) < 3: vals.append(vals[-1])
+                        # квантование и упорядочивание «в минус» относительно стороны
+                        q = [quantize_to_tick(x, tick) for x in vals[:3]]
+                        if pos.side=="LONG":  q = sorted(q, reverse=True)  # вниз → убывание цен
+                        else:                 q = sorted(q)                 # вверх → возрастание
+                        # обеспечиваем минимум разрыва
+                        min_gap = tick * CONFIG.DCA_MIN_GAP_TICKS
+                        q_fixed = []
+                        for i,x in enumerate(q):
+                            if i==0:
+                                # первый — не ближе min_gap к entry
+                                base = pos.avg if pos.steps_filled<=1 else pos.ordinary_targets[getattr(pos,"ordinary_offset",0)]["price"]
+                                if pos.side=="LONG" and x > base - min_gap: x = base - min_gap
+                                if pos.side=="SHORT" and x < base + min_gap: x = base + min_gap
+                            else:
+                                prev = q_fixed[-1]
+                                if pos.side=="LONG" and x > prev - min_gap: x = prev - min_gap
+                                if pos.side=="SHORT" and x < prev + min_gap: x = prev + min_gap
+                            q_fixed.append(quantize_to_tick(x, tick))
+                        # применяем
+                        base_off = getattr(pos, "ordinary_offset", 0)
+                        labels = ["STRAT 33%","STRAT 66%","STRAT 100%"]
+                        for i in range(3):
+                            if base_off+i < len(pos.ordinary_targets):
+                                pos.ordinary_targets[base_off+i] = {"price": q_fixed[i], "label": labels[i]}
+                            else:
+                                pos.ordinary_targets.append({"price": q_fixed[i], "label": labels[i]})
+                        cum_margin = _pos_total_margin(pos)
+                        fees_est = (cum_margin * pos.leverage) * CONFIG.FEE_TAKER * CONFIG.LIQ_FEE_BUFFER
+                        await say(_strat_report_text(pos, px, tick, bank, fees_est, rng_strat, hdr="✏️ STRAT обновлён вручную"))
+                        # лог в шиты
+                        try:
+                            await log_event_safely({
+                                "Event":"STRAT_SET","Event_ID":f"STRAT_SET_{pos.signal_id}_{int(time.time())}",
+                                "Timestamp_UTC": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+                                "Pair": symbol,"Side": pos.side,"Signal_ID": pos.signal_id,
+                                "Next_DCA_Price": pos.ordinary_targets[base_off]["price"] if pos.ordinary_targets else "",
+                                "Next_DCA_Label": pos.ordinary_targets[base_off]["label"] if pos.ordinary_targets else "",
+                                "Chat_ID": b.get("chat_id") or "","Owner_Key": b.get("owner_key") or "",
+                                "FA_Risk": b.get("fa_risk") or "","FA_Bias": b.get("fa_bias") or "",
+                                "Bank_Target_USDT": bank_target, "Bank_Fact_USDT": bank
+                            })
+                        except: pass
+
+            if b.pop("cmd_strat_reset", False):
+                if not pos or not pos.from_hedge or b.get("fsm_state") != int(FSM.MANAGING):
+                    await say("ℹ️ Нет активной позиции «после хеджа» — сбрасывать нечего.")
+                else:
+                    cum_margin = _pos_total_margin(pos)
+                    fees_est = (cum_margin * pos.leverage) * CONFIG.FEE_TAKER * CONFIG.LIQ_FEE_BUFFER
+                    entry_px = pos.hedge_entry_px or pos.avg
+                    pos.ordinary_targets = auto_strat_targets_with_ml_buffer(pos, rng_strat, entry=entry_px,
+                                                                             tick=tick, bank=bank, fees_est=fees_est)
+                    pos.ordinary_offset = min(getattr(pos,"ordinary_offset",0), len(pos.ordinary_targets))
+                    await say(_strat_report_text(pos, px, tick, bank, fees_est, rng_strat, hdr="♻️ STRAT сброшен к авто-плану"))
+                    try:
+                        await log_event_safely({
+                            "Event":"STRAT_RESET","Event_ID":f"STRAT_RESET_{pos.signal_id}_{int(time.time())}",
+                            "Timestamp_UTC": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+                            "Pair": symbol,"Side": pos.side,"Signal_ID": pos.signal_id,
+                            "Chat_ID": b.get("chat_id") or "","Owner_Key": b.get("owner_key") or "",
+                            "FA_Risk": b.get("fa_risk") or "","FA_Bias": b.get("fa_bias") or "",
+                            "Bank_Target_USDT": bank_target, "Bank_Fact_USDT": bank
+                        })
+                    except: pass
+            # -------- /STRAT commands end --------
 
             # Диагностика по флагу
             if b.pop("cmd_diag_targets", False):
@@ -1776,7 +2015,7 @@ async def scanner_main_loop(
                     dep_total = 2 * margin_3
                     b["hedge"] = {
                         "active": True,
-                        "bias": bias_side,      # где «ждём» профит
+                        "bias": bias_side,     # где «ждём» профит
                         "entry_px": px,
                         "leg_margin": margin_3,
                         "lots_per_leg": lots_per_leg,
@@ -1800,30 +2039,29 @@ async def scanner_main_loop(
                     _pos = Position(remain_side, signal_id=f"{symbol.replace('/','')} PREVIEW",
                                     leverage=CONFIG.LEVERAGE, owner_key=b["owner_key"])
                     _pos.plan_with_reserve(alloc_bank_after, growth_after, ord_levels_after)
-                    _pos.step_margins[0] = margin_3          # первый шаг = оставшаяся нога хеджа
+                    _pos.step_margins[0] = margin_3         # первый шаг = оставшаяся нога хеджа
                     if bool(fa.get("reserve_off")):
                         _pos.reserve_available = False
                         _pos.reserve_margin_usdt = 0.0
                         _pos.max_steps = _pos.ord_levels
                     # чтобы суммарное потребление ≤ 70% банка:
                     _pos.rebalance_tail_margins_excluding_reserve(alloc_bank_after)
-                    _ = _pos.add_step(px)                      # оформляем первый шаг по текущей цене
+                    _ = _pos.add_step(px)                   # оформляем первый шаг по текущей цене
                     _pos.from_hedge = True
                     _pos.hedge_entry_px = px
                     _pos.hedge_close_px = planned_hc_px
-                    _pos.ordinary_targets = compute_strategic_targets_only(
-                        entry=px, side=remain_side, rng_strat=rng_strat, tick=tick, levels=ord_levels_after
-                    )
-                    # обрезаем цели ML-ограничением (не поместившиеся уйдут в EXT)
+                    # Авто-раскладка с ML-буфером 3% после #3 и пробоя:
                     _cum_margin = _pos_total_margin(_pos)
                     _fees_est   = (_cum_margin * _pos.leverage) * CONFIG.FEE_TAKER * CONFIG.LIQ_FEE_BUFFER
-                    _pos.ordinary_targets = clip_targets_by_ml(_pos, bank, _fees_est, _pos.ordinary_targets, tick)
+                    _pos.ordinary_targets = auto_strat_targets_with_ml_buffer(_pos, rng_strat, entry=px,
+                                                                              tick=tick, bank=bank, fees_est=_fees_est)
                     _pos.ordinary_offset = 0
 
                     # ML/риски и план следующего добора
                     _ml_now     = ml_price_at(_pos, CONFIG.ML_TARGET_PCT, bank, _fees_est)
                     _ml_arrow   = "↓" if remain_side == "LONG" else "↑"
                     _dist_now   = ml_distance_pct(_pos.side, px, _ml_now)
+                    _dist_now_txt = "N/A" if np.isnan(_dist_now) else f"{_dist_now:.2f}%"
                     _avail = min(3, len(_pos.step_margins)-1, len(_pos.ordinary_targets))
                     _scen = _ml_multi_scenarios(_pos, bank, _fees_est, k_list=tuple(range(1, _avail+1)))
                     def _fmt_ml(v): return "N/A" if (v is None or np.isnan(v)) else fmt(v)
@@ -1869,7 +2107,7 @@ async def scanner_main_loop(
                         f"Депозит (суммарно): <b>{dep_total:.2f} USD</b> (по <b>{margin_3:.2f}</b> на ногу)\n"
                         f"План HC: HC) <code>{fmt(planned_hc_px)}</code> — Δ≈ {_hc_dticks:.0f} тик. ({_hc_dpct:.2f}%)\n"
                         f"⚙️ Превью после закрытия хеджа (останется <b>{remain_side}</b>):\n"
-                        f"ML(20%): {_ml_arrow}<code>{fmt(_ml_now)}</code> ({'N/A' if np.isnan(_dist_now) else f'{_dist_now:.2f}%'} от текущей)\n"
+                        f"ML(20%): {_ml_arrow}<code>{fmt(_ml_now)}</code> ({_dist_now_txt} от текущей)\n"
                         f"ML после +1: {_fmt_ml(_scen.get(1))} | +2: {_fmt_ml(_scen.get(2))} | +3: {_fmt_ml(_scen.get(3))}\n"
                         f"След. STRAT: <code>{_nxt_txt}</code>\n"
                         f"Ближайшие STRAT цели:\n{_targets_block}\n"
@@ -1892,10 +2130,71 @@ async def scanner_main_loop(
                         log.exception("log HEDGE_OPEN failed")
 
             # СИГНАЛ «закрыть хедж» (по противоположному TAC, по хвостам 1m)
+            # + АКТИВНОЕ ОБНОВЛЕНИЕ/ПЕРЕВОРОТ BIAS, если возник «противоположный вход»
             if (b.get("hedge") and b["hedge"].get("active")):
                 tac_lo = rng_tac["lower"] + 0.30 * rng_tac["width"]
                 tac_hi = rng_tac["lower"] + 0.70 * rng_tac["width"]
                 bias = b["hedge"]["bias"]
+                # Детекция условий входа в обе стороны (как при старте)
+                can_long  = (b.get("m1_lo") is not None) and (b["m1_lo"] <= tac_lo - CONFIG.WICK_HYST_TICKS * tick)
+                can_short = (b.get("m1_hi") is not None) and (b["m1_hi"] >= tac_hi + CONFIG.WICK_HYST_TICKS * tick)
+
+                # Если во время хеджа возник «противоположный вход» — переворачиваем bias и пересчитываем превью
+                flip_needed = (bias == "LONG" and can_short) or (bias == "SHORT" and can_long)
+                if flip_needed and (time.time() - b.get("hedge_flip_ts", 0) > 10):
+                    b["hedge_flip_ts"] = time.time()
+                    new_bias = "LONG" if can_long else "SHORT"
+                    b["hedge"]["bias"] = new_bias
+                    planned_hc_px = (tac_hi if new_bias == "LONG" else tac_lo)
+                    # Превью «что останется после закрытия хеджа» в НОВУЮ сторону
+                    remain_side = "SHORT" if new_bias == "LONG" else "LONG"
+                    entry_px0   = float(b["hedge"]["entry_px"])
+                    leg_margin  = float(b["hedge"]["leg_margin"])
+                    alloc_bank_after = _alloc_bank(bank, target_weight_for_pair(symbol, fund_weights))
+                    growth_after = choose_growth(ind, rng_strat, rng_tac)
+                    if fa_risk == "Amber":
+                        growth_after = min(growth_after, CONFIG.AUTO_ALLOC["growth_A"])
+                    _pos = Position(remain_side, signal_id=f"{symbol.replace('/','')} PREVIEW",
+                                    leverage=CONFIG.LEVERAGE, owner_key=b["owner_key"])
+                    _pos.plan_with_reserve(alloc_bank_after, growth_after, CONFIG.STRAT_LEVELS_AFTER_HEDGE)
+                    _pos.step_margins[0] = leg_margin
+                    if bool(fa.get("reserve_off")):
+                        _pos.reserve_available = False
+                        _pos.reserve_margin_usdt = 0.0
+                        _pos.max_steps = _pos.ord_levels
+                    _pos.rebalance_tail_margins_excluding_reserve(alloc_bank_after)
+                    _ = _pos.add_step(entry_px0)
+                    _pos.from_hedge = True
+                    _pos.hedge_entry_px = entry_px0
+                    _pos.hedge_close_px = planned_hc_px
+                    _cum = _pos_total_margin(_pos)
+                    _fees = (_cum * _pos.leverage) * CONFIG.FEE_TAKER * CONFIG.LIQ_FEE_BUFFER
+                    _pos.ordinary_targets = auto_strat_targets_with_ml_buffer(
+                        _pos, rng_strat, entry=entry_px0, tick=tick, bank=bank, fees_est=_fees
+                    )
+                    _pos.ordinary_offset = 0
+                    # Короткое обновлённое превью
+                    _ml_now = ml_price_at(_pos, CONFIG.ML_TARGET_PCT, bank, _fees)
+                    _ml_arrow = "↓" if remain_side == "LONG" else "↑"
+                    _dist_now = ml_distance_pct(_pos.side, px, _ml_now)
+                    _dist_now_txt = "N/A" if np.isnan(_dist_now) else f"{_dist_now:.2f}%"
+                    _nxt = _pos.ordinary_targets[0] if _pos.ordinary_targets else None
+                    _nxt_margin = _pos.step_margins[1] if len(_pos.step_margins) > 1 else None
+                    if _nxt and _nxt_margin:
+                        _nxt_lots = margin_to_lots(symbol, _nxt_margin, price=_nxt["price"], leverage=_pos.leverage)
+                        _nxt_dep_txt = f"{_nxt_margin:.2f} USD ≈ {_nxt_lots:.2f} lot"
+                    else:
+                        _nxt_dep_txt = "N/A"
+                    _nxt_txt = "N/A" if not _nxt else f"{fmt(_nxt['price'])} ({_nxt['label']})"
+                    await say(
+                        f"🔁 HEDGE UPDATE [{new_bias}] \n"
+                        f"HC теперь: <code>{fmt(planned_hc_px)}</code>\n"
+                        f"Останется: <b>{remain_side}</b> | ML(20%): {_ml_arrow}<code>{fmt(_ml_now)}</code> "
+                        f"({_dist_now_txt} от текущей)\n"
+                        f"След. STRAT: <code>{_nxt_txt}</code>\n"
+                        f"Плановый добор: <b>{_nxt_dep_txt}</b>"
+                    )
+
                 # если bias LONG (вход от 30%), закрыть при касании 70% (hi >= tac_hi+buf) — закрываем «плюсовую» LONG
                 # если bias SHORT (вход от 70%), закрыть при касании 30% (lo <= tac_lo-buf) — закрываем «плюсовую» SHORT
                 need_close = (bias == "LONG" and (m1_hi is not None) and (m1_hi >= tac_hi + CONFIG.WICK_HYST_TICKS * tick)) or \
@@ -1944,13 +2243,12 @@ async def scanner_main_loop(
                 pos.hedge_entry_px = entry_px
                 # сохраним точку закрытия хеджа, чтобы показывать её вместе с целями
                 pos.hedge_close_px = close_px
-                # STRAT-цели
-                pos.ordinary_targets = compute_strategic_targets_only(entry=entry_px, side=pos.side, rng_strat=rng_strat, tick=tick, levels=ord_levels)
-                # обрезаем цели ML-ограничением (не поместившиеся уйдут в EXT)
+                # STRAT-цели с ML-буфером 3% после #3 и пробоя:
                 cum_margin   = _pos_total_margin(pos)
                 cum_notional = cum_margin * pos.leverage
                 fees_paid_est = cum_notional * CONFIG.FEE_TAKER * CONFIG.LIQ_FEE_BUFFER
-                pos.ordinary_targets = clip_targets_by_ml(pos, bank, fees_paid_est, pos.ordinary_targets, tick)
+                pos.ordinary_targets = auto_strat_targets_with_ml_buffer(pos, rng_strat, entry=entry_px,
+                                                                         tick=tick, bank=bank, fees_est=fees_paid_est)
                 pos.ordinary_offset = 0
                 b["position"] = pos
                 b["fsm_state"] = int(FSM.MANAGING)
@@ -1961,6 +2259,7 @@ async def scanner_main_loop(
                 ml_now = ml_price_at(pos, CONFIG.ML_TARGET_PCT, bank, fees_paid_est)
                 dist_now = ml_distance_pct(pos.side, px, ml_now)
                 ml_arrow = "↓" if pos.side == "LONG" else "↑"
+                dist_now_txt = "N/A" if np.isnan(dist_now) else f"{dist_now:.2f}%"
                 avail = min(3, len(pos.step_margins)-1, len(pos.ordinary_targets))
                 scen = _ml_multi_scenarios(pos, bank, fees_paid_est, k_list=tuple(range(1, avail+1)))
                 def _fmt_ml(v): 
@@ -2003,7 +2302,7 @@ async def scanner_main_loop(
                     f"✅ Хедж закрыт (по команде). Оставлена нога: <b>{remain_side}</b>\n"
                     f"Цена входа хеджа: <code>{fmt(entry_px)}</code> | Закрытие второй ноги: <code>{fmt(close_px)}</code>\n"
                     f"Средняя: <code>{fmt(pos.avg)}</code> | TP: <code>{fmt(pos.tp_price)}</code>\n"
-                    f"ML(20%): {ml_arrow}<code>{fmt(ml_now)}</code> ({'N/A' if np.isnan(dist_now) else f'{dist_now:.2f}%'} от текущей)\n"
+                    f"ML(20%): {ml_arrow}<code>{fmt(ml_now)}</code> ({dist_now_txt} от текущей)\n"
                     f"ML после +1: {_fmt_ml(scen.get(1))} | +2: {_fmt_ml(scen.get(2))} | +3: {_fmt_ml(scen.get(3))}\n"
                     f"След. STRAT: {next_strat_line}\n"
                     f"Ближайшие STRAT цели:\n{targets_block}\n"
@@ -2089,7 +2388,7 @@ async def scanner_main_loop(
                         ml_arrow = "↓" if pos.side == "LONG" else "↑"
                         # ML после будущих стратегических шагов
                         used_ord_now = pos.steps_filled - (1 if pos.reserve_used else 0)
-                        base_off     = getattr(pos, "ordinary_offset", 0)
+                        base_off   = getattr(pos, "ordinary_offset", 0)
                         avail_ord    = max(0, len(pos.step_margins)    - used_ord_now)
                         avail_tgts   = max(0, len(pos.ordinary_targets) - base_off)
                         avail_k      = min(3, avail_ord, avail_tgts)
@@ -2191,8 +2490,8 @@ async def scanner_main_loop(
                                 pos.sl_price = new_sl_q
                                 pos.trail_stage = stage_idx
                                 if (last_notif_q is None) or \
-                                   (pos.side == "LONG" and new_sl_q > (last_notif_q + t)) or \
-                                   (pos.side == "SHORT" and new_sl_q < (last_notif_q - t)):
+                                  (pos.side == "LONG" and new_sl_q > (last_notif_q + t)) or \
+                                  (pos.side == "SHORT" and new_sl_q < (last_notif_q - t)):
                                     await say(f"🛡️ Трейлинг-SL (стадия {stage_idx+1}) → <code>{fmt(pos.sl_price)}</code>")
                                     pos.last_sl_notified_price = pos.sl_price
                                     await log_event_safely(with_banks({
@@ -2251,6 +2550,14 @@ async def scanner_main_loop(
 
     log.info("BMR-DCA loop gracefully stopped.")
 
+# ---------------------------------------------------------------------------
+# STRAT commands bridge (/strat show | /strat set p1 p2 p3 | /strat reset)
+# Предполагается, что внешний Telegram-слой выставляет в box:
+#    box[ns_key]["cmd_strat_show"] = True
+#    box[ns_key]["cmd_strat_set"]  = [p1, p2, p3]   (строки/числа)
+#    box[ns_key]["cmd_strat_reset"]= True
+# Ниже добавляем обработку внутри основного цикла — рядом с управлением позицией.
+# ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
 # Task Manager: поключично запускаем/останавливаем сканеры по парам
 # ---------------------------------------------------------------------------
