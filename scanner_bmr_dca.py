@@ -2361,12 +2361,15 @@ async def scanner_main_loop(
                         if len(_pos.ordinary_targets) >= 3:
                             _pos.reserve3_price = _pos.ordinary_targets[2]["price"]
 
-                        # ... (дальше — формирование текста ответа остаётся как есть, только
-                        # в заголовке выводим 'Останется: {remain_side}')
-                        _ml_now = ml_price_at(_pos, CONFIG.ML_TARGET_PCT, bank, _fees)
+                        _ml_now = ml_price_at(_pos, CONFIG.ML_TARGET_PCT, alloc_bank_after, _fees)
                         _ml_arrow = "↓" if remain_side == "LONG" else "↑"
                         _dist_now = ml_distance_pct(_pos.side, px, _ml_now)
                         _dist_now_txt = "N/A" if np.isnan(_dist_now) else f"{_dist_now:.2f}%"
+                        _avail = min(3, len(_pos.step_margins) - 1, len(_pos.ordinary_targets))
+                        _scen = _ml_multi_scenarios(_pos, alloc_bank_after, _fees, k_list=tuple(range(1, _avail + 1)))
+                        def _fmt_ml(v): 
+                            return "N/A" if (v is None or np.isnan(v)) else fmt(v)
+                        _ml_after_line = f"ML после +1: {_fmt_ml(_scen.get(1))} | +2: {_fmt_ml(_scen.get(2))} | +3: {_fmt_ml(_scen.get(3))}"
                         _nxt = _pos.ordinary_targets[0] if _pos.ordinary_targets else None
                         _nxt_margin = _pos.step_margins[1] if len(_pos.step_margins) > 1 else None
                         if _nxt and _nxt_margin:
@@ -2403,12 +2406,12 @@ async def scanner_main_loop(
                             f"HC теперь: <code>{fmt(planned_hc_px)}</code>\n"
                             f"Останется: <b>{remain_side}</b> | ML(20%): {_ml_arrow}<code>{fmt(_ml_now)}</code> "
                             f"({_dist_now_txt} от текущей)\n"
+                            f"{_ml_after_line}\n"
                             f"След. STRAT: <code>{_nxt_txt}</code>\n"
                             f"Ближайшие STRAT цели:\n{_targets_block}\n"
                             f"Размеры STRAT доборов:\n{_sizes_block}\n"
                             f"Плановый добор: <b>{_nxt_dep_txt}</b>"
                         )
-
                 # сигнал «закрыть хедж» (только уведомление) — по целевой hc_px, если она задана
                 bias_now = b["hedge"]["bias"]
                 hc_px = b["hedge"].get("hc_px")  # может отсутствовать для старых записей
