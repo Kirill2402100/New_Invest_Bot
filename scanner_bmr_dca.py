@@ -1257,15 +1257,20 @@ def _wrap_broadcast(bc, default_chat_id: int | None):
 # ---------------------------------------------------------------------------
 # HEDGE helpers (состояние и расчёты)
 # ---------------------------------------------------------------------------
-# <<< MODIFIED: Added planned_hc_price helper function
 def planned_hc_price(entry: float, tac_lo: float, tac_hi: float, bias: str, mode: str, tick: float) -> float:
-    if mode == "revert":
-        # закрываем на противоположном TAC (как сейчас)
-        px = (tac_hi if bias == "LONG" else tac_lo)
-    else: # trend
-        # трендовый: «зеркалим» расстояние до противоположного TAC в сторону bias
-        # Пример: bias=LONG, entry=1.1752, tac_lo=1.1692 → HC = 2*1.1752 - 1.1692 = 1.1812
-        px = (2*entry - tac_lo) if bias == "LONG" else (2*entry - tac_hi)
+    """
+    HC для хеджа:
+    - mode == "trend": от точки входа на размер 'коридора' между TAC30 и TAC70
+                      LONG-bias → вверх, SHORT-bias → вниз
+                      HC = entry ± (tac_hi - tac_lo)
+    - mode == "revert": закрытие на противоположном TAC (как раньше)
+    """
+    if mode == "trend":
+        span = float(tac_hi) - float(tac_lo)  # расстояние между 30% и 70%
+        px = entry + span if bias == "LONG" else entry - span
+    else:  # "revert"
+        # противоположный TAC относительно ожидаемого профита
+        px = tac_hi if bias == "LONG" else tac_lo
     return quantize_to_tick(px, tick)
 
 def _sum_first_n(lst: list[float], n: int) -> float:
@@ -1719,7 +1724,7 @@ async def scanner_main_loop(
                                     leverage=CONFIG.LEVERAGE, owner_key=b["owner_key"])
                     _pos.plan_with_reserve(alloc_bank_after, growth_after, ord_levels_after)
                     _pos.step_margins[0] = margin_3
-                    _ = _pos.add_step(entry_px)  # фиксируем, что первый шаг = margin_3
+                    _ = _pos.add_step(entry_px)
                     _pos.rebalance_tail_margins_excluding_reserve(alloc_bank_after)
                     _pos.from_hedge = True
                     _pos.hedge_entry_px = entry_px
@@ -2307,78 +2312,103 @@ async def scanner_main_loop(
 
                 # --- РУЧНОЙ ПЕРЕВОРОТ ХЕДЖА ---
                 _flip = b.pop("cmd_hedge_flip", None)
-                if _flip in ("LONG","SHORT"):
-                    new_bias = _flip
-                    b["hedge"]["bias"] = new_bias
-                    planned_hc_px = planned_hc_price(px, tac_lo, tac_hi, new_bias, CONFIG.HEDGE_MODE, tick)
-                    b["hedge"]["hc_px"] = planned_hc_px
-                    remain_side = "SHORT" if new_bias == "LONG" else "LONG"
-                    entry_px0   = float(b["hedge"]["entry_px"])
-                    leg_margin  = float(b["hedge"]["leg_margin"])
-                    alloc_bank_after = _alloc_bank(bank, target_weight_for_pair(symbol, fund_weights))
-                    growth_after = choose_growth(ind, rng_strat, rng_tac)
-                    _pos = Position(remain_side, signal_id=f"{symbol.replace('/','')} PREVIEW",
-                                    leverage=CONFIG.LEVERAGE, owner_key=b["owner_key"])
-                    _pos.plan_with_reserve(alloc_bank_after, growth_after, CONFIG.STRAT_LEVELS_AFTER_HEDGE)
-                    _pos.step_margins[0] = leg_margin
-                    _ = _pos.add_step(entry_px0)
-                    _pos.rebalance_tail_margins_excluding_reserve(alloc_bank_after)
-                    _pos.from_hedge = True
-                    _pos.hedge_entry_px = entry_px0
-                    _pos.hedge_close_px = planned_hc_px
-                    _cum = _pos_total_margin(_pos)
-                    _fees = (_cum * _pos.leverage) * CONFIG.FEE_TAKER * CONFIG.LIQ_FEE_BUFFER
-                    _pos.ordinary_targets = auto_strat_targets_with_ml_buffer(
-                        _pos, rng_strat, entry=entry_px0, tick=tick, bank=bank, fees_est=_fees
-                    )
-                    _pos.ordinary_offset = 0
-                    if len(_pos.ordinary_targets) >= 3:
-                        _pos.reserve3_price = _pos.ordinary_targets[2]["price"]
-                    _ml_now = ml_price_at(_pos, CONFIG.ML_TARGET_PCT, bank, _fees)
-                    _ml_arrow = "↓" if remain_side == "LONG" else "↑"
-                    _dist_now = ml_distance_pct(_pos.side, px, _ml_now)
-                    _dist_now_txt = "N/A" if np.isnan(_dist_now) else f"{_dist_now:.2f}%"
-                    _nxt = _pos.ordinary_targets[0] if _pos.ordinary_targets else None
-                    _nxt_margin = _pos.step_margins[1] if len(_pos.step_margins) > 1 else None
-                    if _nxt and _nxt_margin:
-                        _nxt_lots = margin_to_lots(symbol, _nxt_margin, price=_nxt["price"], leverage=_pos.leverage)
-                        _nxt_dep_txt = f"{_nxt_margin:.2f} USD ≈ {_nxt_lots:.2f} lot"
+                if _flip:
+                    if not (b.get("hedge") and b["hedge"].get("active")):
+                        await say("ℹ️ Хедж не активен — переворот невозможен.")
                     else:
-                        _nxt_dep_txt = "N/A"
-                    _nxt_txt = "N/A" if not _nxt else f"{fmt(_nxt['price'])} ({_nxt['label']})"
-                    _targets_lines = []
-                    _hc_dticks = abs((planned_hc_px - px) / max(tick, 1e-12))
-                    _hc_dpct   = abs((planned_hc_px / max(px, 1e-12) - 1.0) * 100.0)
-                    _targets_lines.append(
-                        f"HC) <code>{fmt(planned_hc_px)}</code> — Δ≈ {_hc_dticks:.0f} тик. ({_hc_dpct:.2f}%)"
-                    )
-                    for i, t in enumerate(_pos.ordinary_targets[:3], start=1):
-                        _dt = abs((t['price'] - px) / max(tick, 1e-12))
-                        _dp = abs((t['price'] / max(px, 1e-12) - 1.0) * 100.0)
-                        _targets_lines.append(
-                            f"{i}) <code>{fmt(t['price'])}</code> ({t['label']}) — Δ≈ {_dt:.0f} тик. ({_dp:.2f}%)"
-                        )
-                    _targets_block = "\n".join(_targets_lines) if _targets_lines else "—"
-                    _sizes_lines = []
-                    _next_idx = 1
-                    for j, t in enumerate(_pos.ordinary_targets[:3], start=1):
-                        idx = _next_idx + (j - 1)
-                        if idx >= len(_pos.step_margins): break
-                        _m = _pos.step_margins[idx]
-                        _lots_j = margin_to_lots(symbol, _m, price=t['price'], leverage=_pos.leverage)
-                        _sizes_lines.append(f"{j}) {_m:.2f} USD ≈ {_lots_j:.2f} lot")
-                    _sizes_block = "\n".join(_sizes_lines) if _sizes_lines else "—"
+                        # 1) аргумент команды теперь трактуем как 'remain side' (что должно остаться)
+                        desired_remain = str(_flip).upper() if isinstance(_flip, str) else None
+                        curr_bias = b["hedge"]["bias"]
 
-                    await say(
-                        f"🔁 HEDGE UPDATE [manual → {new_bias}] \n"
-                        f"HC теперь: <code>{fmt(planned_hc_px)}</code>\n"
-                        f"Останется: <b>{remain_side}</b> | ML(20%): {_ml_arrow}<code>{fmt(_ml_now)}</code> "
-                        f"({_dist_now_txt} от текущей)\n"
-                        f"След. STRAT: <code>{_nxt_txt}</code>\n"
-                        f"Ближайшие STRAT цели:\n{_targets_block}\n"
-                        f"Размеры STRAT доборов:\n{_sizes_block}\n"
-                        f"Плановый добор: <b>{_nxt_dep_txt}</b>"
-                    )
+                        if desired_remain in ("LONG","SHORT"):
+                            new_bias = "SHORT" if desired_remain == "LONG" else "LONG"
+                        else:
+                            # если аргумент не задан, просто инвертируем текущий bias
+                            new_bias = "SHORT" if curr_bias == "LONG" else "LONG"
+                            desired_remain = "SHORT" if new_bias == "LONG" else "LONG"
+
+                        b["hedge"]["bias"] = new_bias
+
+                        # 2) TAC-уровни и HC считаем ОТ ТОЧКИ ВХОДА ХЕДЖА
+                        tac_lo = rng_tac["lower"] + 0.30 * rng_tac["width"]
+                        tac_hi = rng_tac["lower"] + 0.70 * rng_tac["width"]
+                        entry_px0 = float(b["hedge"]["entry_px"])
+                        planned_hc_px = planned_hc_price(entry_px0, tac_lo, tac_hi, new_bias, CONFIG.HEDGE_MODE, tick)
+                        b["hedge"]["hc_px"] = planned_hc_px
+
+                        # 3) Превью позиции после закрытия хеджа уже строим в сторону desired_remain
+                        remain_side = desired_remain
+                        leg_margin  = float(b["hedge"]["leg_margin"])
+                        alloc_bank_after = _alloc_bank(bank, target_weight_for_pair(symbol, fund_weights))
+                        growth_after = choose_growth(ind, rng_strat, rng_tac)
+
+                        _pos = Position(remain_side, signal_id=f"{symbol.replace('/','')} PREVIEW",
+                                        leverage=CONFIG.LEVERAGE, owner_key=b["owner_key"])
+                        _pos.plan_with_reserve(alloc_bank_after, growth_after, CONFIG.STRAT_LEVELS_AFTER_HEDGE)
+                        _pos.step_margins[0] = leg_margin
+                        _ = _pos.add_step(entry_px0)
+                        _pos.rebalance_tail_margins_excluding_reserve(alloc_bank_after)
+                        _pos.from_hedge = True
+                        _pos.hedge_entry_px = entry_px0
+                        _pos.hedge_close_px = planned_hc_px
+
+                        _cum = _pos_total_margin(_pos)
+                        _fees = (_cum * _pos.leverage) * CONFIG.FEE_TAKER * CONFIG.LIQ_FEE_BUFFER
+                        _pos.ordinary_targets = auto_strat_targets_with_ml_buffer(
+                            _pos, rng_strat, entry=entry_px0, tick=tick, bank=bank, fees_est=_fees
+                        )
+                        _pos.ordinary_offset = 0
+                        if len(_pos.ordinary_targets) >= 3:
+                            _pos.reserve3_price = _pos.ordinary_targets[2]["price"]
+
+                        # ... (дальше — формирование текста ответа остаётся как есть, только
+                        # в заголовке выводим 'Останется: {remain_side}')
+                        _ml_now = ml_price_at(_pos, CONFIG.ML_TARGET_PCT, bank, _fees)
+                        _ml_arrow = "↓" if remain_side == "LONG" else "↑"
+                        _dist_now = ml_distance_pct(_pos.side, px, _ml_now)
+                        _dist_now_txt = "N/A" if np.isnan(_dist_now) else f"{_dist_now:.2f}%"
+                        _nxt = _pos.ordinary_targets[0] if _pos.ordinary_targets else None
+                        _nxt_margin = _pos.step_margins[1] if len(_pos.step_margins) > 1 else None
+                        if _nxt and _nxt_margin:
+                            _nxt_lots = margin_to_lots(symbol, _nxt_margin, price=_nxt["price"], leverage=_pos.leverage)
+                            _nxt_dep_txt = f"{_nxt_margin:.2f} USD ≈ {_nxt_lots:.2f} lot"
+                        else:
+                            _nxt_dep_txt = "N/A"
+                        _nxt_txt = "N/A" if not _nxt else f"{fmt(_nxt['price'])} ({_nxt['label']})"
+                        _targets_lines = []
+                        _hc_dticks = abs((planned_hc_px - px) / max(tick, 1e-12))
+                        _hc_dpct   = abs((planned_hc_px / max(px, 1e-12) - 1.0) * 100.0)
+                        _targets_lines.append(
+                            f"HC) <code>{fmt(planned_hc_px)}</code> — Δ≈ {_hc_dticks:.0f} тик. ({_hc_dpct:.2f}%)"
+                        )
+                        for i, t in enumerate(_pos.ordinary_targets[:3], start=1):
+                            _dt = abs((t['price'] - px) / max(tick, 1e-12))
+                            _dp = abs((t['price'] / max(px, 1e-12) - 1.0) * 100.0)
+                            _targets_lines.append(
+                                f"{i}) <code>{fmt(t['price'])}</code> ({t['label']}) — Δ≈ {_dt:.0f} тик. ({_dp:.2f}%)"
+                            )
+                        _targets_block = "\n".join(_targets_lines) if _targets_lines else "—"
+                        _sizes_lines = []
+                        _next_idx = 1
+                        for j, t in enumerate(_pos.ordinary_targets[:3], start=1):
+                            idx = _next_idx + (j - 1)
+                            if idx >= len(_pos.step_margins): break
+                            _m = _pos.step_margins[idx]
+                            _lots_j = margin_to_lots(symbol, _m, price=t['price'], leverage=_pos.leverage)
+                            _sizes_lines.append(f"{j}) {_m:.2f} USD ≈ {_lots_j:.2f} lot")
+                        _sizes_block = "\n".join(_sizes_lines) if _sizes_lines else "—"
+
+                        await say(
+                            f"🔁 HEDGE FLIP [Останется: {remain_side}] \n"
+                            f"HC теперь: <code>{fmt(planned_hc_px)}</code>\n"
+                            f"Останется: <b>{remain_side}</b> | ML(20%): {_ml_arrow}<code>{fmt(_ml_now)}</code> "
+                            f"({_dist_now_txt} от текущей)\n"
+                            f"След. STRAT: <code>{_nxt_txt}</code>\n"
+                            f"Ближайшие STRAT цели:\n{_targets_block}\n"
+                            f"Размеры STRAT доборов:\n{_sizes_block}\n"
+                            f"Плановый добор: <b>{_nxt_dep_txt}</b>"
+                        )
+
                 # сигнал «закрыть хедж» (только уведомление) — по целевой hc_px, если она задана
                 bias_now = b["hedge"]["bias"]
                 hc_px = b["hedge"].get("hc_px")  # может отсутствовать для старых записей
