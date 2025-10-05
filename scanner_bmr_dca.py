@@ -1732,15 +1732,19 @@ async def scanner_main_loop(
                     _cum_margin = _pos_total_margin(_pos)
                     _fees_est   = (_cum_margin * _pos.leverage) * CONFIG.FEE_TAKER * CONFIG.LIQ_FEE_BUFFER
                     _pos.ordinary_targets = auto_strat_targets_with_ml_buffer(_pos, rng_strat, entry=entry_px,
-                                                                                tick=tick, bank=bank, fees_est=_fees_est)
+                                                                                tick=tick, bank=alloc_bank_after, fees_est=_fees_est)
+                    _pos.ordinary_targets = clip_targets_by_ml(
+                        _pos, bank=alloc_bank_after, fees_est=_fees_est,
+                        targets=_pos.ordinary_targets, tick=tick, safety_ticks=CONFIG.DCA_MIN_GAP_TICKS
+                    )
                     _pos.ordinary_offset = 0
 
-                    _ml_now    = ml_price_at(_pos, CONFIG.ML_TARGET_PCT, bank, _fees_est)
+                    _ml_now    = ml_price_at(_pos, CONFIG.ML_TARGET_PCT, alloc_bank_after, _fees_est)
                     _ml_arrow  = "↓" if remain_side == "LONG" else "↑"
                     _dist_now  = ml_distance_pct(_pos.side, px, _ml_now)  # расстояние — от текущей цены рынка
                     def _fmt_ml(v): return "N/A" if (v is None or np.isnan(v)) else fmt(v)
                     _avail = min(3, len(_pos.step_margins)-1, len(_pos.ordinary_targets))
-                    _scen = _ml_multi_scenarios(_pos, bank, _fees_est, k_list=tuple(range(1, _avail+1)))
+                    _scen = _ml_multi_scenarios(_pos, alloc_bank_after, _fees_est, k_list=tuple(range(1, _avail+1)))
                     _nxt = _pos.ordinary_targets[0] if _pos.ordinary_targets else None
                     _nxt_txt = "N/A" if _nxt is None else f"{fmt(_nxt['price'])} ({_nxt['label']})"
                     _nxt_margin = _pos.step_margins[1] if len(_pos.step_margins) > 1 else None
@@ -2228,16 +2232,20 @@ async def scanner_main_loop(
                     _cum_margin = _pos_total_margin(_pos)
                     _fees_est   = (_cum_margin * _pos.leverage) * CONFIG.FEE_TAKER * CONFIG.LIQ_FEE_BUFFER
                     _pos.ordinary_targets = auto_strat_targets_with_ml_buffer(_pos, rng_strat, entry=px,
-                                                                                tick=tick, bank=bank, fees_est=_fees_est)
+                                                                                tick=tick, bank=alloc_bank_after, fees_est=_fees_est)
+                    _pos.ordinary_targets = clip_targets_by_ml(
+                        _pos, bank=alloc_bank_after, fees_est=_fees_est,
+                        targets=_pos.ordinary_targets, tick=tick, safety_ticks=CONFIG.DCA_MIN_GAP_TICKS
+                    )
                     _pos.ordinary_offset = 0
 
                     # ML/риски и план следующего добора
-                    _ml_now    = ml_price_at(_pos, CONFIG.ML_TARGET_PCT, bank, _fees_est)
+                    _ml_now    = ml_price_at(_pos, CONFIG.ML_TARGET_PCT, alloc_bank_after, _fees_est)
                     _ml_arrow  = "↓" if remain_side == "LONG" else "↑"
                     _dist_now  = ml_distance_pct(_pos.side, px, _ml_now)
                     _dist_now_txt = "N/A" if np.isnan(_dist_now) else f"{_dist_now:.2f}%"
                     _avail = min(3, len(_pos.step_margins)-1, len(_pos.ordinary_targets))
-                    _scen = _ml_multi_scenarios(_pos, bank, _fees_est, k_list=tuple(range(1, _avail+1)))
+                    _scen = _ml_multi_scenarios(_pos, alloc_bank_after, _fees_est, k_list=tuple(range(1, _avail+1)))
                     def _fmt_ml(v): return "N/A" if (v is None or np.isnan(v)) else fmt(v)
 
                     _nxt = _pos.ordinary_targets[0] if _pos.ordinary_targets else None
@@ -2355,7 +2363,11 @@ async def scanner_main_loop(
                         _cum = _pos_total_margin(_pos)
                         _fees = (_cum * _pos.leverage) * CONFIG.FEE_TAKER * CONFIG.LIQ_FEE_BUFFER
                         _pos.ordinary_targets = auto_strat_targets_with_ml_buffer(
-                            _pos, rng_strat, entry=entry_px0, tick=tick, bank=bank, fees_est=_fees
+                            _pos, rng_strat, entry=entry_px0, tick=tick, bank=alloc_bank_after, fees_est=_fees
+                        )
+                        _pos.ordinary_targets = clip_targets_by_ml(
+                            _pos, bank=alloc_bank_after, fees_est=_fees,
+                            targets=_pos.ordinary_targets, tick=tick, safety_ticks=CONFIG.DCA_MIN_GAP_TICKS
                         )
                         _pos.ordinary_offset = 0
                         if len(_pos.ordinary_targets) >= 3:
@@ -2470,7 +2482,11 @@ async def scanner_main_loop(
                 cum_notional = cum_margin * pos.leverage
                 fees_paid_est = cum_notional * CONFIG.FEE_TAKER * CONFIG.LIQ_FEE_BUFFER
                 pos.ordinary_targets = auto_strat_targets_with_ml_buffer(pos, rng_strat, entry=entry_px,
-                                                                       tick=tick, bank=bank, fees_est=fees_paid_est)
+                                                                       tick=tick, bank=alloc_bank, fees_est=fees_paid_est)
+                pos.ordinary_targets = clip_targets_by_ml(
+                    pos, bank=alloc_bank, fees_est=fees_paid_est,
+                    targets=pos.ordinary_targets, tick=tick
+                )
                 pos.ordinary_offset = 0
                 # пометим резервный #3
                 if len(pos.ordinary_targets) >= 3:
