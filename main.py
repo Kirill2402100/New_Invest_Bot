@@ -91,8 +91,8 @@ HELP_TEXT = (
     "• <code>/strat set P1 [P2 P3] [SYMBOL]</code> — задать 1–3 цены STRAT\n"
     "• <code>/strat reset [SYMBOL]</code> — вернуть авто-план STRAT\n"
     "• <code>/diag [SYMBOL]</code> — диагностика (снапшот FUND_BOT)\n"
-    "• <code>/openlong [SYMBOL]</code> — ручной старт через хедж в LONG\n"
-    "• <code>/openshort [SYMBOL]</code> — ручной старт через хедж в SHORT\n"
+    "• <code>/openlong [SYMBOL]</code> — немедленный ручной старт через хедж в LONG\n"
+    "• <code>/openshort [SYMBOL]</code> — немедленный ручной старт через хедж в SHORT\n"
     "• <code>/hedge_flip LONG|SHORT [SYMBOL]</code> — перевернуть bias активного хеджа\n"
 )
 
@@ -439,12 +439,24 @@ async def _set_manual_open(update: Update, context: ContextTypes.DEFAULT_TYPE, s
     chat_id = _chat_id(update)
     args = context.args or []
     sym = _norm_symbol(args[0]) if args else (context.chat_data.get("current_symbol") or CONFIG.SYMBOL)
+    if not is_scanner_running(context.application, sym, chat_id):
+        return await update.message.reply_html(
+            f"Сканер для <b>{h(sym)}</b> не запущен. Сначала: <code>/run {h(sym)}</code>"
+        )
+
     ns = _ns_key(sym, chat_id)
     box = context.application.bot_data.setdefault(ns, {})
-    box["cmd_open_manual_dir"] = "LONG" if side == "LONG" else "SHORT"
+    # ключ с новым явным смыслом — немедленный старт через хедж
+    box["cmd_force_open_now_dir"] = "LONG" if side.upper() == "LONG" else "SHORT"
+    box["force_open_now_ts"] = time.time()
+    # на всякий случай снимаем ручной режим, чтобы цикл не стопорился
     box["user_manual_mode"] = False
+
     context.chat_data["current_symbol"] = sym
-    await update.message.reply_html(f"Готово. Ручной старт через хедж: <b>{side}</b> по <b>{h(sym)}</b>.")
+    await update.message.reply_html(
+        f"Ок. Запросил <b>немедленный</b> ручной старт через хедж: "
+        f"<b>{side.upper()}</b> по <b>{h(sym)}</b>."
+    )
 
 async def cmd_openlong(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return await _set_manual_open(update, context, "LONG")
