@@ -6,6 +6,7 @@ import os
 import re
 import time
 from typing import Optional
+from html import escape as h
 
 from telegram import (
     Update, BotCommand,
@@ -90,6 +91,9 @@ HELP_TEXT = (
     "• <code>/strat set P1 [P2 P3] [SYMBOL]</code> — задать 1–3 цены STRAT\n"
     "• <code>/strat reset [SYMBOL]</code> — вернуть авто-план STRAT\n"
     "• <code>/diag [SYMBOL]</code> — диагностика (снапшот FUND_BOT)\n"
+    "• <code>/openlong [SYMBOL]</code> — ручной старт через хедж в LONG\n"
+    "• <code>/openshort [SYMBOL]</code> — ручной старт через хедж в SHORT\n"
+    "• <code>/hedge_flip LONG|SHORT [SYMBOL]</code> — перевернуть bias активного хеджа\n"
 )
 
 # --- меню команд для Telegram ---
@@ -107,6 +111,9 @@ COMMANDS = [
     BotCommand("hedge_close", "Подтвердить закрытие прибыльной ноги хеджа"),
     BotCommand("strat", "STRAT: show | set | reset"),
     BotCommand("diag", "Диагностика FUND_BOT"),
+    BotCommand("openlong", "Ручной старт LONG через хедж"),
+    BotCommand("openshort", "Ручной старт SHORT через хедж"),
+    BotCommand("hedge_flip", "Перевернуть bias хеджа: LONG|SHORT"),
 ]
 
 async def _post_init(app: Application):
@@ -150,7 +157,7 @@ async def cmd_setbank(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # формы:
     # 1) /setbank 6000             -> для уже выбранной пары (в этом чате)
-    # 2) /setbank GBPUSD 6000      -> явная пара + сумма (можно до /run)
+    # 2) /setbank GBPUSD 6000     -> явная пара + сумма (можно до /run)
     if len(args) == 1:
         amt = _parse_amount(args[0])
         if amt is None or amt <= 0:
@@ -427,6 +434,37 @@ async def cmd_hedge_close_alias(update: Update, context: ContextTypes.DEFAULT_TY
     context.args = parts[1:] if len(parts) > 1 else []
     return await cmd_hedge_close(update, context)
 
+# --- новые команды для ручного хеджа ---
+async def _set_manual_open(update: Update, context: ContextTypes.DEFAULT_TYPE, side: str):
+    chat_id = _chat_id(update)
+    args = context.args or []
+    sym = _norm_symbol(args[0]) if args else (context.chat_data.get("current_symbol") or CONFIG.SYMBOL)
+    ns = _ns_key(sym, chat_id)
+    box = context.application.bot_data.setdefault(ns, {})
+    box["cmd_open_manual_dir"] = "LONG" if side == "LONG" else "SHORT"
+    box["user_manual_mode"] = False
+    context.chat_data["current_symbol"] = sym
+    await update.message.reply_html(f"Готово. Ручной старт через хедж: <b>{side}</b> по <b>{h(sym)}</b>.")
+
+async def cmd_openlong(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    return await _set_manual_open(update, context, "LONG")
+
+async def cmd_openshort(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    return await _set_manual_open(update, context, "SHORT")
+
+async def cmd_hedge_flip(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args or []
+    if not args or args[0].upper() not in ("LONG", "SHORT"):
+        return await update.message.reply_html("Формат: <code>/hedge_flip LONG|SHORT [SYMBOL]</code>")
+    side = args[0].upper()
+    sym = _norm_symbol(args[1]) if len(args) > 1 else (context.chat_data.get("current_symbol") or CONFIG.SYMBOL)
+    chat_id = _chat_id(update)
+    ns = _ns_key(sym, chat_id)
+    box = context.application.bot_data.setdefault(ns, {})
+    box["cmd_hedge_flip"] = side
+    context.chat_data["current_symbol"] = sym
+    await update.message.reply_html(f"Ок. Переворот bias хеджа на <b>{side}</b> по <b>{h(sym)}</b> запрошен.")
+
 async def cmd_unknown(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_html("Неизвестная команда. Вот список:\n\n" + HELP_TEXT)
 
@@ -452,6 +490,9 @@ def build_app() -> Application:
     application.add_handler(CommandHandler("fees",   cmd_fees))
     application.add_handler(CommandHandler("hedge_close", cmd_hedge_close))
     application.add_handler(CommandHandler("strat", cmd_strat))
+    application.add_handler(CommandHandler("openlong",  cmd_openlong))
+    application.add_handler(CommandHandler("openshort", cmd_openshort))
+    application.add_handler(CommandHandler("hedge_flip", cmd_hedge_flip))
     # кириллический алиас ловим как обычный текст:
     application.add_handler(MessageHandler(filters.Regex(r"^/хедж_закрытие(?:@[\w_]+)?(?:\s|$)"), cmd_hedge_close_alias))
     # обработчик неизвестных команд — в самом конце:
