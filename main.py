@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import logging
 import os
 import re
@@ -47,6 +46,10 @@ def _chat_id(update: Update) -> Optional[int]:
 def _ns_key(symbol: str, chat_id: Optional[int]) -> str:
     return f"{_norm_symbol(symbol)}|{chat_id or 'default'}"
 
+def _hs(s: str) -> str:
+    """Нормализованный и экранированный символ для безопасных HTML-ответов."""
+    return h(_norm_symbol(s))
+
 def _parse_amount(s: str) -> Optional[float]:
     if not s:
         return None
@@ -68,6 +71,9 @@ def _get_slot(app: Application, symbol: str, chat_id: Optional[int]) -> dict:
 # общий broadcast: здесь не используем «сырые» <>
 async def _broadcast(app: Application, text: str, target_chat_id: Optional[int] = None):
     cid = target_chat_id or None
+    if cid is None:
+        log.warning("Broadcast skipped: no chat_id")
+        return
     try:
         await app.bot.send_message(chat_id=cid, text=text, parse_mode="HTML")
     except Exception as e:
@@ -90,9 +96,10 @@ HELP_TEXT = (
     "• <code>/strat show [SYMBOL]</code> — показать текущий STRAT-план\n"
     "• <code>/strat set P1 [P2 P3] [SYMBOL]</code> — задать 1–3 цены STRAT\n"
     "• <code>/strat reset [SYMBOL]</code> — вернуть авто-план STRAT\n"
-    "• <code>/diag [SYMBOL]</code> — диагностика (снапшот FUND_BOT)\n"
-    "• <code>/openlong [SYMBOL]</code> — немедленный ручной старт через хедж в LONG\n"
-    "• <code>/openshort [SYMBOL]</code> — немедленный ручной старт через хедж в SHORT\n"
+    "• <code>/tac set PRICE [SYMBOL]</code> — задать ручной TAC между HC и STRAT#1\n"
+    "• <code>/tac reset [SYMBOL]</code> — вернуть авто-TAC\n"
+    "• <code>/openlong [PRICE] [SYMBOL]</code> — немедленный ручной старт через хедж в LONG\n"
+    "• <code>/openshort [PRICE] [SYMBOL]</code> — немедленный ручной старт через хедж в SHORT\n"
     "• <code>/hedge_flip LONG|SHORT [SYMBOL]</code> — перевернуть bias активного хеджа\n"
 )
 
@@ -110,7 +117,7 @@ COMMANDS = [
     BotCommand("fees", "Комиссии: maker taker [SYMBOL]"),
     BotCommand("hedge_close", "Подтвердить закрытие прибыльной ноги хеджа"),
     BotCommand("strat", "STRAT: show | set | reset"),
-    BotCommand("diag", "Диагностика FUND_BOT"),
+    BotCommand("tac", "TAC: set | reset"),
     BotCommand("openlong", "Ручной старт LONG через хедж"),
     BotCommand("openshort", "Ручной старт SHORT через хедж"),
     BotCommand("hedge_flip", "Перевернуть bias хеджа: LONG|SHORT"),
@@ -156,7 +163,7 @@ async def cmd_setbank(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args or []
 
     # формы:
-    # 1) /setbank 6000             -> для уже выбранной пары (в этом чате)
+    # 1) /setbank 6000           -> для уже выбранной пары (в этом чате)
     # 2) /setbank GBPUSD 6000     -> явная пара + сумма (можно до /run)
     if len(args) == 1:
         amt = _parse_amount(args[0])
@@ -175,8 +182,8 @@ async def cmd_setbank(update: Update, context: ContextTypes.DEFAULT_TYPE):
         slot["safety_bank_user_set"] = True
         slot["bank_set_ts"] = time.time()
         return await update.message.reply_html(
-            f"OK. Банк для <b>{_norm_symbol(sym)}</b> установлен: <b>{amt:.2f} USD</b>.\n"
-            f"Теперь можете запустить: <code>/run {_norm_symbol(sym)}</code>"
+            f"OK. Банк для <b>{_hs(sym)}</b> установлен: <b>{amt:.2f} USD</b>.\n"
+            f"Теперь можете запустить: <code>/run {_hs(sym)}</code>"
         )
 
     elif len(args) >= 2:
@@ -195,8 +202,8 @@ async def cmd_setbank(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.chat_data["current_symbol"] = sym
 
         return await update.message.reply_html(
-            f"OK. Банк для <b>{sym}</b> установлен: <b>{amt:.2f} USD</b>.\n"
-            f"Запуск: <code>/run {sym}</code>"
+            f"OK. Банк для <b>{_hs(sym)}</b> установлен: <b>{amt:.2f} USD</b>.\n"
+            f"Запуск: <code>/run {_hs(sym)}</code>"
         )
 
     else:
@@ -221,12 +228,12 @@ async def cmd_run(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ex = slot.get("safety_bank_usdt")
         hint = f" (сейчас задано по умолчанию: {ex:.2f} USD)" if ex else ""
         return await update.message.reply_html(
-            f"Сначала задайте банк для <b>{sym}</b>: "
-            f"<code>/setbank {sym} USD</code>{hint}"
+            f"Сначала задайте банк для <b>{_hs(sym)}</b>: "
+            f"<code>/setbank {_hs(sym)} USD</code>{hint}"
         )
 
     if is_scanner_running(context.application, sym, chat_id):
-        return await update.message.reply_html(f"Сканер для <b>{sym}</b> уже запущен.")
+        return await update.message.reply_html(f"Сканер для <b>{_hs(sym)}</b> уже запущен.")
 
     msg = await start_scanner_for_pair(
         context.application,
@@ -269,7 +276,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     has_rng = "✅" if snap.get("has_ranges") else "❌"
     # если сканер уже сформировал готовую строку — покажем её
     text = box.get("status_line") or (
-        f"<b>Статус ({_norm_symbol(sym)})</b>\n"
+        f"<b>Статус ({_hs(sym)})</b>\n"
         f"Сканер: <b>{state}</b>\n"
         f"Банк (факт/план): {bank_f if bank_f is not None else 'N/A'} / {bank_t if bank_t is not None else 'N/A'} USD\n"
         f"Диапазоны доступны: {has_rng}"
@@ -287,7 +294,7 @@ async def cmd_open(update: Update, context: ContextTypes.DEFAULT_TYPE):
     box = context.application.bot_data.setdefault(ns, {})
     box["user_manual_mode"] = False  # снять ручной режим после TP/SL/manual_close
     context.chat_data["current_symbol"] = sym
-    await update.message.reply_html(f"Готово. Взведён /open для <b>{sym}</b> (направление выберет сканер).")
+    await update.message.reply_html(f"Готово. Взведён /open для <b>{_hs(sym)}</b> (направление выберет сканер).")
 
 async def cmd_close(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Ручное закрытие текущей позиции."""
@@ -298,7 +305,7 @@ async def cmd_close(update: Update, context: ContextTypes.DEFAULT_TYPE):
     box = context.application.bot_data.setdefault(ns, {})
     box["force_close"] = True
     context.chat_data["current_symbol"] = sym
-    await update.message.reply_html(f"MANUAL_CLOSE запрошен для <b>{sym}</b>.")
+    await update.message.reply_html(f"MANUAL_CLOSE запрошен для <b>{_hs(sym)}</b>.")
 
 async def cmd_pause(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Включить ручной режим (входы не стартуют)."""
@@ -309,7 +316,7 @@ async def cmd_pause(update: Update, context: ContextTypes.DEFAULT_TYPE):
     box = context.application.bot_data.setdefault(ns, {})
     box["user_manual_mode"] = True
     context.chat_data["current_symbol"] = sym
-    await update.message.reply_html(f"⏸ Включён ручной режим по <b>{sym}</b>. Используйте <code>/open {sym}</code> для продолжения.")
+    await update.message.reply_html(f"⏸ Включён ручной режим по <b>{_hs(sym)}</b>. Используйте <code>/open {_hs(sym)}</code> для продолжения.")
 
 async def cmd_fees(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Установить комиссии: maker taker (в долях). /fees 0.0002 0.0005 [SYMBOL]"""
@@ -328,18 +335,63 @@ async def cmd_fees(update: Update, context: ContextTypes.DEFAULT_TYPE):
     box["fee_taker"] = taker
     context.chat_data["current_symbol"] = sym
     await update.message.reply_html(
-        f"⚙️ Комиссии для <b>{sym}</b> заданы: maker={maker:.6f}, taker={taker:.6f}"
+        f"⚙️ Комиссии для <b>{_hs(sym)}</b> заданы: maker={maker:.6f}, taker={taker:.6f}"
     )
 
-async def cmd_diag(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Разовая диагностика: снапшот таргетов FUND_BOT в канал."""
+async def cmd_tac(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """TAC: set PRICE [SYMBOL] | reset [SYMBOL]"""
     chat_id = _chat_id(update)
     args = context.args or []
-    sym = _norm_symbol(args[0]) if args else (context.chat_data.get("current_symbol") or CONFIG.SYMBOL)
+    if not args:
+        return await update.message.reply_html(
+            "Использование:\n"
+            "• <code>/tac set PRICE [SYMBOL]</code>\n"
+            "• <code>/tac reset [SYMBOL]</code>"
+        )
+
+    sub = args[0].lower()
+    tail = args[1:]
+
+    def _is_num(s: str) -> bool:
+        try:
+            float(str(s).replace(",", "."))
+            return True
+        except Exception:
+            return False
+
+    # SYMBOL — последний нечисловой аргумент (если есть)
+    sym = None
+    if tail and not all(_is_num(x) for x in tail):
+        for x in reversed(tail):
+            if not _is_num(x):
+                sym = _norm_symbol(x); break
+    if sym is None:
+        sym = context.chat_data.get("current_symbol") or CONFIG.SYMBOL
+
     ns = _ns_key(sym, chat_id)
     box = context.application.bot_data.setdefault(ns, {})
-    box["cmd_diag_targets"] = True
-    await update.message.reply_html("Диагностика: запросил снапшот таргетов FUND_BOT.")
+
+    if sub == "reset":
+        box["cmd_tac_reset"] = True
+        context.chat_data["current_symbol"] = sym
+        return await update.message.reply_html(f"Запросил сброс TAC до авто-плана по <b>{_hs(sym)}</b>.")
+
+    if sub == "set":
+        # первый числовой аргумент — цена
+        price = None
+        for x in tail:
+            if _is_num(x):
+                price = float(str(x).replace(",", "."))
+                break
+        if price is None:
+            return await update.message.reply_html("Укажите цену: <code>/tac set PRICE [SYMBOL]</code>")
+        box["cmd_tac_set"] = price
+        context.chat_data["current_symbol"] = sym
+        return await update.message.reply_html(
+            f"Запросил установку TAC по <b>{_hs(sym)}</b>: <code>{price:.6f}</code>"
+        )
+
+    return await update.message.reply_html("Неизвестная подкоманда. Используйте: <code>/tac set|reset</code>")
 
 async def cmd_strat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = _chat_id(update)
@@ -379,12 +431,12 @@ async def cmd_strat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if sub == "show":
         box["cmd_strat_show"] = True
         context.chat_data["current_symbol"] = sym
-        return await update.message.reply_html(f"Запросил STRAT-отчёт по <b>{sym}</b>.")
+        return await update.message.reply_html(f"Запросил STRAT-отчёт по <b>{_hs(sym)}</b>.")
 
     if sub == "reset":
         box["cmd_strat_reset"] = True
         context.chat_data["current_symbol"] = sym
-        return await update.message.reply_html(f"Запросил сброс STRAT до авто-плана по <b>{sym}</b>.")
+        return await update.message.reply_html(f"Запросил сброс STRAT до авто-плана по <b>{_hs(sym)}</b>.")
 
     if sub == "set":
         # соберём до трёх цен слева направо
@@ -400,7 +452,7 @@ async def cmd_strat(update: Update, context: ContextTypes.DEFAULT_TYPE):
         box["cmd_strat_set"] = prices[:3]
         context.chat_data["current_symbol"] = sym
         return await update.message.reply_html(
-            f"Запросил установку STRAT точек по <b>{sym}</b>: " +
+            f"Запросил установку STRAT точек по <b>{_hs(sym)}</b>: " +
             ", ".join(f"<code>{p:.6f}</code>" for p in prices[:3])
         )
 
@@ -422,10 +474,10 @@ async def cmd_hedge_close(update: Update, context: ContextTypes.DEFAULT_TYPE):
         px = float(str(price_raw).replace(",", "."))
         box["hedge_close_price"] = px
         context.chat_data["current_symbol"] = sym
-        await update.message.reply_html(f"✅ Принял цену закрытия хеджа по <b>{sym}</b>: <code>{px:.6f}</code>")
+        await update.message.reply_html(f"✅ Принял цену закрытия хеджа по <b>{_hs(sym)}</b>: <code>{px:.6f}</code>")
     except Exception:
         box["hedge_close_price"] = None
-        await update.message.reply_html(f"⚠️ Цена не распознана — сканер возьмёт рыночную. Пара: <b>{sym}</b>.")
+        await update.message.reply_html(f"⚠️ Цена не распознана — сканер возьмёт рыночную. Пара: <b>{_hs(sym)}</b>.")
 
 # --- кириллический алиас /хедж_закрытие (CommandHandler не принимает нелатиницу) ---
 async def cmd_hedge_close_alias(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -438,24 +490,39 @@ async def cmd_hedge_close_alias(update: Update, context: ContextTypes.DEFAULT_TY
 async def _set_manual_open(update: Update, context: ContextTypes.DEFAULT_TYPE, side: str):
     chat_id = _chat_id(update)
     args = context.args or []
-    sym = _norm_symbol(args[0]) if args else (context.chat_data.get("current_symbol") or CONFIG.SYMBOL)
+    # допускаем: /openlong [PRICE] [SYMBOL]
+    price = None
+    sym = None
+    if args:
+        # если первый аргумент — число, это PRICE
+        try:
+            price = float(str(args[0]).replace(",", "."))
+            if len(args) > 1:
+                sym = _norm_symbol(args[1])
+        except Exception:
+            sym = _norm_symbol(args[0])
+    if sym is None:
+        sym = context.chat_data.get("current_symbol") or CONFIG.SYMBOL
     if not is_scanner_running(context.application, sym, chat_id):
         return await update.message.reply_html(
-            f"Сканер для <b>{h(sym)}</b> не запущен. Сначала: <code>/run {h(sym)}</code>"
+            f"Сканер для <b>{_hs(sym)}</b> не запущен. Сначала: <code>/run {_hs(sym)}</code>"
         )
 
     ns = _ns_key(sym, chat_id)
     box = context.application.bot_data.setdefault(ns, {})
     # ключ с новым явным смыслом — немедленный старт через хедж
     box["cmd_force_open_now_dir"] = "LONG" if side.upper() == "LONG" else "SHORT"
+    if price is not None:
+        box["cmd_force_open_now_entry_px"] = float(price)
     box["force_open_now_ts"] = time.time()
     # на всякий случай снимаем ручной режим, чтобы цикл не стопорился
     box["user_manual_mode"] = False
 
     context.chat_data["current_symbol"] = sym
+    extra = f" @ <code>{price:.6f}</code>" if price is not None else ""
     await update.message.reply_html(
         f"Ок. Запросил <b>немедленный</b> ручной старт через хедж: "
-        f"<b>{side.upper()}</b> по <b>{h(sym)}</b>."
+        f"<b>{side.upper()}</b> по <b>{_hs(sym)}</b>{extra}."
     )
 
 async def cmd_openlong(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -475,7 +542,7 @@ async def cmd_hedge_flip(update: Update, context: ContextTypes.DEFAULT_TYPE):
     box = context.application.bot_data.setdefault(ns, {})
     box["cmd_hedge_flip"] = side
     context.chat_data["current_symbol"] = sym
-    await update.message.reply_html(f"Ок. Переворот bias хеджа на <b>{side}</b> по <b>{h(sym)}</b> запрошен.")
+    await update.message.reply_html(f"Ок. Переворот bias хеджа на <b>{side}</b> по <b>{_hs(sym)}</b> запрошен.")
 
 async def cmd_unknown(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_html("Неизвестная команда. Вот список:\n\n" + HELP_TEXT)
@@ -498,10 +565,10 @@ def build_app() -> Application:
     application.add_handler(CommandHandler("open",   cmd_open))
     application.add_handler(CommandHandler("pause",  cmd_pause))
     application.add_handler(CommandHandler("close",  cmd_close))
-    application.add_handler(CommandHandler("diag",   cmd_diag))
     application.add_handler(CommandHandler("fees",   cmd_fees))
     application.add_handler(CommandHandler("hedge_close", cmd_hedge_close))
     application.add_handler(CommandHandler("strat", cmd_strat))
+    application.add_handler(CommandHandler("tac",   cmd_tac))
     application.add_handler(CommandHandler("openlong",  cmd_openlong))
     application.add_handler(CommandHandler("openshort", cmd_openshort))
     application.add_handler(CommandHandler("hedge_flip", cmd_hedge_flip))
