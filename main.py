@@ -17,11 +17,35 @@ from telegram.ext import (
     MessageHandler, filters
 )
 
-# наш DCA-сканер
-from scanner_bmr_dca import (
-    start_scanner_for_pair, stop_scanner_for_pair, is_scanner_running,
-    _norm_symbol, CONFIG
-)
+# Робастный импорт API сканера: поддерживаем альтернативные имена.
+try:
+    from scanner_bmr_dca import (
+        start_scanner_for_pair, stop_scanner_for_pair, is_scanner_running,
+        _norm_symbol, CONFIG
+    )
+except ImportError as _e:
+    import scanner_bmr_dca as _sc
+    start_scanner_for_pair = getattr(_sc, "start_scanner_for_pair",
+                                     getattr(_sc, "start_pair_scanner", None))
+    stop_scanner_for_pair  = getattr(_sc, "stop_scanner_for_pair",
+                                     getattr(_sc, "stop_pair_scanner", None))
+    is_scanner_running     = getattr(_sc, "is_scanner_running",
+                                     getattr(_sc, "is_pair_scanner_running", None))
+    _norm_symbol           = getattr(
+        _sc, "_norm_symbol",
+        getattr(_sc, "norm_symbol",
+                lambda s: str(s or "").upper().replace(" ", "").replace("-", ""))
+    )
+    CONFIG = getattr(_sc, "CONFIG", type("CONFIG", (), {"SYMBOL": "BTCUSDT"}))
+    _missing = [n for n, v in {
+        "start_scanner_for_pair": start_scanner_for_pair,
+        "stop_scanner_for_pair":  stop_scanner_for_pair,
+        "is_scanner_running":     is_scanner_running,
+    }.items() if v is None]
+    if _missing:
+        raise ImportError(
+            "scanner_bmr_dca не экспортирует необходимые функции: " + ", ".join(_missing)
+        ) from _e
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
