@@ -220,6 +220,8 @@ class CONFIG:
     ML_BREAK_BUFFER_PCT2 = 2.0   # после 2-го STRAT (новое, для более ранней страховки)
     ### NEW: минимальный разрыв между HC, TAC и STRAT#1 — 0.35%
     MIN_SPACING_PCT = 0.0035    # 0.35%
+    # Требование к запасу после STRAT в «тиках»: не меньше шага между самими STRAT
+    ML_REQ_GAP_MODE = "strat_spacing"  # ["strat_spacing"]
 
     # Расширение коридора после пробоя
     EXT_AFTER_BREAK = {
@@ -486,6 +488,11 @@ def ml_percent_now(pos, price: float, bank: float, fees_est: float) -> float:
         return float('inf')
     return (equity_at_price(pos, price, bank, fees_est) / used) * 100.0
 
+def ml_reserve_pct_to_ml20(pos, price: float, bank: float, fees_est: float) -> float:
+    """Сколько процентов маржи остаётся до порога 20%: ML% - 20%."""
+    mlp = ml_percent_now(pos, price, bank, fees_est)
+    return float('inf') if (not np.isfinite(mlp)) else (mlp - CONFIG.ML_TARGET_PCT)
+
 def ml_price_at(pos, target_ml_pct: float, bank: float, fees_est: float) -> float:
     """
     Цена, при которой ML = target_ml_pct.
@@ -498,16 +505,10 @@ def ml_price_at(pos, target_ml_pct: float, bank: float, fees_est: float) -> floa
     L = max(1, int(getattr(pos, "leverage", 1) or 1))
     target_equity = (target_ml_pct / 100.0) * UM
     base = (target_equity - (bank - max(fees_est, 0.0))) / (UM * L)
-
-    if pos.side == "LONG":
-        # price/avg - 1 = base  ->  price = avg * (1 + base)
-        return pos.avg * (1.0 + base)
-    else:
-        # avg/price - 1 = base  ->  price = avg / (1 + base)
-        denom = 1.0 + base
-        if denom <= 0:
-            return float('nan')
-        return pos.avg / denom
+    denom = 1.0 + base
+    if denom <= 0:
+        return float('nan')
+    return pos.avg * denom if pos.side == "LONG" else pos.avg / denom
 
 def ml_distance_pct(side: str, px: float, ml_price: float) -> float:
     if px is None or ml_price is None or px <= 0 or np.isnan(ml_price):
@@ -622,7 +623,8 @@ def quantize_to_tick(x: float | None, tick: float) -> float | None:
     if x is None or (isinstance(x, float) and np.isnan(x)): return x
     return round(round(x / tick) * tick, 10)
 
-def _place_segment(start: float, end: float, count: int, tick: float, include_end_last: bool) -> list[float]:
+def _place_segment(start: float, end: float, count: int, tick: float,
+                   include_end_last: bool, side: str) -> list[float]:
     """Равномерно распределяем точки между start и end. Анти-слипание: >= DCA_MIN_GAP_TICKS."""
     if count <= 0:
         return []
@@ -632,23 +634,22 @@ def _place_segment(start: float, end: float, count: int, tick: float, include_en
         return []
 
     if include_end_last and count >= 1:
-        # фракции: 1/n, 2/n, ..., 1.0  (нет 0.0)
         fracs = [(i + 1) / count for i in range(count)]
     else:
-        # по-прежнему исключаем оба конца
         fracs = [(i + 1) / (count + 1) for i in range(count)]
-        
+
     raw = [start + path * f for f in fracs]
-    # Квантование и анти-слипание
     out: list[float] = []
-    for x in raw:
+    lo, hi = (min(start, end), max(start, end))
+    for i, x in enumerate(raw):
         q = quantize_to_tick(x, tick)
-        if q is None:
-            continue
-        # гарантируем отступ минимум в min_gap от точки start
-        if abs(q - start) < min_gap:
-            continue
-        if not out or (abs(q - out[-1]) >= min_gap):
+        # кламп в коридор
+        q = min(max(q, lo), hi)
+        if i == 0:
+            # первый — отступить от 'a' минимум на min_gap, но оставаться в коридоре
+            q = (start - min_gap) if side == "LONG" else (start + min_gap)
+            q = min(max(quantize_to_tick(q, tick), lo), hi)
+        if (not out) or (side == "LONG" and q <= out[-1] - min_gap) or (side == "SHORT" and q >= out[-1] + min_gap):
             out.append(q)
     return out
 
@@ -665,13 +666,13 @@ def compute_corridor_targets(entry: float, side: str, rng_strat: dict, rng_tac: 
     if side == "LONG":
         tac_b    = min(entry, rng_tac["lower"])
         strat_b = min(entry, rng_strat["lower"])
-        seg1 = _place_segment(entry, tac_b,   DESIRED_TAC,   tick, include_end_last=False)  # TAC
-        seg2 = _place_segment(tac_b,  strat_b, DESIRED_STRAT, tick, include_end_last=True)   # STRAT
+        seg1 = _place_segment(entry, tac_b,   DESIRED_TAC,   tick, include_end_last=False, side=side)
+        seg2 = _place_segment(tac_b,  strat_b, DESIRED_STRAT, tick, include_end_last=True,  side=side)
     else:
         tac_b    = max(entry, rng_tac["upper"])
         strat_b = max(entry, rng_strat["upper"])
-        seg1 = _place_segment(entry, tac_b,   DESIRED_TAC,   tick, include_end_last=False)
-        seg2 = _place_segment(tac_b,  strat_b, DESIRED_STRAT, tick, include_end_last=True)
+        seg1 = _place_segment(entry, tac_b,   DESIRED_TAC,   tick, include_end_last=False, side=side)
+        seg2 = _place_segment(tac_b,  strat_b, DESIRED_STRAT, tick, include_end_last=True,  side=side)
 
     # Если TAC-точек не хватает, «одалживаем» их с начала STRAT,
     # но ВСЕГДА сохраняем последний STRAT (100%) в конце.
@@ -712,10 +713,10 @@ def compute_strategic_targets_only(entry: float, side: str, rng_strat: dict, tic
         return []
     if side == "LONG":
         strat_b = min(entry, rng_strat["lower"])
-        seg = _place_segment(entry, strat_b, levels, tick, include_end_last=True)
+        seg = _place_segment(entry, strat_b, levels, tick, include_end_last=True, side=side)
     else:
         strat_b = max(entry, rng_strat["upper"])
-        seg = _place_segment(entry, strat_b, levels, tick, include_end_last=True)
+        seg = _place_segment(entry, strat_b, levels, tick, include_end_last=True, side=side)
     labs = [f"STRAT {int(round((i + 1) / max(len(seg),1) * 100))}%" for i in range(len(seg))]
     out = [{"price": p, "label": lab} for p, lab in zip(seg, labs)]
     return merge_targets_sorted(side, tick, entry, out)
@@ -828,7 +829,7 @@ async def plan_extension_after_break(symbol: str, pos: "Position",
         start = px
 
     # Равномерно раскидываем оставшиеся уровни, последний — у "нового потолка/пола"
-    seg = _place_segment(start, end, remaining, tick, include_end_last=True)
+    seg = _place_segment(start, end, remaining, tick, include_end_last=True, side=pos.side)
     if not seg:
         return pos.ordinary_targets
 
@@ -845,9 +846,13 @@ async def plan_extension_after_break(symbol: str, pos: "Position",
 # ---------------------------------------------------------------------------
 async def build_range_from_df(df: Optional[pd.DataFrame], min_atr_mult: float):
     if df is None or df.empty: return None
-    cols = list(df.columns)[-5:]
-    df = df[cols].copy()
-    df.columns = ["open","high","low","close","volume"]
+    want = ["open","high","low","close","volume"]
+    cols_named = [c for c in want if c in df.columns]
+    if len(cols_named) == 5:
+        df = df[cols_named].copy()
+    else:
+        df = df.iloc[:, -5:].copy()
+        df.columns = want
     ema = _ema(df["close"], length=50)
     atr = ta_atr(df["high"], df["low"], df["close"], length=14)
     lower = float(np.quantile(df["close"].dropna(), CONFIG.Q_LOWER))
@@ -879,8 +884,10 @@ def compute_indicators_5m(df: pd.DataFrame) -> dict:
     rsi   = ta_rsi(df["close"], length=CONFIG.RSI_LEN).iloc[-1]
     adx   = ta_adx(df["high"], df["low"], df["close"], length=CONFIG.ADX_LEN).iloc[-1]
     ema20 = _ema(df["close"], length=20).iloc[-1]
-    vol_z = (df["volume"].iloc[-1] - df["volume"].rolling(CONFIG.VOL_WIN).mean().iloc[-1]) / \
-            max(df["volume"].rolling(CONFIG.VOL_WIN).std().iloc[-1], 1e-9)
+    vol = df["volume"]
+    rm = vol.rolling(CONFIG.VOL_WIN, min_periods=1).mean().iloc[-1]
+    rs = vol.rolling(CONFIG.VOL_WIN, min_periods=2).std().iloc[-1]
+    vol_z = (vol.iloc[-1] - rm) / max(rs, 1e-9)
     st = ta_supertrend(df["high"], df["low"], df["close"], length=10, multiplier=3.0)
     dir_now  = int(st["direction"].iloc[-1])
     dir_prev = int(st["direction"].iloc[-2]) if len(st) > 1 else dir_now
@@ -939,6 +946,39 @@ def _ml_after_k(pos: "Position", bank: float, fees_est: float, targets: list[flo
     t.steps_filled = 1; t.step_margins = [used]; t.reserve_used = False; t.reserve_margin_usdt = 0.0
     return ml_price_at(t, CONFIG.ML_TARGET_PCT, bank, fees_est)
 
+# --- helpers для требований по запасу ---
+def _extract_strat_prices(targets: list[dict]) -> list[float]:
+    """Возвращает цены STRAT-таргетов (без TAC) в порядке ухудшения."""
+    out = []
+    for t in targets:
+        lab = str(t.get("label","")).upper()
+        if lab.startswith("STRAT"):
+            out.append(float(t["price"]))
+    return out
+
+def _gap_ticks_to_ml_after_k(pos: "Position", bank: float, fees_est: float,
+                              strat_prices: list[float], k: int, tick: float) -> float:
+    """
+    Запас (в тиках) от цены k-го STRAT до ML(20%) после исполнения k шагов.
+    """
+    if k <= 0 or k > len(strat_prices): 
+        return float('nan')
+    mlk = _ml_after_k(pos, bank, fees_est, strat_prices[:k], k)
+    if np.isnan(mlk): 
+        return float('nan')
+    p_k = strat_prices[k-1]
+    dpx = (p_k - mlk) if pos.side=="LONG" else (mlk - p_k)
+    return abs(dpx / max(tick, 1e-12))
+
+def _strat_spacings_in_ticks(side: str, strat_prices: list[float], tick: float) -> list[float]:
+    """
+    Расстояния между соседними STRAT в тиках (|p_i - p_{i+1}|/tick).
+    """
+    gaps = []
+    for i in range(len(strat_prices)-1):
+        gaps.append(abs((strat_prices[i] - strat_prices[i+1]) / max(tick, 1e-12)))
+    return gaps
+
 def _ml_buffer_after_3(pos: "Position", bank: float, fees_est: float,
                        rng_strat: dict, t1: float, t2: float, t3: float) -> float:
     """
@@ -951,18 +991,20 @@ def _ml_buffer_after_3(pos: "Position", bank: float, fees_est: float,
 
 def _linspace_exclusive(a: float, b: float, n: int, include_end: bool, tick: float, side: str) -> list[float]:
     if n <= 0: return []
-    if include_end: fr = [(i+1)/n for i in range(n)]
-    else:           fr = [(i+1)/(n+1) for i in range(n)]
+    fr = [(i+1)/n for i in range(n)] if include_end else [(i+1)/(n+1) for i in range(n)]
     raw = [a + (b - a)*f for f in fr]
     out = []
     min_gap = tick * CONFIG.DCA_MIN_GAP_TICKS
-    for x in raw:
+    lo, hi = (min(a,b), max(a,b))
+    for i, x in enumerate(raw):
         q = quantize_to_tick(x, tick)
-        if not out:
-            # первый всегда должен отходить от a минимум на min_gap
-            if abs(q - a) < min_gap: 
-                q = a - min_gap if side=="LONG" else a + min_gap
-        if not out or (side=="LONG" and q <= out[-1]-min_gap) or (side=="SHORT" and q >= out[-1]+min_gap):
+        # кламп в коридор
+        q = min(max(q, lo), hi)
+        if i == 0:
+            # первый — отступить от 'a' минимум на min_gap, но оставаться в коридоре
+            q = (a - min_gap) if side == "LONG" else (a + min_gap)
+            q = min(max(quantize_to_tick(q, tick), lo), hi)
+        if (not out) or (side == "LONG" and q <= out[-1] - min_gap) or (side == "SHORT" and q >= out[-1] + min_gap):
             out.append(q)
     return out
 
@@ -1027,8 +1069,9 @@ def _strat_report_text(pos: "Position", px: float, tick: float, bank: float,
     ML сейчас и после +1/+2/+3, буфер после #3.
     """
     lines = [hdr]
-    # Ближайшие 3 цели c дистанциями
-    tgts = pos.ordinary_targets[getattr(pos, "ordinary_offset", 0):getattr(pos, "ordinary_offset", 0)+3]
+    # Ближайшие 3 цели c дистанциями (для отображения)
+    base_off = getattr(pos, "ordinary_offset", 0)
+    tgts = pos.ordinary_targets[base_off:base_off+3]
     if getattr(pos, "hedge_close_px", None) is not None:
         dt = abs((pos.hedge_close_px - px) / max(tick,1e-12))
         dp = abs((pos.hedge_close_px/max(px,1e-12)-1.0)*100.0)
@@ -1048,9 +1091,12 @@ def _strat_report_text(pos: "Position", px: float, tick: float, bank: float,
     dist_txt = "N/A" if np.isnan(dist_now) else f"{dist_now:.2f}%"
     lines.append(f"ML(20%): {arrow}<code>{fmt(ml_now)}</code> ({dist_txt} от текущей)")
     lines.append(f"ML после +1: {_fmt_ml(scen.get(1))} | +2: {_fmt_ml(scen.get(2))} | +3: {_fmt_ml(scen.get(3))}")
-    # Буфер к ML после #3 и пробоя
-    if len(tgts) >= 3:
-        buf = _ml_buffer_after_3(pos, bank, fees_est, rng_strat, tgts[0]["price"], tgts[1]["price"], tgts[2]["price"])
+    # Буфер к ML после #3 и пробоя — СТРОГО по STRAT#1/#2/#3
+    strat_only = [t for t in pos.ordinary_targets[base_off:] 
+                  if str(t.get("label","")).upper().startswith("STRAT")][:3]
+    if len(strat_only) == 3:
+        buf = _ml_buffer_after_3(pos, bank, fees_est, rng_strat,
+                                 strat_only[0]["price"], strat_only[1]["price"], strat_only[2]["price"])
         st = "OK" if (pd.notna(buf) and buf >= CONFIG.ML_BREAK_BUFFER_PCT) else "FAIL"
         brk_up, brk_dn = break_levels(rng_strat)
         brk = brk_dn if pos.side=="LONG" else brk_up
@@ -1061,6 +1107,19 @@ class FSM(IntEnum):
     IDLE = 0   # нет позиции
     OPENED = 1 # открыт 1-й шаг, идёт первичное оповещение
     MANAGING = 2 # можно ADD/RETEST/TRAIL/EXIT
+
+# --- FIX 2: единая синхронизация reserve3 после любых перестроений ---
+
+def _sync_reserve3_flags(pos: "Position"):
+    """После изменения ordinary_targets привести в соответствие reserve3_*."""
+    pos.reserve3_price = None
+    pos.reserve3_armed = False
+    pos.reserve3_ready = False
+    pos.reserve3_done  = False
+    for t in pos.ordinary_targets:
+        if t.get("reserve3"):
+            pos.reserve3_price = float(t["price"])
+            break
 
 # ---------------------------------------------------------------------------
 # Состояние позиции
@@ -1317,13 +1376,10 @@ def _plan_with_leg(symbol: str, leg_margin: float, remain_side: str, entry_px: f
     pos.ordinary_targets = build_targets_with_tactical(
         pos, rng_strat, close_px, tick, bank, fees_est
     )
-    pos.ordinary_targets = clip_targets_by_ml(pos, bank=bank, fees_est=fees_est,
-                                              targets=pos.ordinary_targets, tick=tick)
+    # вместо обрезания целей — сначала пробуем вписаться сайзингом
+    # (обрезка останется как страховка уже после финальной подгонки)
     pos.ordinary_offset = 0
-    for t in pos.ordinary_targets:
-        if t.get("reserve3"):
-            pos.reserve3_price = t["price"]
-            break
+    _sync_reserve3_flags(pos)
     return pos, pos.ordinary_targets, fees_est
 
 def fit_leg_margin_for_three_strats(symbol: str, leg_margin_init: float, remain_side: str,
@@ -1337,28 +1393,46 @@ def fit_leg_margin_for_three_strats(symbol: str, leg_margin_init: float, remain_
     s_min = 0.25
     lo, hi = s_min, 1.0
 
+    def _ok(pos, targets, fees) -> bool:
+        s = _extract_strat_prices(targets)
+        if len(s) < 3:
+            return False
+        # требуемые «мин. запасы» в тиках — по дистанциям между STRAT
+        req = _strat_spacings_in_ticks(pos.side, s, tick)  # [|S1-S2|, |S2-S3|]
+        # фактический запас после 2-го и 3-го STRAT
+        g2 = _gap_ticks_to_ml_after_k(pos, bank, fees, s, 2, tick)
+        g3 = _gap_ticks_to_ml_after_k(pos, bank, fees, s, 3, tick)
+        req1 = req[0]                 # S1-S2 всегда есть при len(s)>=3
+        req2 = req[1] if len(req) > 1 else req1
+        ok2 = (not np.isnan(g2)) and (g2 + 1e-9 >= req1)
+        ok3 = (not np.isnan(g3)) and (g3 + 1e-9 >= req2)
+        return ok2 and ok3
+
     p0, tg0, f0 = _plan_with_leg(symbol, leg_margin_init, remain_side, entry_px, close_px,
                                  bank, rng_strat, tick, growth)
-    if _count_strats(tg0) >= 3:
+    if _count_strats(tg0) >= 3 and _ok(p0, tg0, f0):
         return leg_margin_init, p0, tg0, f0
 
     best = None
-    for _ in range(20):
+    for _ in range(28):
         mid = (lo + hi) / 2.0
         leg = leg_margin_init * mid
         pos, targets, fees = _plan_with_leg(symbol, leg, remain_side, entry_px, close_px,
                                             bank, rng_strat, tick, growth)
-        if _count_strats(targets) >= 3:
+        if (_count_strats(targets) >= 3) and _ok(pos, targets, fees):
             best = (leg, pos, targets, fees)
             hi = mid
         else:
             lo = mid
     if best is not None:
         return best
-    # fallback: что получилось ближе к hi
-    pos, targets, fees = _plan_with_leg(symbol, leg_margin_init * hi, remain_side, entry_px, close_px,
+    # fallback: возьмём более осторожный (уменьшенный) leg и после — ML-клиппинг
+    leg = leg_margin_init * hi
+    pos, targets, fees = _plan_with_leg(symbol, leg, remain_side, entry_px, close_px,
                                         bank, rng_strat, tick, growth)
-    return leg_margin_init * hi, pos, targets, fees
+    pos.ordinary_targets = clip_targets_by_ml(pos, bank=bank, fees_est=fees,
+                                              targets=targets, tick=tick)
+    return leg, pos, pos.ordinary_targets, fees
 
 def clip_targets_by_ml(pos: "Position", bank: float, fees_est: float,
                        targets: list[dict], tick: float, safety_ticks: int = 2) -> list[dict]:
@@ -1680,6 +1754,7 @@ async def scanner_main_loop(
                     _ml_arrow  = "↓" if remain_side == "LONG" else "↑"
                     _dist_now  = ml_distance_pct(_pos.side, px, _ml_now)  # расстояние — от текущей цены рынка
                     _ml_after_line = _ml_after_labels_line(_pos, alloc_bank_after, _fees_est)
+                    _ml_reserve = ml_reserve_pct_to_ml20(_pos, px, alloc_bank_after, _fees_est)
                     _nxt = _pos.ordinary_targets[0] if _pos.ordinary_targets else None
                     _nxt_txt = "N/A" if _nxt is None else f"{fmt(_nxt['price'])} ({_nxt['label']})"
                     _nxt_margin = _pos.step_margins[1] if len(_pos.step_margins) > 1 else None
@@ -1698,6 +1773,7 @@ async def scanner_main_loop(
                         f"⚙️ Превью после закрытия хеджа (останется <b>{remain_side}</b>):\n"
                         f"Средняя: <code>{fmt(_pos.avg)}</code> (P/L 0) | TP: <code>{fmt(_pos.tp_price)}</code>\n"
                         f"ML(20%): {_ml_arrow}<code>{fmt(_ml_now)}</code> ({'N/A' if np.isnan(_dist_now) else f'{_dist_now:.2f}%'} от текущей)\n"
+                        f"Запас маржи до ML20%: <b>{('∞' if not np.isfinite(_ml_reserve) else f'{_ml_reserve:.1f}%')}</b>\n"
                         f"{_ml_after_line}\n"
                         f"{_levels_block}\n"
                         f"Сигнал на ЗАКРЫТИЕ хеджа придёт при касании целевой цены HC по 1m-хвосту."
@@ -1844,7 +1920,8 @@ async def scanner_main_loop(
                         for i,x in enumerate(q):
                             if i==0:
                                 # первый — не ближе min_gap к entry
-                                base = pos.avg if pos.steps_filled<=1 else pos.ordinary_targets[getattr(pos,"ordinary_offset",0)]["price"]
+                                base_off = min(getattr(pos,"ordinary_offset",0), max(0, len(pos.ordinary_targets)-1))
+                                base = pos.avg if pos.steps_filled <= 1 or not pos.ordinary_targets else pos.ordinary_targets[base_off]["price"]
                                 if pos.side=="LONG" and x > base - min_gap: x = base - min_gap
                                 if pos.side=="SHORT" and x < base + min_gap: x = base + min_gap
                             else:
@@ -1860,11 +1937,12 @@ async def scanner_main_loop(
                         labels = ["STRAT 33%","STRAT 66%","STRAT 100%"]
                         for i, j in enumerate(idxs):
                             pos.ordinary_targets[j] = {"price": q_fixed[i], "label": labels[i]}
-                        # пересоберём резерв3-метку
+                        # заново помечаем третий как резерв
                         for t in pos.ordinary_targets:
                             t.pop("reserve3", None)
                         if len(idxs) >= 3:
                             pos.ordinary_targets[idxs[2]]["reserve3"] = True
+                        _sync_reserve3_flags(pos)
                         cum_margin = _pos_total_margin(pos)
                         fees_est = (cum_margin * pos.leverage) * CONFIG.FEE_TAKER * CONFIG.LIQ_FEE_BUFFER
                         await say(_strat_report_text(pos, px, tick, bank, fees_est, rng_strat, hdr="✏️ STRAT обновлён вручную (TAC сохранён)"))
@@ -1881,6 +1959,7 @@ async def scanner_main_loop(
                     pos.manual_tac_price = None
                     pos.ordinary_targets = build_targets_with_tactical(pos, rng_strat, close_px, tick, bank, fees_est)
                     pos.ordinary_offset = min(getattr(pos,"ordinary_offset",0), len(pos.ordinary_targets))
+                    _sync_reserve3_flags(pos)
                     await say(_strat_report_text(pos, px, tick, bank, fees_est, rng_strat, hdr="♻️ STRAT сброшен к авто-плану"))
                     # Sheets логирование удалено
             # -------- /STRAT commands end --------
@@ -1906,6 +1985,7 @@ async def scanner_main_loop(
                         base_close = pos.hedge_close_px or pos.avg
                         pos.ordinary_targets = build_targets_with_tactical(pos, rng_strat, base_close, tick, bank, fees_est)
                         pos.ordinary_offset = min(getattr(pos,"ordinary_offset",0), len(pos.ordinary_targets))
+                        _sync_reserve3_flags(pos)
                         await say(f"✏️ TAC обновлён вручную → <code>{fmt(tac_q)}</code>")
             if b.pop("cmd_tac_reset", False):
                 if not pos or not pos.from_hedge or b.get("fsm_state") != int(FSM.MANAGING):
@@ -1917,6 +1997,7 @@ async def scanner_main_loop(
                     base_close = pos.hedge_close_px or pos.avg
                     pos.ordinary_targets = build_targets_with_tactical(pos, rng_strat, base_close, tick, bank, fees_est)
                     pos.ordinary_offset = min(getattr(pos,"ordinary_offset",0), len(pos.ordinary_targets))
+                    _sync_reserve3_flags(pos)
                     await say("♻️ TAC сброшен к авто-плану")
 
             # Диагностика целей FUND_BOT — удалена
@@ -2098,8 +2179,9 @@ async def scanner_main_loop(
                     _ml_arrow  = "↓" if remain_side == "LONG" else "↑"
                     _dist_now  = ml_distance_pct(_pos.side, px, _ml_now)
                     _dist_now_txt = "N/A" if np.isnan(_dist_now) else f"{_dist_now:.2f}%"
-                    _levels_block = render_remaining_levels_block(symbol, _pos, alloc_bank_after, CONFIG.FEE_TAKER, tick)
                     _ml_after_line = _ml_after_labels_line(_pos, alloc_bank_after, _fees_est)
+                    _ml_reserve = ml_reserve_pct_to_ml20(_pos, px, alloc_bank_after, _fees_est)
+                    _levels_block = render_remaining_levels_block(symbol, _pos, alloc_bank_after, CONFIG.FEE_TAKER, tick)
                     def _fmt_ml(v): return "N/A" if (v is None or np.isnan(v)) else fmt(v)
                     _planned_now = len([t for t in _pos.ordinary_targets[getattr(_pos,"ordinary_offset",0):]
                                         if str(t.get("label","")).startswith("STRAT")])
@@ -2112,6 +2194,7 @@ async def scanner_main_loop(
                         f"⚙️ Превью после закрытия хеджа (останется <b>{remain_side}</b>):\n"
                         f"Средняя: <code>{fmt(_pos.avg)}</code> (P/L 0) | TP: <code>{fmt(_pos.tp_price)}</code>\n"
                         f"ML(20%): {_ml_arrow}<code>{fmt(_ml_now)}</code> ({_dist_now_txt} от текущей)\n"
+                        f"Запас маржи до ML20%: <b>{('∞' if not np.isfinite(_ml_reserve) else f'{_ml_reserve:.1f}%')}</b>\n"
                         f"{_ml_after_line}\n"
                         f"{_levels_block}\n"
                         f"(Осталось: {_planned_now} из 3)\n"
@@ -2149,7 +2232,10 @@ async def scanner_main_loop(
                         tac_lo = rng_tac["lower"] + 0.30 * rng_tac["width"]
                         tac_hi = rng_tac["lower"] + 0.70 * rng_tac["width"]
                         entry_px0 = float(b["hedge"]["entry_px"])
-                        planned_hc_px = planned_hc_price(entry_px0, tac_lo, tac_hi, new_bias, CONFIG.HEDGE_MODE, tick)
+                        planned_hc_px = quantize_to_tick(
+                            planned_hc_price(entry_px0, tac_lo, tac_hi, new_bias, CONFIG.HEDGE_MODE, tick),
+                            tick
+                        )
                         b["hedge"]["hc_px"] = planned_hc_px
 
                         # 3) Превью позиции после закрытия хеджа уже строим в сторону desired_remain
@@ -2245,14 +2331,11 @@ async def scanner_main_loop(
                 pos.ordinary_targets = clip_targets_by_ml(pos, bank=alloc_bank, fees_est=fees_paid_est,
                                                           targets=pos.ordinary_targets, tick=tick)
                 pos.ordinary_offset = 0
-                # пометим резервный STRAT#3
-                for t in pos.ordinary_targets:
-                    if t.get("reserve3"):
-                        pos.reserve3_price = t["price"]
-                        break
+                _sync_reserve3_flags(pos)
 
                 # --- СООБЩЕНИЕ ПОСЛЕ ЗАКРЫТИЯ ХЕДЖА ---
                 ml_now = ml_price_at(pos, CONFIG.ML_TARGET_PCT, bank, fees_paid_est)
+                ml_reserve = ml_reserve_pct_to_ml20(pos, px, bank, fees_paid_est)
                 dist_now = ml_distance_pct(pos.side, px, ml_now)
                 ml_arrow = "↓" if pos.side == "LONG" else "↑"
                 dist_now_txt = "N/A" if np.isnan(dist_now) else f"{dist_now:.2f}%"
@@ -2270,6 +2353,7 @@ async def scanner_main_loop(
                     f"Цена входа хеджа: <code>{fmt(entry_px)}</code> | Закрытие второй ноги: <code>{fmt(close_px)}</code>\n"
                     f"Средняя: <code>{fmt(pos.avg)}</code> (P/L 0) | TP: <code>{fmt(pos.tp_price)}</code>\n"
                     f"ML(20%): {ml_arrow}<code>{fmt(ml_now)}</code> ({dist_now_txt} от текущей)\n"
+                    f"Запас маржи до ML20%: <b>{('∞' if not np.isfinite(ml_reserve) else f'{ml_reserve:.1f}%')}</b>\n"
                     f"{_ml_after_labels_line(pos, bank, fees_paid_est)}\n"
                     f"{levels_block}\n"
                     f"(Осталось: {planned_now} из 3)"
@@ -2360,6 +2444,7 @@ async def scanner_main_loop(
                         fees_paid_est = cum_notional * fee_taker * CONFIG.LIQ_FEE_BUFFER
 
                         ml_price = ml_price_at(pos, CONFIG.ML_TARGET_PCT, bank, fees_paid_est)
+                        ml_reserve = ml_reserve_pct_to_ml20(pos, px, bank, fees_paid_est)
                         dist_ml_pct = ml_distance_pct(pos.side, px, ml_price)
                         dist_txt = "N/A" if np.isnan(dist_ml_pct) else f"{dist_ml_pct:.2f}%"
                         # запас хода до ML в тиках
@@ -2397,6 +2482,7 @@ async def scanner_main_loop(
                             f"Средняя: <code>{fmt(pos.avg)}</code> (P/L 0) | TP: <code>{fmt(pos.tp_price)}</code>",
                             margin_line(pos, bank, px, fees_paid_est),
                             f"ML(20%): {ml_arrow}<code>{fmt(ml_price)}</code> ({dist_txt} от текущей, {dist_ml_ticks_txt})",
+                            f"Запас маржи до ML20%: <b>{('∞' if not np.isfinite(ml_reserve) else f'{ml_reserve:.1f}%')}</b>",
                         ]
                         ml_after = _ml_after_labels_line(pos, bank, fees_paid_est)
                         if ml_after:
@@ -2455,8 +2541,6 @@ async def scanner_main_loop(
 # ---------------------------------------------------------------------------
 # Public scanner controls (exports for main.py)
 # ---------------------------------------------------------------------------
-
-import asyncio
 
 def _ns_key(symbol: str, chat_id: int | None) -> str:
     return f"{_norm_symbol(symbol)}|{chat_id or 'default'}"
