@@ -215,8 +215,9 @@ class CONFIG:
 
     # Показываем ML-цену при целевом Margin Level
     ML_TARGET_PCT = 20.0    # "ML цена (20%)"
-    # Минимальный запас к ML(20%) после третьего STRAT-усреднения и пробоя STRAT
-    ML_BREAK_BUFFER_PCT = 3.0
+    # Минимальный запас к ML(20%) после STRAT и пробоя STRAT
+    ML_BREAK_BUFFER_PCT  = 3.0   # после 3-го STRAT
+    ML_BREAK_BUFFER_PCT2 = 2.0   # после 2-го STRAT (новое, для более ранней страховки)
     ### NEW: минимальный разрыв между HC, TAC и STRAT#1 — 0.35%
     MIN_SPACING_PCT = 0.0035    # 0.35%
 
@@ -250,9 +251,12 @@ class CONFIG:
         "TIMEOUT_SEC": 20,     # таймаут пробы, сек
     }
 
-    # План STRAT после закрытия хеджа:
-    # 1 шаг уже занят «оставшейся ногой» хеджа + 3 будущих STRAT-усреднения
-    STRAT_LEVELS_AFTER_HEDGE = 4
+    # План после закрытия хеджа:
+    # 1 шаг уже занят «оставшейся ногой» + (TAC + STRAT#1..#3) = 4 оставшихся шага
+    STRAT_LEVELS_AFTER_HEDGE = 5
+
+    # Более плавная лестница ДЛЯ периода «после хеджа»
+    GROWTH_AFTER_HEDGE = 1.6
 
 # ENV-переопределения
 CONFIG.SYMBOL   = os.getenv("FX_SYMBOL", CONFIG.SYMBOL)
@@ -978,9 +982,15 @@ def auto_strat_targets_with_ml_buffer(pos: "Position", rng_strat: dict, entry: f
     if len(p) < 3:
         return [{"price": x, "label": lab} for x,lab in zip(p, ["STRAT 33%","STRAT 66%","STRAT 100%"][:len(p)])]
     p1, p2, p3 = p
-    buf = _ml_buffer_after_3(pos, bank, fees_est, rng_strat, p1, p2, p3)
-    # если буфер уже ок — возвращаем
-    if pd.notna(buf) and buf >= CONFIG.ML_BREAK_BUFFER_PCT:
+    # Оценим буферы после 2-х и 3-х шагов
+    buf3 = _ml_buffer_after_3(pos, bank, fees_est, rng_strat, p1, p2, p3)
+    buf2 = ml_distance_pct(pos.side,
+                           _break_price_for_side(rng_strat, pos.side),
+                           _ml_after_k(pos, bank, fees_est, [p1, p2], 2))
+    thr3 = CONFIG.ML_BREAK_BUFFER_PCT
+    thr2 = CONFIG.ML_BREAK_BUFFER_PCT2
+    # если оба буфера уже ок — возвращаем
+    if (pd.notna(buf3) and buf3 >= thr3) and (pd.notna(buf2) and buf2 >= thr2):
         labs = ["STRAT 33%","STRAT 66%","STRAT 100%"]
         return [{"price": p1, "label": labs[0]}, {"price": p2, "label": labs[1]}, {"price": p3, "label": labs[2]}]
     # иначе — углубляем p3 ступенчато до выполнения условия или до стопа
@@ -998,8 +1008,11 @@ def auto_strat_targets_with_ml_buffer(pos: "Position", rng_strat: dict, entry: f
             moved += step
             continue
         p1, p2, p3 = mid
-        buf = _ml_buffer_after_3(pos, bank, fees_est, rng_strat, p1, p2, p3)
-        if pd.notna(buf) and buf >= CONFIG.ML_BREAK_BUFFER_PCT:
+        buf3 = _ml_buffer_after_3(pos, bank, fees_est, rng_strat, p1, p2, p3)
+        buf2 = ml_distance_pct(pos.side,
+                               _break_price_for_side(rng_strat, pos.side),
+                               _ml_after_k(pos, bank, fees_est, [p1, p2], 2))
+        if (pd.notna(buf3) and buf3 >= thr3) and (pd.notna(buf2) and buf2 >= thr2):
             break
         moved += step
     labs = ["STRAT 33%","STRAT 66%","STRAT 100% (RESERVE)"]
@@ -1639,7 +1652,7 @@ async def scanner_main_loop(
                         margin_3 *= scale
                     # --- сайзер ноги хеджа: гарантируем TAC + STRAT #1/#2/#3 после закрытия
                     remain_side = manual_dir
-                    growth_after = choose_growth(ind, rng_strat, rng_tac)
+                    growth_after = CONFIG.GROWTH_AFTER_HEDGE
                     alloc_bank_after = _alloc_bank(bank, weight)
                     leg_sized, _pos, _targets, _fees_est = fit_leg_margin_for_three_strats(
                         symbol, margin_3, remain_side, entry_px, planned_hc_px,
@@ -2054,7 +2067,8 @@ async def scanner_main_loop(
 
                     # --- Превью после закрытия хеджа: остаётся противоположная нога ---
                     remain_side = "SHORT" if bias_side == "LONG" else "LONG"
-                    growth_after = choose_growth(ind, rng_strat, rng_tac)
+                    # после хеджа льем более плавную лестницу
+                    growth_after = CONFIG.GROWTH_AFTER_HEDGE
                     alloc_bank_after = _alloc_bank(bank, weight)
                     # Подберём маржу первой ноги так, чтобы поместились 3 STRAT
                     leg_sized, _pos, _targets, _fees_est = fit_leg_margin_for_three_strats(
@@ -2142,7 +2156,7 @@ async def scanner_main_loop(
                         remain_side = desired_remain
                         leg_margin  = float(b["hedge"]["leg_margin"])
                         alloc_bank_after = _alloc_bank(bank, weight)
-                        growth_after = choose_growth(ind, rng_strat, rng_tac)
+                        growth_after = CONFIG.GROWTH_AFTER_HEDGE
 
                         # Превью без изменения маржи (факт уже в рынке)
                         _pos, _, _fees = _plan_with_leg(symbol, leg_margin, remain_side, entry_px0,
@@ -2209,9 +2223,9 @@ async def scanner_main_loop(
                                leverage=CONFIG.LEVERAGE, owner_key=b["owner_key"])
                 # план STRAT: только стратегические уровни
                 ord_levels = CONFIG.STRAT_LEVELS_AFTER_HEDGE
-                growth = choose_growth(ind, rng_strat, rng_tac)
                 alloc_bank = _alloc_bank(bank, weight)
-                pos.plan_with_reserve(alloc_bank, growth, ord_levels)
+                # после хеджа — фиксированный более плавный рост
+                pos.plan_with_reserve(alloc_bank, CONFIG.GROWTH_AFTER_HEDGE, ord_levels)
                 # первый шаг = объём оставшейся ноги хеджа
                 pos.step_margins[0] = leg_margin
                 pos.alloc_bank_planned = alloc_bank
