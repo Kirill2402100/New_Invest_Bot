@@ -260,6 +260,24 @@ class CONFIG:
     # Лестница после хеджа под твой пример распределений
     GROWTH_AFTER_HEDGE = 1.40
 
+    # === LEG-anchored хвост после хеджа (TAC + STRAT1..3) ===
+    # mode="relative_vector" — точное масштабирование от оставленной ноги
+    #   (коэффы подобраны под твой эталон: 600$ → 207/299/414/575),
+    # mode="geom" — геометрическая прогрессия от first_rel_to_leg с ростом growth.
+    AFTER_HEDGE_TAIL = {
+        "levels": 4,                    # TAC + STRAT1 + STRAT2 + STRAT3
+        "mode": "relative_vector",      # "relative_vector" | "geom"
+        "coeffs_rel_to_leg": [          # для mode="relative_vector"
+            0.345,        # 600 * 0.345 = 207
+            0.4983333333, # 600 * 0.498333... ≈ 299
+            0.690,        # 600 * 0.690 = 414
+            0.9583333333  # 600 * 0.95833... ≈ 575
+        ],
+        "first_rel_to_leg": 0.345,      # для mode="geom": первый добор = 34.5% от ноги
+        "growth": 1.40,                 # для mode="geom"
+        "round_usd": 1.0                # округление каждого добора до 1$
+    }
+
     # --- equalization / sizing for STRAT#3 & ML20% gap ---
     EQUALIZE_TOL_TICKS = 2      # допуск равенства разрывов в тиках
     LEG_MIN_FRACTION   = 0.30  # нижняя доля от исходного margin_3 при сжатии ноги
@@ -1487,6 +1505,8 @@ def _plan_with_leg(symbol: str, leg_margin: float, remain_side: str, entry_px: f
     pos.step_margins[0] = float(leg_margin)
     _ = pos.add_step(entry_px)
     pos.rebalance_tail_margins_excluding_reserve(bank)
+    # << LEG-anchored: хвост (TAC + STRAT1..3) привязываем к ноге
+    _shape_tail_from_leg(pos, bank)
     pos.from_hedge = True
     pos.hedge_entry_px = entry_px
     pos.hedge_close_px = close_px
@@ -1560,6 +1580,72 @@ def _fit_leg_with_equalization(
                 a = mid
         return best[1], best[2], best[3], best[4]
     return leg_margin_init, *_plan_with_leg(symbol, leg_margin_init, remain_side, entry_px, close_px, bank, rng_strat, tick, growth)
+
+# ---------------------------------------------------------------------------
+# LEG-anchored tail shaping (после хеджа)
+# ---------------------------------------------------------------------------
+def _shape_tail_from_leg(pos: "Position", bank: float):
+    """
+    Формирует хвост (TAC + STRAT1..3) от размера оставленной ноги.
+    Поддерживает два режима:
+      - relative_vector: явные коэффициенты от ноги (масштабируются линейно);
+      - geom: геом. прогрессия от first_rel_to_leg с ростом growth.
+    Учитывает бюджет (<= 70% банка) и раскладывает остаток в резерв.
+    Корректно работает при steps_filled >= 1 (первая нога уже есть).
+    """
+    cfg = getattr(CONFIG, "AFTER_HEDGE_TAIL", None)
+    if not cfg:
+        return
+
+    total_target = bank * CONFIG.CUM_DEPOSIT_FRAC_AT_FULL
+
+    used_ord_count = max(0, pos.steps_filled - (1 if getattr(pos, "reserve_used", False) else 0))
+    if not pos.step_margins or used_ord_count <= 0:
+        return
+
+    leg = float(pos.step_margins[0])  # маржа «оставленной ноги» уже на месте
+    levels = int(cfg.get("levels", 4))
+    mode   = str(cfg.get("mode", "relative_vector")).lower()
+    rnd    = float(cfg.get("round_usd", 1.0))
+
+    # сырые (желательные) доборы без учёта бюджета
+    tail_raw: list[float]
+    if mode == "geom":
+        k1 = float(cfg.get("first_rel_to_leg", 0.345))
+        g  = float(cfg.get("growth", CONFIG.GROWTH_AFTER_HEDGE))
+        a0 = max(0.0, leg * k1)
+        tail_raw = [a0 * (g ** i) for i in range(max(0, levels))]
+    else:
+        coeffs = list(cfg.get("coeffs_rel_to_leg", [0.345, 0.4983333333, 0.690, 0.9583333333]))
+        tail_raw = [max(0.0, leg * c) for c in coeffs[:max(0, levels)]]
+
+    # бюджет на обычные доборы (без резервной и уже использованных шагов)
+    used_ord_sum = sum(pos.step_margins[:used_ord_count])
+    max_tail_budget = max(0.0, total_target - used_ord_sum)
+
+    # если не помещаемся — масштабируем равномерно
+    raw_sum = sum(tail_raw)
+    if raw_sum > max_tail_budget and raw_sum > 0:
+        s = max_tail_budget / raw_sum
+        tail = [t * s for t in tail_raw]
+    else:
+        tail = tail_raw
+
+    # округление сумм доборов до долларов (если нужно)
+    if rnd > 0:
+        tail = [round(t / rnd) * rnd for t in tail]
+
+    # применяем: оставляем уже исполненные шаги нетронутыми
+    remaining_levels = max(0, pos.ord_levels - used_ord_count)
+    tail = tail[:remaining_levels]
+    pos.step_margins = (pos.step_margins[:used_ord_count] or []) + tail
+
+    # перерасчёт резерва
+    used_now = sum(pos.step_margins[:pos.ord_levels])
+    pos.reserve_margin_usdt = max(0.0, total_target - used_now)
+    pos.reserve_available = pos.reserve_margin_usdt > 0
+    pos.max_steps = pos.ord_levels + (1 if (pos.reserve_available and not pos.reserve_used) else 0)
+
 
 def clip_targets_by_ml(pos: "Position", bank: float, fees_est: float,
                        targets: list[dict], tick: float, safety_ticks: int = 2) -> list[dict]:
@@ -2406,6 +2492,8 @@ async def scanner_main_loop(
                 _ = pos.add_step(entry_px)
                 # чтобы суммарное потребление ≤ 70% банка:
                 pos.rebalance_tail_margins_excluding_reserve(alloc_bank)
+                # << LEG-anchored: сформировать хвост от размера оставленной ноги
+                _shape_tail_from_leg(pos, alloc_bank)
                 pos.from_hedge = True
                 pos.hedge_entry_px = entry_px
                 # STRAT-цели с ML-буфером строим ОТ ЦЕНЫ ЗАКРЫТИЯ ХЕДЖА (важно!) и добавляем TAC:
@@ -2508,6 +2596,8 @@ async def scanner_main_loop(
                             fill_px = float(nxt["price"]) if nxt is not None else float(px)
                             margin, _ = pos.add_step(fill_px)
                             pos.rebalance_tail_margins_excluding_reserve(alloc_bank)
+                            # << LEG-anchored: пересобрать хвост после фактического ADD/OPEN
+                            _shape_tail_from_leg(pos, alloc_bank)
                             # пометим уровень как «израсходованный»
                             pos.last_filled_q = quantize_to_tick(nxt["price"], tick) if nxt else None
                             _advance_pointer(pos, tick)
