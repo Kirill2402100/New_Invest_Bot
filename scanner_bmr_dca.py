@@ -27,7 +27,7 @@ log = logging.getLogger("bmr_dca_engine")
 logging.getLogger("fx_feed").setLevel(logging.WARNING)
 
 # Регистр для задач сканеров в рамках Telegram-приложения
-TASKS_KEY = "scan_tasks"    # app.bot_data[TASKS_KEY] -> dict[ns_key] = asyncio.Task
+TASKS_KEY = "scan_tasks" # app.bot_data[TASKS_KEY] -> dict[ns_key] = asyncio.Task
 
 # --- Status snapshot helper (для /status)
 def _update_status_snapshot(box: dict, *, symbol: str, bank_fact: float, bank_target: float,
@@ -136,7 +136,7 @@ class CONFIG:
     # Таймфреймы
     TF_ENTRY = "5m"
     TF_RANGE = "1h"
-    TF_TRIGGER = "1m"          # новый: поток для триггеров по хвостам
+    TF_TRIGGER = "1m"         # новый: поток для триггеров по хвостам
 
     # Сколько истории собирать под диапазоны
     STRATEGIC_LOOKBACK_DAYS = 60    # для TF_RANGE
@@ -168,7 +168,7 @@ class CONFIG:
     DCA_GROWTH = 2.0
     CUM_DEPOSIT_FRAC_AT_FULL = 0.70
     ADD_COOLDOWN_SEC = 25
-    WICK_HYST_TICKS = 1        # гистерезис для 1m-триггеров (±тик)
+    WICK_HYST_TICKS = 1         # гистерезис для 1m-триггеров (±тик)
 
     # Тейк/Трейл
     TP_PCT = 0.010
@@ -216,10 +216,13 @@ class CONFIG:
     # Показываем ML-цену при целевом Margin Level
     ML_TARGET_PCT = 20.0    # "ML цена (20%)"
     # Минимальный запас к ML(20%) после STRAT и пробоя STRAT
-    ML_BREAK_BUFFER_PCT  = 3.0   # после 3-го STRAT
-    ML_BREAK_BUFFER_PCT2 = 2.0   # после 2-го STRAT (новое, для более ранней страховки)
+    ML_BREAK_BUFFER_PCT  = 3.0    # после 3-го STRAT
+    ML_BREAK_BUFFER_PCT2 = 2.0    # после 2-го STRAT (новое, для более ранней страховки)
+    # Минимальный ML% на цене последнего стратегического добора (после его исполнения).
+    # Т.е. после STRAT#3 при цене = STRAT#3 уровень маржи должен быть >= этого порога.
+    ML_MIN_AFTER_LAST_PCT = 200.0
     ### NEW: минимальный разрыв между HC, TAC и STRAT#1 — 0.35%
-    MIN_SPACING_PCT = 0.0035     # 0.35%
+    MIN_SPACING_PCT = 0.0035      # 0.35%
     # Требование к запасу после STRAT в «тиках»: не меньше шага между самими STRAT
     ML_REQ_GAP_MODE = "strat_spacing"  # ["strat_spacing"]
 
@@ -249,8 +252,8 @@ class CONFIG:
     # проверяем пробой несколькими замерами
     BREAK_PROBE = {
         "SAMPLES": 3,      # число подтверждений
-        "INTERVAL_SEC": 5,     # интервал между замерами, сек
-        "TIMEOUT_SEC": 20,     # таймаут пробы, сек
+        "INTERVAL_SEC": 5,       # интервал между замерами, сек
+        "TIMEOUT_SEC": 20,       # таймаут пробы, сек
     }
 
     # План после закрытия хеджа:
@@ -283,7 +286,7 @@ class CONFIG:
     LEG_MIN_FRACTION   = 0.30  # нижняя доля от исходного margin_3 при сжатии ноги
 
 # ENV-переопределения
-CONFIG.SYMBOL    = os.getenv("FX_SYMBOL", CONFIG.SYMBOL)
+CONFIG.SYMBOL     = os.getenv("FX_SYMBOL", CONFIG.SYMBOL)
 CONFIG.TF_ENTRY = os.getenv("TF_ENTRY", CONFIG.TF_ENTRY)
 CONFIG.TF_RANGE = os.getenv("TF_RANGE", os.getenv("TF_TREND", CONFIG.TF_RANGE))
 
@@ -434,9 +437,9 @@ def render_hedge_preview_block(symbol: str, pos: "Position", bank: float,
                                 hc_price: float, lots_leg: float, leg_usd: float) -> str:
     """
     Формат ровно как в примере:
-      'Закрытие хеджа ... Средняя ... Свободная маржа: ..., Уровень маржи: ..., ML 20%: ...'
-      Затем по каждому уровню: цена, добор ($/лоты), всего лотов, новая средняя,
-      ML20% после шага, Свободная маржа и Уровень маржи — всё ПОСЛЕ шага на цене шага.
+        'Закрытие хеджа ... Средняя ... Свободная маржа: ..., Уровень маржи: ..., ML 20%: ...'
+        Затем по каждому уровню: цена, добор ($/лоты), всего лотов, новая средняя,
+        ML20% после шага, Свободная маржа и Уровень маржи — всё ПОСЛЕ шага на цене шага.
     """
     L = max(1, int(getattr(pos, "leverage", 1) or 1))
     used0 = _pos_total_margin(pos)
@@ -903,7 +906,7 @@ async def plan_extension_after_break(symbol: str, pos: "Position",
         ]
         end = max([v for v in candidates if np.isfinite(v)])
         start = px
-    else:                                                        # LONG: пробой вниз, строим ПОДАЛЬШЕ вниз
+    else:                                                         # LONG: пробой вниз, строим ПОДАЛЬШЕ вниз
         candidates = [
             px - atr_guard,
             rng_strat["lower"],
@@ -1030,6 +1033,21 @@ def _ml_after_k(pos: "Position", bank: float, fees_est: float, targets: list[flo
     t.steps_filled = 1; t.step_margins = [used]; t.reserve_used = False; t.reserve_margin_usdt = 0.0
     return ml_price_at(t, CONFIG.ML_TARGET_PCT, bank, fees_est)
 
+def _ml_pct_after_k_at_p_k(pos: "Position", bank: float, fees_est: float,
+                            targets: list[float], k: int) -> float:
+    """
+    ML% после применения k будущих шагов, измеренный прямо на цене k-го шага.
+    Используется как «жёсткий» порог для последнего STRAT.
+    """
+    avg, qty, used = _simulate_after_k(pos, targets, k)
+    class _Tmp: pass
+    t = _Tmp()
+    t.side = pos.side; t.avg = avg; t.qty = qty; t.leverage = pos.leverage
+    t.steps_filled = 1; t.step_margins = [used]; t.reserve_used = False; t.reserve_margin_usdt = 0.0
+    p_k = float(targets[k-1])
+    eq = equity_at_price(t, p_k, bank, fees_est)
+    return (eq / used) * 100.0 if used > 0 else float("inf")
+
 # --- helpers для требований по запасу ---
 def _extract_strat_prices(targets: list[dict]) -> list[float]:
     """Возвращает цены STRAT-таргетов (без TAC) в порядке ухудшения."""
@@ -1121,8 +1139,8 @@ def auto_strat_targets_with_ml_buffer(pos: "Position", rng_strat: dict, entry: f
     """
     Новый алгоритм STRAT: строим от HC (=entry) равными шагами g: p1=HC±g, p2=HC±2g, p3=HC±3g
     в сторону ухудшения. Увеличиваем g, пока одновременно:
-      • |p1−HC| ≥ (0.35% от HC + 0.35% от p1) и не ближе min tick gap;
-      • ML-буферы выполняются: после #2 ≥ ML_BREAK_BUFFER_PCT2, после #3 ≥ ML_BREAK_BUFFER_PCT.
+        • |p1−HC| ≥ (0.35% от HC + 0.35% от p1) и не ближе min tick gap;
+        • ML-буферы выполняются: после #2 ≥ ML_BREAK_BUFFER_PCT2, после #3 ≥ ML_BREAK_BUFFER_PCT.
     Это гарантирует коридор под TAC между HC и STRAT#1 и исключает слипание HC/TAC/STRAT1.
     """
     side = pos.side
@@ -1244,7 +1262,7 @@ def _strat_report_text(pos: "Position", px: float, tick: float, bank: float,
     return "\n".join(lines)
 
 class FSM(IntEnum):
-    IDLE = 0   # нет позиции
+    IDLE = 0  # нет позиции
     OPENED = 1 # открыт 1-й шаг, идёт первичное оповещение
     MANAGING = 2 # можно ADD/RETEST/TRAIL/EXIT
 
@@ -1542,21 +1560,27 @@ def _fit_leg_with_equalization(
     lo = max(CONFIG.LEG_MIN_FRACTION, 0.25)
     hi = 1.0
     best = None
+    thr_pct = float(getattr(CONFIG, "ML_MIN_AFTER_LAST_PCT", 0.0) or 0.0)
+    PENALTY_W = 10.0  # вес штрафа за недобор ML при выборе «лучшего» варианта
     # грубая сетка масштабов
     for s in [1.00, 0.90, 0.80, 0.70, 0.60, 0.50, max(0.45, lo), lo]:
         leg = leg_margin_init * s
         pos, tgts, fees = _plan_with_leg(symbol, leg, remain_side, entry_px, close_px, bank, rng_strat, tick, growth)
         tgts2, ok = _equalize_p3_to_gap_and_ml(pos, bank, fees, tick)
-        if _count_strats(tgts2) >= 3 and ok:
-            return leg, pos, tgts2, fees
         strat = _extract_first_three_strats(tgts2)
+        ml_last = _ml_pct_after_k_at_p_k(pos, bank, fees, strat, 3) if len(strat) == 3 else float("inf")
+        ok_ml = (thr_pct <= 0.0) or (ml_last >= thr_pct)
+        if _count_strats(tgts2) >= 3 and ok and ok_ml:
+            return leg, pos, tgts2, fees
         if len(strat) == 3:
             p1,p2,p3 = strat
             gap12 = _ticks_between(p1,p2,tick)
             ml3 = _ml_after_k(pos, bank, fees, [p1,p2,p3], 3)
             gap23 = _ticks_between(p2,p3,tick)
             gapML = _ticks_between(p3, ml3, tick) if not np.isnan(ml3) else float("inf")
-            err = abs(gap23-gap12) + abs(gapML-gap12)
+            # штрафуем решения, где ML% на последнем шаге ниже порога
+            penalty = max(0.0, thr_pct - ml_last) * PENALTY_W
+            err = abs(gap23-gap12) + abs(gapML-gap12) + penalty
             if best is None or err < best[0]:
                 best = (err, leg, pos, tgts2, fees)
     if best is not None:
@@ -1566,9 +1590,11 @@ def _fit_leg_with_equalization(
             mid = (a + b) / 2.0
             pos, tgts, fees = _plan_with_leg(symbol, mid, remain_side, entry_px, close_px, bank, rng_strat, tick, growth)
             tgts2, ok = _equalize_p3_to_gap_and_ml(pos, bank, fees, tick)
-            if _count_strats(tgts2) >= 3 and ok:
-                return mid, pos, tgts2, fees
             strat = _extract_first_three_strats(tgts2)
+            ml_last = _ml_pct_after_k_at_p_k(pos, bank, fees, strat, 3) if len(strat) == 3 else float("inf")
+            ok_ml = (thr_pct <= 0.0) or (ml_last >= thr_pct)
+            if _count_strats(tgts2) >= 3 and ok and ok_ml:
+                return mid, pos, tgts2, fees
             if len(strat) < 3:
                 a = mid; continue
             p1,p2,p3 = strat
@@ -1577,7 +1603,8 @@ def _fit_leg_with_equalization(
                 a = mid; continue
             gap12 = _ticks_between(p1,p2,tick)
             gapML = _ticks_between(p3, ml3, tick)
-            if gapML < gap12:
+            # приоритет — набрать ML% на последнем шаге, затем — равнение
+            if thr_pct > 0.0 and (not ok_ml):
                 b = mid
             else:
                 a = mid
@@ -1591,8 +1618,8 @@ def _shape_tail_from_leg(pos: "Position", bank: float):
     """
     Формирует хвост (TAC + STRAT1..3) от размера оставленной ноги.
     Поддерживает два режима:
-      - relative_vector: явные коэффициенты от ноги (масштабируются линейно);
-      - geom: геом. прогрессия от first_rel_to_leg с ростом growth.
+        - relative_vector: явные коэффициенты от ноги (масштабируются линейно);
+        - geom: геом. прогрессия от first_rel_to_leg с ростом growth.
     Учитывает бюджет (<= 70% банка) и раскладывает остаток в резерв.
     Корректно работает при steps_filled >= 1 (первая нога уже есть).
     """
@@ -2640,7 +2667,7 @@ async def scanner_main_loop(
                         # ML после будущих стратегических шагов
                         used_ord_now = pos.steps_filled - (1 if pos.reserve_used else 0)
                         base_off   = getattr(pos, "ordinary_offset", 0)
-                        avail_ord  = max(0, len(pos.step_margins)        - used_ord_now)
+                        avail_ord  = max(0, len(pos.step_margins)       - used_ord_now)
                         avail_tgts = max(0, len(pos.ordinary_targets) - base_off)
                         avail_k    = min(3, avail_ord, avail_tgts)
                         k_list     = tuple(range(1, avail_k + 1)) if avail_k > 0 else ()
