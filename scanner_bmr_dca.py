@@ -1119,56 +1119,59 @@ def _linspace_exclusive(a: float, b: float, n: int, include_end: bool, tick: flo
 def auto_strat_targets_with_ml_buffer(pos: "Position", rng_strat: dict, entry: float, tick: float,
                                       bank: float, fees_est: float) -> list[dict]:
     """
-    Строит 3 STRAT-цели от entry в сторону «ухудшения» так, чтобы запас
-    к ML(20%) от цены пробоя STRAT после 3-й ступени был >= CONFIG.ML_BREAK_BUFFER_PCT.
-    Алгоритм: якорим #3 у STRAT(100%), проверяем буфер; если < порога — углубляем #3,
-    #1/#2 — равномерно между entry и новым #3. Соблюдаем квантование и gap.
+    Новый алгоритм STRAT: строим от HC (=entry) равными шагами g: p1=HC±g, p2=HC±2g, p3=HC±3g
+    в сторону ухудшения. Увеличиваем g, пока одновременно:
+      • |p1−HC| ≥ (0.35% от HC + 0.35% от p1) и не ближе min tick gap;
+      • ML-буферы выполняются: после #2 ≥ ML_BREAK_BUFFER_PCT2, после #3 ≥ ML_BREAK_BUFFER_PCT.
+    Это гарантирует коридор под TAC между HC и STRAT#1 и исключает слипание HC/TAC/STRAT1.
     """
     side = pos.side
-    # базовая конечная точка — STRAT 100%
-    end = rng_strat["lower"] if side=="LONG" else rng_strat["upper"]
-    # стартовая равномерная раскладка
-    p = _linspace_exclusive(entry, end, 3, include_end=True, tick=tick, side=side)
-    if len(p) < 3:
-        return [{"price": x, "label": lab} for x,lab in zip(p, ["STRAT 33%","STRAT 66%","STRAT 100%"][:len(p)])]
-    p1, p2, p3 = p
-    # Оценим буферы после 2-х и 3-х шагов
-    buf3 = _ml_buffer_after_3(pos, bank, fees_est, rng_strat, p1, p2, p3)
-    buf2 = ml_distance_pct(pos.side,
-                               _break_price_for_side(rng_strat, pos.side),
-                               _ml_after_k(pos, bank, fees_est, [p1, p2], 2))
+    hc = float(entry)  # база = цена закрытия хеджа
+    atr = float(rng_strat.get("atr1h", 0.0)) or 0.0
+    # шаг наращивания g
+    g_step = max(tick * max(2, CONFIG.DCA_MIN_GAP_TICKS), atr * 0.01)
+    # стартовое g: ≥0.35% от HC + минимальный тик-буфер
+    g = max(g_step, hc * CONFIG.MIN_SPACING_PCT + tick * max(2, CONFIG.DCA_MIN_GAP_TICKS))
+
+    def _triplet(gv: float) -> tuple[float, float, float]:
+        if side == "LONG":
+            return (quantize_to_tick(hc - gv, tick),
+                    quantize_to_tick(hc - 2 * gv, tick),
+                    quantize_to_tick(hc - 3 * gv, tick))
+        else:
+            return (quantize_to_tick(hc + gv, tick),
+                    quantize_to_tick(hc + 2 * gv, tick),
+                    quantize_to_tick(hc + 3 * gv, tick))
+
     thr3 = CONFIG.ML_BREAK_BUFFER_PCT
     thr2 = CONFIG.ML_BREAK_BUFFER_PCT2
-    # если оба буфера уже ок — возвращаем
-    if (pd.notna(buf3) and buf3 >= thr3) and (pd.notna(buf2) and buf2 >= thr2):
-        labs = ["STRAT 33%","STRAT 66%","STRAT 100%"]
-        return [{"price": p1, "label": labs[0]}, {"price": p2, "label": labs[1]}, {"price": p3, "label": labs[2]}]
-    # иначе — углубляем p3 ступенчато до выполнения условия или до стопа
-    atr = float(rng_strat.get("atr1h", 0.0)) or max(abs(end-entry), 1e-6)*0.02
-    step = max(tick*max(4, CONFIG.DCA_MIN_GAP_TICKS), atr*0.05)  # ~5% ATR шаг
-    max_depth = atr * 4.0  # не уходим слишком далеко: до ~4 ATR
+    max_depth = max(atr * 4.0, g_step * 60)  # ограничитель «углубления»
     moved = 0.0
+
     while moved <= max_depth:
-        # двигаем p3 глубже в сторону «минуса»
-        p3 = (p3 - step) if side=="LONG" else (p3 + step)
-        p3 = quantize_to_tick(p3, tick)
-        # пересобираем p1,p2 равномерно между entry и p3 (end не нужен)
-        mid = _linspace_exclusive(entry, p3, 3, include_end=True, tick=tick, side=side)
-        if len(mid) < 3:
-            moved += step
-            continue
-        p1, p2, p3 = mid
+        p1, p2, p3 = _triplet(g)
+
+        # Требуемый просвет под TAC: 0.35% к HC и 0.35% к STRAT#1 + минимум в тиках
+        min_total = (max(tick * CONFIG.DCA_MIN_GAP_TICKS, hc   * CONFIG.MIN_SPACING_PCT) +
+                       max(tick * CONFIG.DCA_MIN_GAP_TICKS, p1   * CONFIG.MIN_SPACING_PCT))
+        ok_corridor = (abs(p1 - hc) >= min_total)
+
+        # ML-буферы после #2 и #3
         buf3 = _ml_buffer_after_3(pos, bank, fees_est, rng_strat, p1, p2, p3)
-        buf2 = ml_distance_pct(pos.side,
-                                     _break_price_for_side(rng_strat, pos.side),
-                                     _ml_after_k(pos, bank, fees_est, [p1, p2], 2))
-        if (pd.notna(buf3) and buf3 >= thr3) and (pd.notna(buf2) and buf2 >= thr2):
+        buf2 = ml_distance_pct(side, _break_price_for_side(rng_strat, side),
+                               _ml_after_k(pos, bank, fees_est, [p1, p2], 2))
+        ok_ml = (pd.notna(buf3) and buf3 >= thr3) and (pd.notna(buf2) and buf2 >= thr2)
+
+        if ok_corridor and ok_ml:
             break
-        moved += step
-    labs = ["STRAT 33%","STRAT 66%","STRAT 100% (RESERVE)"]
-    return [{"price": p1, "label": labs[0]},
-            {"price": p2, "label": labs[1]},
-            {"price": p3, "label": labs[2], "reserve3": True}]
+
+        g += g_step
+        moved += g_step
+
+    labels = ["STRAT 33%", "STRAT 66%", "STRAT 100% (RESERVE)"]
+    return [{"price": p1, "label": labels[0]},
+            {"price": p2, "label": labels[1]},
+            {"price": p3, "label": labels[2], "reserve3": True}]
 
 # === равнение #3: |#2−#3| ≈ |#1−#2| и |ML20%(после #3)−#3| ≈ |#1−#2| ===
 def _equalize_p3_to_gap_and_ml(pos: "Position", bank: float, fees_est: float, tick: float) -> tuple[list[dict], bool]:
