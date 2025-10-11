@@ -260,6 +260,10 @@ class CONFIG:
     # Более плавная лестница ДЛЯ периода «после хеджа»
     GROWTH_AFTER_HEDGE = 1.6
 
+    # --- equalization / sizing for STRAT#3 & ML20% gap ---
+    EQUALIZE_TOL_TICKS = 2     # допуск равенства разрывов в тиках
+    LEG_MIN_FRACTION   = 0.30  # нижняя доля от исходного margin_3 при сжатии ноги
+
 # ENV-переопределения
 CONFIG.SYMBOL   = os.getenv("FX_SYMBOL", CONFIG.SYMBOL)
 CONFIG.TF_ENTRY = os.getenv("TF_ENTRY", CONFIG.TF_ENTRY)
@@ -374,14 +378,54 @@ def _project_remaining_levels(symbol: str, pos: "Position", bank: float,
 
 def render_remaining_levels_block(symbol: str, pos: "Position", bank: float,
                                     fee_taker: float, tick: float) -> str:
-    rows = _project_remaining_levels(symbol, pos, bank, fee_taker, tick)
-    if not rows:
+    """
+    Для каждого оставшегося уровня считаем состояние ПОСЛЕ его исполнения и показываем:
+      цена — добор ≈ лоты → ML20% @ <цена_охраны>, запас ≈ <тик> / <$> / +<п.п. к 20%>
+    """
+    if not getattr(pos, "ordinary_targets", None):
         return "Оставшиеся уровни: —"
-    lines = ["Оставшиеся уровни (цена — добор → ПОСЛЕ ИСП.: свободная, уровень маржи):"]
-    for r in rows:
+    lines = ["Оставшиеся уровни (цена — добор → ML20%@, запас до ML20%):"]
+
+    L = max(1, int(getattr(pos, "leverage", 1) or 1))
+    used0 = _pos_total_margin(pos)
+    avg0, qty0 = float(pos.avg), float(pos.qty)
+    used_ord = pos.steps_filled - (1 if pos.reserve_used else 0)
+    base_off = getattr(pos, "ordinary_offset", 0)
+
+    for i, t in enumerate(pos.ordinary_targets[base_off:], start=0):
+        step_idx = used_ord + i
+        if step_idx >= len(pos.step_margins):
+            break
+        price = float(t["price"])
+        m = float(pos.step_margins[step_idx])
+        dq = (m * L) / max(price, 1e-12)
+
+        # состояние ПОСЛЕ гипотетического исполнения уровня
+        qty_new = qty0 + dq
+        avg_new = (avg0 * qty0 + price * dq) / max(qty_new, 1e-9)
+        used_new = used0 + m
+
+        class _Tmp: pass
+        tmp = _Tmp()
+        tmp.side = pos.side; tmp.avg = avg_new; tmp.qty = qty_new; tmp.leverage = L
+        tmp.steps_filled = 1; tmp.step_margins = [used_new]; tmp.reserve_used = False; tmp.reserve_margin_usdt = 0.0
+
+        fees_est = (used_new * L) * fee_taker * CONFIG.LIQ_FEE_BUFFER
+
+        # Цена охранного ML=20% ПОСЛЕ этого добора
+        ml20 = ml_price_at(tmp, CONFIG.ML_TARGET_PCT, bank, fees_est)
+        gap_ticks = abs((ml20 - price) / max(tick, 1e-12)) if pd.notna(ml20) else float("nan")
+
+        # Эквити на цене добора и запас к 20%: в $ и в п.п. к 20%
+        eq_now = equity_at_price(tmp, price, bank, fees_est)
+        buffer_usd = max(eq_now - 0.2 * used_new, 0.0) if np.isfinite(eq_now) else float("nan")
+        ml_pct_after = (eq_now / used_new) * 100.0 if used_new > 0 and np.isfinite(eq_now) else float("nan")
+        buffer_pp = ml_pct_after - CONFIG.ML_TARGET_PCT if np.isfinite(ml_pct_after) else float("nan")
+
+        lots = margin_to_lots(symbol, m, price=price, leverage=L)
         lines.append(
-            f"• {r['label']}: {fmt(r['price'])} — {r['step_margin']:.0f} $ ≈ {r['lots']:.2f} lot → "
-            f"{r['free_after']:.2f} $, {r['ml_after']:.1f}%"
+            f"• {_display_label_ru(t.get('label',''))}: {fmt(price)} — {m:.0f} $ ≈ {lots:.2f} lot "
+            f"→ ML20%@{fmt(ml20)}, запас ≈ {gap_ticks:.0f} тик / {buffer_usd:.2f} $ / +{buffer_pp:.1f} п.п."
         )
     return "\n".join(lines)
 
@@ -1062,6 +1106,95 @@ def auto_strat_targets_with_ml_buffer(pos: "Position", rng_strat: dict, entry: f
             {"price": p2, "label": labs[1]},
             {"price": p3, "label": labs[2], "reserve3": True}]
 
+# === равнение #3: |#2−#3| ≈ |#1−#2| и |ML20%(после #3)−#3| ≈ |#1−#2| ===
+def _equalize_p3_to_gap_and_ml(pos: "Position", bank: float, fees_est: float, tick: float) -> tuple[list[dict], bool]:
+    tol = CONFIG.EQUALIZE_TOL_TICKS
+    strat = _extract_first_three_strats(pos.ordinary_targets)
+    if len(strat) < 3:
+        return pos.ordinary_targets, False
+    p1, p2, p3 = strat
+    gap12 = _ticks_between(p1, p2, tick)
+    if gap12 < CONFIG.DCA_MIN_GAP_TICKS:
+        return pos.ordinary_targets, False
+    # целевой p3 по равному разрыву к p2
+    p3_target = quantize_to_tick(p2 - gap12 * tick, tick) if pos.side == "LONG" else quantize_to_tick(p2 + gap12 * tick, tick)
+    ml3 = _ml_after_k(pos, bank, fees_est, [p1, p2, p3_target], 3)
+    if np.isnan(ml3):
+        return pos.ordinary_targets, False
+    gap23 = _ticks_between(p2, p3_target, tick)
+    gapML = _ticks_between(p3_target, ml3, tick)
+    ok = (abs(gap23 - gap12) <= tol) and (abs(gapML - gap12) <= tol)
+    # применяем новые цены p1,p2,p3_target
+    idxs = [i for i,t in enumerate(pos.ordinary_targets) if str(t.get("label","")).upper().startswith("STRAT")][:3]
+    labels = [pos.ordinary_targets[i]["label"] for i in idxs]
+    new_vals = [p1, p2, p3_target]
+    for j, i in enumerate(idxs):
+        pos.ordinary_targets[i]["price"] = quantize_to_tick(new_vals[j], tick)
+        pos.ordinary_targets[i]["label"] = labels[j]
+        pos.ordinary_targets[i]["reserve3"] = True if j == 2 else pos.ordinary_targets[i].pop("reserve3", None)
+    _sync_reserve3_flags(pos)
+    return pos.ordinary_targets, ok
+
+def _fit_leg_with_equalization(
+    symbol: str,
+    leg_margin_init: float,
+    remain_side: str,
+    entry_px: float,
+    close_px: float,
+    bank: float,
+    rng_strat: dict,
+    tick: float,
+    growth: float
+) -> tuple[float, "Position", list[dict], float]:
+    """
+    Подбирает leg_margin ≤ leg_margin_init, строит цели и равняет p3 так, чтобы
+    gap(#2,#3) ≈ gap(#1,#2) и gap(#3,ML20%(после #3)) ≈ gap(#1,#2).
+    """
+    lo = max(CONFIG.LEG_MIN_FRACTION, 0.25)
+    hi = 1.0
+    best = None
+    # грубая сетка масштабов
+    for s in [1.00, 0.90, 0.80, 0.70, 0.60, 0.50, max(0.45, lo), lo]:
+        leg = leg_margin_init * s
+        pos, tgts, fees = _plan_with_leg(symbol, leg, remain_side, entry_px, close_px, bank, rng_strat, tick, growth)
+        tgts2, ok = _equalize_p3_to_gap_and_ml(pos, bank, fees, tick)
+        if _count_strats(tgts2) >= 3 and ok:
+            return leg, pos, tgts2, fees
+        strat = _extract_first_three_strats(tgts2)
+        if len(strat) == 3:
+            p1,p2,p3 = strat
+            gap12 = _ticks_between(p1,p2,tick)
+            ml3 = _ml_after_k(pos, bank, fees, [p1,p2,p3], 3)
+            gap23 = _ticks_between(p2,p3,tick)
+            gapML = _ticks_between(p3, ml3, tick) if not np.isnan(ml3) else float("inf")
+            err = abs(gap23-gap12) + abs(gapML-gap12)
+            if best is None or err < best[0]:
+                best = (err, leg, pos, tgts2, fees)
+    if best is not None:
+        _, leg0, _, _, _ = best
+        a = max(lo, leg0 * 0.6); b = min(hi, leg0 * 1.0)
+        for _ in range(18):
+            mid = (a + b) / 2.0
+            pos, tgts, fees = _plan_with_leg(symbol, mid, remain_side, entry_px, close_px, bank, rng_strat, tick, growth)
+            tgts2, ok = _equalize_p3_to_gap_and_ml(pos, bank, fees, tick)
+            if _count_strats(tgts2) >= 3 and ok:
+                return mid, pos, tgts2, fees
+            strat = _extract_first_three_strats(tgts2)
+            if len(strat) < 3:
+                a = mid; continue
+            p1,p2,p3 = strat
+            ml3 = _ml_after_k(pos, bank, fees, [p1,p2,p3], 3)
+            if np.isnan(ml3):
+                a = mid; continue
+            gap12 = _ticks_between(p1,p2,tick)
+            gapML = _ticks_between(p3, ml3, tick)
+            if gapML < gap12:
+                b = mid
+            else:
+                a = mid
+        return best[1], best[2], best[3], best[4]
+    return leg_margin_init, *_plan_with_leg(symbol, leg_margin_init, remain_side, entry_px, close_px, bank, rng_strat, tick, growth)
+
 def _strat_report_text(pos: "Position", px: float, tick: float, bank: float,
                        fees_est: float, rng_strat: dict, hdr: str) -> str:
     """
@@ -1434,6 +1567,66 @@ def fit_leg_margin_for_three_strats(symbol: str, leg_margin_init: float, remain_
                                               targets=targets, tick=tick)
     return leg, pos, pos.ordinary_targets, fees
 
+def _fit_leg_with_equalization(
+    symbol: str,
+    leg_margin_init: float,
+    remain_side: str,
+    entry_px: float,
+    close_px: float,
+    bank: float,
+    rng_strat: dict,
+    tick: float,
+    growth: float
+) -> tuple[float, "Position", list[dict], float]:
+    """
+    Подбирает leg_margin ≤ leg_margin_init, строит цели и равняет p3 так, чтобы
+    gap(#2,#3) ≈ gap(#1,#2) и gap(#3,ML20%(после #3)) ≈ gap(#1,#2).
+    """
+    lo = max(CONFIG.LEG_MIN_FRACTION, 0.25)
+    hi = 1.0
+    best = None
+    # грубая сетка масштабов
+    for s in [1.00, 0.90, 0.80, 0.70, 0.60, 0.50, max(0.45, lo), lo]:
+        leg = leg_margin_init * s
+        pos, tgts, fees = _plan_with_leg(symbol, leg, remain_side, entry_px, close_px, bank, rng_strat, tick, growth)
+        tgts2, ok = _equalize_p3_to_gap_and_ml(pos, bank, fees, tick)
+        if _count_strats(tgts2) >= 3 and ok:
+            return leg, pos, tgts2, fees
+        strat = _extract_first_three_strats(tgts2)
+        if len(strat) == 3:
+            p1,p2,p3 = strat
+            gap12 = _ticks_between(p1,p2,tick)
+            ml3 = _ml_after_k(pos, bank, fees, [p1,p2,p3], 3)
+            gap23 = _ticks_between(p2,p3,tick)
+            gapML = _ticks_between(p3, ml3, tick) if not np.isnan(ml3) else float("inf")
+            err = abs(gap23-gap12) + abs(gapML-gap12)
+            if best is None or err < best[0]:
+                best = (err, leg, pos, tgts2, fees)
+    if best is not None:
+        _, leg0, _, _, _ = best
+        a = max(lo, leg0 * 0.6); b = min(hi, leg0 * 1.0)
+        for _ in range(18):
+            mid = (a + b) / 2.0
+            pos, tgts, fees = _plan_with_leg(symbol, mid, remain_side, entry_px, close_px, bank, rng_strat, tick, growth)
+            tgts2, ok = _equalize_p3_to_gap_and_ml(pos, bank, fees, tick)
+            if _count_strats(tgts2) >= 3 and ok:
+                return mid, pos, tgts2, fees
+            strat = _extract_first_three_strats(tgts2)
+            if len(strat) < 3:
+                a = mid; continue
+            p1,p2,p3 = strat
+            ml3 = _ml_after_k(pos, bank, fees, [p1,p2,p3], 3)
+            if np.isnan(ml3):
+                a = mid; continue
+            gap12 = _ticks_between(p1,p2,tick)
+            gapML = _ticks_between(p3, ml3, tick)
+            if gapML < gap12:
+                b = mid
+            else:
+                a = mid
+        return best[1], best[2], best[3], best[4]
+    return leg_margin_init, *_plan_with_leg(symbol, leg_margin_init, remain_side, entry_px, close_px, bank, rng_strat, tick, growth)
+
 def clip_targets_by_ml(pos: "Position", bank: float, fees_est: float,
                        targets: list[dict], tick: float, safety_ticks: int = 2) -> list[dict]:
     """
@@ -1515,7 +1708,6 @@ async def scanner_main_loop(
     b["chat_id"]   = target_chat_id
 
     # Google Sheets: полностью удалено; sheet = None
-    sheet = None
 
     # ---- SYMBOL ----
     if symbol not in FX:
@@ -1598,7 +1790,6 @@ async def scanner_main_loop(
             def _alloc_bank(bank: float, weight: int = 100) -> float:
                 return bank
             
-            reserve_off = False
 
             idle_for_rebuild = not (b.get("position") or _hedge_active())
             need_build_strat = (rng_strat is None) or ((now - last_build_strat > CONFIG.REBUILD_RANGE_EVERY_MIN*60) and idle_for_rebuild)
@@ -1728,7 +1919,7 @@ async def scanner_main_loop(
                     remain_side = manual_dir
                     growth_after = CONFIG.GROWTH_AFTER_HEDGE
                     alloc_bank_after = _alloc_bank(bank, weight)
-                    leg_sized, _pos, _targets, _fees_est = fit_leg_margin_for_three_strats(
+                    leg_sized, _pos, _targets, _fees_est = _fit_leg_with_equalization(
                         symbol, margin_3, remain_side, entry_px, planned_hc_px,
                         alloc_bank_after, rng_strat, tick, growth_after
                     )
@@ -2152,7 +2343,7 @@ async def scanner_main_loop(
                     growth_after = CONFIG.GROWTH_AFTER_HEDGE
                     alloc_bank_after = _alloc_bank(bank, weight)
                     # Подберём маржу первой ноги так, чтобы поместились 3 STRAT
-                    leg_sized, _pos, _targets, _fees_est = fit_leg_margin_for_three_strats(
+                    leg_sized, _pos, _targets, _fees_est = _fit_leg_with_equalization(
                         symbol, margin_3, remain_side, px, planned_hc_px,
                         alloc_bank_after, rng_strat, tick, growth_after
                     )
