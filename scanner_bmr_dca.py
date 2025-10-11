@@ -27,7 +27,7 @@ log = logging.getLogger("bmr_dca_engine")
 logging.getLogger("fx_feed").setLevel(logging.WARNING)
 
 # Регистр для задач сканеров в рамках Telegram-приложения
-TASKS_KEY = "scan_tasks" # app.bot_data[TASKS_KEY] -> dict[ns_key] = asyncio.Task
+TASKS_KEY = "scan_tasks"  # app.bot_data[TASKS_KEY] -> dict[ns_key] = asyncio.Task
 
 # --- Status snapshot helper (для /status)
 def _update_status_snapshot(box: dict, *, symbol: str, bank_fact: float, bank_target: float,
@@ -1713,6 +1713,12 @@ def clip_targets_by_ml(pos: "Position", bank: float, fees_est: float,
         qty_new = qty + dq
         avg_new = (avg * qty + price * dq) / max(qty_new, 1e-9)
         used_new = used + m
+        # --- NEW: резервный STRAT #3 не клиппуем по ML, он gated через reserve3_ready ---
+        if t.get("reserve3"):
+            out.append(t)
+            qty, avg, used = qty_new, avg_new, used_new
+            continue
+        # --- /NEW
         class _Tmp: pass
         tmp = _Tmp()
         tmp.side = pos.side; tmp.avg = avg_new; tmp.leverage = L; tmp.qty = qty_new
@@ -2215,9 +2221,15 @@ async def scanner_main_loop(
                         fees_est = (cum_margin * pos.leverage) * CONFIG.FEE_TAKER * CONFIG.LIQ_FEE_BUFFER
                         base_close = pos.hedge_close_px or pos.avg
                         pos.ordinary_targets = build_targets_with_tactical(pos, rng_strat, base_close, tick, bank, fees_est)
+                        # NEW: клиппинг по ML + синхронизация reserve3
+                        pos.ordinary_targets = clip_targets_by_ml(pos, bank, fees_est, pos.ordinary_targets, tick)
                         pos.ordinary_offset = min(getattr(pos,"ordinary_offset",0), len(pos.ordinary_targets))
                         _sync_reserve3_flags(pos)
-                        await say(f"✏️ TAC обновлён вручную → <code>{fmt(tac_q)}</code>")
+                        # NEW: подробный отчёт как в /strat show
+                        await say(_strat_report_text(
+                            pos, px, tick, bank, fees_est, rng_strat,
+                            hdr=f"✏️ TAC обновлён вручную → <code>{fmt(tac_q)}</code>"
+                        ))
             if b.pop("cmd_tac_reset", False):
                 if not pos or not pos.from_hedge or b.get("fsm_state") != int(FSM.MANAGING):
                     await say("ℹ️ Нет активной позиции «после хеджа» — сбрасывать TAC нечего.")
@@ -2227,9 +2239,15 @@ async def scanner_main_loop(
                     fees_est = (cum_margin * pos.leverage) * CONFIG.FEE_TAKER * CONFIG.LIQ_FEE_BUFFER
                     base_close = pos.hedge_close_px or pos.avg
                     pos.ordinary_targets = build_targets_with_tactical(pos, rng_strat, base_close, tick, bank, fees_est)
+                    # NEW: клиппинг по ML + синхронизация reserve3
+                    pos.ordinary_targets = clip_targets_by_ml(pos, bank, fees_est, pos.ordinary_targets, tick)
                     pos.ordinary_offset = min(getattr(pos,"ordinary_offset",0), len(pos.ordinary_targets))
                     _sync_reserve3_flags(pos)
-                    await say("♻️ TAC сброшен к авто-плану")
+                    # NEW: подробный отчёт
+                    await say(_strat_report_text(
+                        pos, px, tick, bank, fees_est, rng_strat,
+                        hdr="♻️ TAC сброшен к авто-плану"
+                    ))
 
             # Диагностика целей FUND_BOT — удалена
 
