@@ -2222,3 +2222,162 @@ async def _handle_manual_commands(
             f"{levels_block}\n"
             f"(Осталось: {planned_now} из 3)"
         )
+
+# ---------------------------------------------------------------------------
+# ================  ЭКСПОРТ ДЛЯ TELEGRAM-БОТА  ==============================
+# ---------------------------------------------------------------------------
+
+# куда складываем asyncio.Task-и
+TASKS_KEY = "scan_tasks"
+
+
+def _ns(symbol: str, chat_id):
+    """Единый ключ для bot_data: EURUSD|<chat_id>"""
+    from inspect import isclass  # на всякий случай, если кто-то передаст объект
+    s = _norm_symbol(symbol)
+    return f"{s}|{chat_id or 'default'}"
+
+
+async def _scanner_loop(app, broadcaster, *, symbol: str, chat_id=None, botbox: dict | None = None):
+    """
+    Реальный рабочий цикл сканера.
+    Тут мы можем пользоваться ВСЕМ, что ты выше уже написал: build_ranges, fetch_ohlcv,
+    _update_status_snapshot, Position и т.д.
+    """
+    ns_key = _ns(symbol, chat_id)
+
+    # box — это то, что потом /status читает из app.bot_data[ns_key]
+    if botbox is None:
+        botbox = app.bot_data.setdefault(ns_key, {})
+
+    # инициализация дефолтов
+    bank_target = float(botbox.get("safety_bank_usdt") or CONFIG.SAFETY_BANK_USDT)
+    botbox.setdefault("bank_target_usdt", bank_target)
+    botbox.setdefault("bank_fact_usdt", bank_target)
+    botbox.setdefault("scan_paused", False)
+    botbox.setdefault("symbol", symbol)
+
+    # broadcaster мы раньше оборачивали try/except — сделаем и тут
+    say = _wrap_broadcast(broadcaster, chat_id)
+
+    await say(app, f"✅ сканер по <b>{_norm_symbol(symbol)}</b> запущен.")
+
+    try:
+        last_ranges_ts = 0.0
+        rng_strat = None
+        rng_tac = None
+
+        while True:
+            now = time.time()
+
+            # 1) раз в N минут перестраиваем диапазоны
+            if now - last_ranges_ts >= CONFIG.REBUILD_RANGE_EVERY_MIN * 60 or rng_strat is None:
+                try:
+                    rng_strat, rng_tac = await build_ranges(symbol)
+                except Exception:
+                    log.exception("range build failed")
+                    rng_strat, rng_tac = None, None
+                else:
+                    last_ranges_ts = now
+
+            # 2) тянем быструю цену (1–3 свечи хватит)
+            try:
+                df_fast = await maybe_await(fetch_ohlcv, symbol, CONFIG.TF_ENTRY, 3)
+                if df_fast is not None and not df_fast.empty:
+                    px = float(df_fast["close"].iloc[-1])
+                else:
+                    px = None
+            except Exception:
+                log.exception("fast price fetch failed")
+                px = None
+
+            # 3) можно было бы тут обновлять позицию/трэйлинг/доборы —
+            #    но у тебя вверху уже есть жирные функции для этого.
+            #    Чтобы бот сейчас не падал — просто обновим статус.
+            _update_status_snapshot(
+                botbox,
+                symbol=symbol,
+                bank_fact=botbox.get("bank_fact_usdt", bank_target),
+                bank_target=botbox.get("bank_target_usdt", bank_target),
+                pos=botbox.get("position"),              # если сверху кто-то положит Position — /status его покажет
+                scan_paused=botbox.get("scan_paused", False),
+                rng_strat=rng_strat,
+                rng_tac=rng_tac,
+            )
+
+            # 4) иногда дадим сигнал по 15m-фракталам — у тебя есть готовый код
+            if "m15_state" not in botbox:
+                botbox["m15_state"] = {}
+            if "m15_sig" not in botbox:
+                botbox["m15_sig"] = {}
+            await _m15_state_step(botbox, symbol, lambda text: say(app, text, target_chat_id=chat_id))
+
+            # 5) пауза цикла
+            await asyncio.sleep(CONFIG.SCAN_INTERVAL_SEC)
+
+    except asyncio.CancelledError:
+        # нас попросили /stop — надо красиво выйти
+        await say(app, f"🛑 сканер по <b>{_norm_symbol(symbol)}</b> остановлен.")
+        raise
+    except Exception:
+        log.exception("scanner loop crashed")
+        await say(app, f"❌ сканер по <b>{_norm_symbol(symbol)}</b> упал, см. логи.")
+        raise
+
+
+async def start_scanner_for_pair(app, broadcaster, *, symbol: str, chat_id=None, botbox: dict | None = None):
+    """
+    Это и вызывает /run SYMBOL
+    """
+    tasks: dict = app.bot_data.setdefault(TASKS_KEY, {})
+    ns_key = _ns(symbol, chat_id)
+
+    # уже запущен — просто скажем об этом
+    task = tasks.get(ns_key)
+    if task and not task.done():
+        return f"ℹ️ сканер по { _norm_symbol(symbol) } уже запущен."
+
+    # если botbox не передали — возьмём из bot_data
+    if botbox is None:
+        botbox = app.bot_data.setdefault(ns_key, {})
+
+    # стартуем настоящий цикл
+    loop_task = asyncio.create_task(
+        _scanner_loop(app, broadcaster, symbol=symbol, chat_id=chat_id, botbox=botbox),
+        name=f"scan-{ns_key}",
+    )
+    tasks[ns_key] = loop_task
+    return f"✅ сканер по { _norm_symbol(symbol) } запущен."
+
+
+async def stop_scanner_for_pair(app, *, symbol: str, chat_id=None, hard: bool = False):
+    """
+    Это и вызывает /stop SYMBOL [hard]
+    """
+    tasks: dict = app.bot_data.setdefault(TASKS_KEY, {})
+    ns_key = _ns(symbol, chat_id)
+    task: asyncio.Task | None = tasks.get(ns_key)
+
+    if not task:
+        return f"ℹ️ сканер по { _norm_symbol(symbol) } не запущен."
+
+    # мягко отменяем
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+    tasks.pop(ns_key, None)
+    # можно почистить статус, но лучше оставить — /status после stop что-то покажет
+    return f"🛑 сканер по { _norm_symbol(symbol) } остановлен."
+
+
+def is_scanner_running(app, symbol: str, chat_id=None) -> bool:
+    """
+    Проверка для /run — чтобы не стартовать второй раз
+    """
+    tasks: dict = app.bot_data.get(TASKS_KEY, {})
+    ns_key = _ns(symbol, chat_id)
+    task = tasks.get(ns_key)
+    return bool(task and not task.done())
