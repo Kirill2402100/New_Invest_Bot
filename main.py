@@ -27,6 +27,8 @@ try:
         is_scanner_running,
         _norm_symbol,
         CONFIG,
+        BOXES_KEY,  # <-- ИСПРАВЛЕНО
+        BANKS_KEY,  # <-- ИСПРАВЛЕНО
     )
     _IMPORTED_OK = True
 except ImportError as _e:
@@ -45,7 +47,13 @@ except ImportError as _e:
         ),
     )
     CONFIG = getattr(_sc, "CONFIG", type("CONFIG", (), {"SYMBOL": "BTCUSDT"}))
+    
+    # <-- ИСПРАВЛЕНО: Ключи должны быть определены всегда
+    BOXES_KEY = getattr(_sc, "BOXES_KEY", "scan_boxes")
+    BANKS_KEY = getattr(_sc, "BANKS_KEY", "scan_banks")
+    
     _IMPORTED_OK = all([start_scanner_for_pair, stop_scanner_for_pair, is_scanner_running])
+    
     if not _IMPORTED_OK:
         # подставим мягкие заглушки, чтобы /run не крашил приложение
         async def _stub_start(app, bc, *, symbol: str, chat_id: Optional[int], botbox=None):
@@ -92,9 +100,36 @@ def _chat_id(update: Update) -> Optional[int]:
         return update.effective_chat.id
     return None
 
+# --- БЛОК УТИЛИТ ПОЛНОСТЬЮ ЗАМЕНЕН ---
 
-def _ns_key(symbol: str, chat_id: Optional[int]) -> str:
-    return f"{_norm_symbol(symbol)}|{chat_id or 'default'}"
+def _get_scanner_ns_key(chat_id: int, symbol: str) -> str:
+    """
+    Ключ в формате, который ожидает scanner_bmr_dca.py
+    (f"{chat_id}:{symbol.upper()}")
+    """
+    return f"{chat_id}:{_norm_symbol(symbol)}"
+
+
+def _get_scanner_box(app: Application, symbol: str, chat_id: Optional[int]) -> dict:
+    """
+    Получает 'коробку' (box) состояния для сканера из app.bot_data[BOXES_KEY].
+    Именно В ЭТУ 'коробку' сканер смотрит в своем цикле.
+    """
+    if chat_id is None:
+        log.warning("chat_id is None, returning empty box")
+        return {}
+    ns_key = _get_scanner_ns_key(chat_id, symbol)
+    boxes = app.bot_data.setdefault(BOXES_KEY, {})
+    return boxes.setdefault(ns_key, {})
+
+
+def _get_banks_registry(app: Application) -> dict:
+    """
+    Получает глобальный реестр банков app.bot_data[BANKS_KEY].
+    """
+    return app.bot_data.setdefault(BANKS_KEY, {})
+
+# --- КОНЕЦ БЛОКА ЗАМЕНЫ УТИЛИТ ---
 
 
 def _hs(s: str) -> str:
@@ -118,9 +153,7 @@ def _parse_amount(s: str) -> Optional[float]:
     return x
 
 
-def _get_slot(app: Application, symbol: str, chat_id: Optional[int]) -> dict:
-    ns = _ns_key(symbol, chat_id)
-    return app.bot_data.setdefault(ns, {})
+# (старый _get_slot удален)
 
 
 # общий broadcast
@@ -228,16 +261,20 @@ async def cmd_restart(update: Update, context: ContextTypes.DEFAULT_TYPE):
         sym = _norm_symbol(args[0])
     else:
         sym = context.chat_data.get("current_symbol") or CONFIG.SYMBOL
-    ns = _ns_key(sym, chat_id)
-    box = context.application.bot_data.setdefault(ns, {})
+    
+    # ИСПРАВЛЕНО
+    box = _get_scanner_box(context.application, sym, chat_id)
     box["cmd_restart"] = True
+    
     context.chat_data["current_symbol"] = sym
     await update.message.reply_html(f"✅ Запросил /restart для <b>{_hs(sym)}</b>.")
 
 
+# --- cmd_setbank ПОЛНОСТЬЮ ЗАМЕНЕН ---
 async def cmd_setbank(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = _chat_id(update)
     args = context.args or []
+    banks_registry = _get_banks_registry(context.application)
 
     if len(args) == 1:
         amt = _parse_amount(args[0])
@@ -249,10 +286,15 @@ async def cmd_setbank(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "Неизвестна активная пара в этом чате.\n"
                 "Используй: <code>/setbank SYMBOL USD</code>"
             )
-        slot = _get_slot(context.application, sym, chat_id)
-        slot["safety_bank_usdt"] = float(amt)
-        slot["safety_bank_user_set"] = True
-        slot["bank_set_ts"] = time.time()
+        
+        ns_key = _get_scanner_ns_key(chat_id, sym)
+        banks_registry[ns_key] = float(amt)
+        
+        # Дополнительно обновим 'коробку', если сканер уже запущен
+        box = _get_scanner_box(context.application, sym, chat_id)
+        if box:
+            box["bank_usd"] = float(amt)
+
         return await update.message.reply_html(
             f"OK. Банк для <b>{_hs(sym)}</b> установлен: <b>{amt:.2f} USD</b>.\n"
             f"Теперь: <code>/run {_hs(sym)}</code>"
@@ -266,10 +308,14 @@ async def cmd_setbank(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if amt is None or amt <= 0:
             return await update.message.reply_html("Некорректная сумма. Пример: <code>/setbank GBPUSD 6000</code>")
 
-        slot = _get_slot(context.application, sym, chat_id)
-        slot["safety_bank_usdt"] = float(amt)
-        slot["safety_bank_user_set"] = True
-        slot["bank_set_ts"] = time.time()
+        ns_key = _get_scanner_ns_key(chat_id, sym)
+        banks_registry[ns_key] = float(amt)
+        
+        # Дополнительно обновим 'коробку', если сканер уже запущен
+        box = _get_scanner_box(context.application, sym, chat_id)
+        if box:
+            box["bank_usd"] = float(amt)
+
         context.chat_data["current_symbol"] = sym
 
         return await update.message.reply_html(
@@ -283,6 +329,7 @@ async def cmd_setbank(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "• <code>/setbank SYMBOL USD</code>\n"
             "• <code>/setbank USD</code> — для уже выбранной пары"
         )
+# --- КОНЕЦ ЗАМЕНЫ cmd_setbank ---
 
 
 async def cmd_run(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -294,23 +341,27 @@ async def cmd_run(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sym = _norm_symbol(args[0])
     context.chat_data["current_symbol"] = sym
 
-    slot = _get_slot(context.application, sym, chat_id)
-    if not slot.get("safety_bank_user_set"):
-        ex = slot.get("safety_bank_usdt")
-        hint = f" (сейчас по умолчанию: {ex:.2f} USD)" if ex else ""
+    # ИСПРАВЛЕНО
+    ns_key = _get_scanner_ns_key(chat_id, sym)
+    banks_registry = _get_banks_registry(context.application)
+    
+    if ns_key not in banks_registry:
+        default_bank = CONFIG.SAFETY_BANK_USDT
+        hint = f" (сейчас по умолчанию: {default_bank:.2f} USD)"
         return await update.message.reply_html(
             f"Сначала задай банк: <code>/setbank {_hs(sym)} USD</code>{hint}"
         )
+    # ---
 
     if is_scanner_running(context.application, sym, chat_id):
         return await update.message.reply_html(f"Сканер для <b>{_hs(sym)}</b> уже запущен.")
 
     msg = await start_scanner_for_pair(
         context.application,
-        _broadcast,
+        # _broadcast, # start_scanner_for_pair больше не принимает broadcast
         symbol=sym,
         chat_id=chat_id,
-        botbox=None,
+        # botbox=None, # и botbox тоже
     )
     await update.message.reply_html(msg)
 
@@ -337,8 +388,9 @@ async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = _chat_id(update)
     sym = context.chat_data.get("current_symbol") or CONFIG.SYMBOL
-    ns = _ns_key(sym, chat_id)
-    box = context.application.bot_data.get(ns) or {}
+    
+    # ИСПРАВЛЕНО
+    box = _get_scanner_box(context.application, sym, chat_id)
 
     snap = box.get("status_snapshot") or {}
     state = snap.get("state", "N/A")
@@ -361,9 +413,11 @@ async def cmd_open(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not args:
         return await update.message.reply_html("Укажи символ: <code>/open SYMBOL</code>")
     sym = _norm_symbol(args[0])
-    ns = _ns_key(sym, chat_id)
-    box = context.application.bot_data.setdefault(ns, {})
+    
+    # ИСПРАВЛЕНО
+    box = _get_scanner_box(context.application, sym, chat_id)
     box["user_manual_mode"] = False
+    
     context.chat_data["current_symbol"] = sym
     await update.message.reply_html(f"Готово. /open взведён для <b>{_hs(sym)}</b>.")
 
@@ -372,9 +426,11 @@ async def cmd_close(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = _chat_id(update)
     args = context.args or []
     sym = _norm_symbol(args[0]) if args else (context.chat_data.get("current_symbol") or CONFIG.SYMBOL)
-    ns = _ns_key(sym, chat_id)
-    box = context.application.bot_data.setdefault(ns, {})
+    
+    # ИСПРАВЛЕНО
+    box = _get_scanner_box(context.application, sym, chat_id)
     box["force_close"] = True
+    
     context.chat_data["current_symbol"] = sym
     await update.message.reply_html(f"MANUAL_CLOSE запрошен для <b>{_hs(sym)}</b>.")
 
@@ -383,9 +439,11 @@ async def cmd_pause(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = _chat_id(update)
     args = context.args or []
     sym = _norm_symbol(args[0]) if args else (context.chat_data.get("current_symbol") or CONFIG.SYMBOL)
-    ns = _ns_key(sym, chat_id)
-    box = context.application.bot_data.setdefault(ns, {})
+
+    # ИСПРАВЛЕНО
+    box = _get_scanner_box(context.application, sym, chat_id)
     box["user_manual_mode"] = True
+    
     context.chat_data["current_symbol"] = sym
     await update.message.reply_html(
         f"⏸ Ручной режим по <b>{_hs(sym)}</b>. Используй <code>/open {_hs(sym)}</code> для продолжения."
@@ -403,9 +461,12 @@ async def cmd_fees(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await update.message.reply_html("Не могу разобрать комиссии. Пример: <code>/fees 0.0002 0.0005</code>")
     sym = _norm_symbol(args[2]) if len(args) > 2 else (context.chat_data.get("current_symbol") or CONFIG.SYMBOL)
     chat_id = _chat_id(update)
-    box = _get_slot(context.application, sym, chat_id)
+    
+    # ИСПРАВЛЕНО
+    box = _get_scanner_box(context.application, sym, chat_id)
     box["fee_maker"] = maker
     box["fee_taker"] = taker
+    
     context.chat_data["current_symbol"] = sym
     await update.message.reply_html(
         f"⚙️ Комиссии для <b>{_hs(sym)}</b> заданы: maker={maker:.6f}, taker={taker:.6f}"
@@ -443,8 +504,8 @@ async def cmd_tac(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if sym is None:
         sym = context.chat_data.get("current_symbol") or CONFIG.SYMBOL
 
-    ns = _ns_key(sym, chat_id)
-    box = context.application.bot_data.setdefault(ns, {})
+    # ИСПРАВЛЕНО
+    box = _get_scanner_box(context.application, sym, chat_id)
 
     if sub == "reset":
         box["cmd_tac_reset"] = True
@@ -506,8 +567,8 @@ async def cmd_tac2(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if sym is None:
         sym = context.chat_data.get("current_symbol") or CONFIG.SYMBOL
 
-    ns = _ns_key(sym, chat_id)
-    box = context.application.bot_data.setdefault(ns, {})
+    # ИСПРАВЛЕНО
+    box = _get_scanner_box(context.application, sym, chat_id)
 
     if sub == "reset":
         # сбросим только TAC #2 (первый оставим как есть)
@@ -564,8 +625,8 @@ async def cmd_strat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if sym is None:
         sym = context.chat_data.get("current_symbol") or CONFIG.SYMBOL
 
-    ns = _ns_key(sym, chat_id)
-    box = context.application.bot_data.setdefault(ns, {})
+    # ИСПРАВЛЕНО
+    box = _get_scanner_box(context.application, sym, chat_id)
 
     if sub == "show":
         box["cmd_strat_show"] = True
@@ -596,7 +657,7 @@ async def cmd_strat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return await update.message.reply_html("Неизвестная подкоманда. Используй: <code>/strat show|set|reset</code>")
 
 
-# ---------------- HEDGE CLOSE + алиас -----------------
+# --- cmd_hedge_close ПОЛНОСТЬЮ ЗАМЕНЕН ---
 async def cmd_hedge_close(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args or []
     if not args:
@@ -604,16 +665,18 @@ async def cmd_hedge_close(update: Update, context: ContextTypes.DEFAULT_TYPE):
     price_raw = args[0]
     sym = _norm_symbol(args[1]) if len(args) > 1 else (context.chat_data.get("current_symbol") or CONFIG.SYMBOL)
     chat_id = _chat_id(update)
-    ns = _ns_key(sym, chat_id)
-    box = context.application.bot_data.setdefault(ns, {})
+    
+    # ИСПРАВЛЕНО
+    box = _get_scanner_box(context.application, sym, chat_id)
     try:
         px = float(str(price_raw).replace(",", "."))
-        box["hedge_close_price"] = px
+        box["pending_hc_price"] = px  # <-- Пишем в 'pending_hc_price'
         context.chat_data["current_symbol"] = sym
-        await update.message.reply_html(f"✅ Принял цену закрытия хеджа по <b>{_hs(sym)}</b>: <code>{px:.6f}</code>")
+        await update.message.reply_html(f"✅ Принял цену закрытия хеджа по <b>{_hs(sym)}</b>: <code>{px:.6f}</code>. Ожидаю пересчет...")
     except Exception:
-        box["hedge_close_price"] = None
+        box["pending_hc_price"] = None
         await update.message.reply_html(f"⚠️ Цена не распознана — сканер возьмёт рыночную. Пара: <b>{_hs(sym)}</b>.")
+# --- КОНЕЦ ЗАМЕНЫ cmd_hedge_close ---
 
 
 async def cmd_hedge_close_alias(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -623,7 +686,7 @@ async def cmd_hedge_close_alias(update: Update, context: ContextTypes.DEFAULT_TY
     return await cmd_hedge_close(update, context)
 
 
-# ---------------- Ручные ХЕДЖ старты / flip -----------------
+# --- _set_manual_open ПОЛНОСТЬЮ ЗАМЕНЕН ---
 async def _set_manual_open(update: Update, context: ContextTypes.DEFAULT_TYPE, side: str):
     chat_id = _chat_id(update)
     args = context.args or []
@@ -638,24 +701,31 @@ async def _set_manual_open(update: Update, context: ContextTypes.DEFAULT_TYPE, s
             sym = _norm_symbol(args[0])
     if sym is None:
         sym = context.chat_data.get("current_symbol") or CONFIG.SYMBOL
+
+    # Проверяем, запущен ли сканер
     if not is_scanner_running(context.application, sym, chat_id):
         return await update.message.reply_html(
             f"Сканер для <b>{_hs(sym)}</b> не запущен. Сначала: <code>/run {_hs(sym)}</code>"
         )
-
-    ns = _ns_key(sym, chat_id)
-    box = context.application.bot_data.setdefault(ns, {})
-    box["cmd_force_open_now_dir"] = "LONG" if side.upper() == "LONG" else "SHORT"
+    
+    # Если сканер запущен, мы не можем "заставить" его войти,
+    # но мы можем УСТАНОВИТЬ BIAS (как /hedge_flip)
+    # и снять ручной режим (как /open)
+    
+    box = _get_scanner_box(context.application, sym, chat_id)
+    box["pending_hedge_bias"] = "LONG" if side.upper() == "LONG" else "SHORT"
+    box["user_manual_mode"] = False # Снимаем ручной режим
+    
     if price is not None:
-        box["cmd_force_open_now_entry_px"] = float(price)
-    box["force_open_now_ts"] = time.time()
-    box["user_manual_mode"] = False
+        box["pending_hc_price"] = float(price) # Устанавливаем цену закрытия (она же ~вход)
 
     context.chat_data["current_symbol"] = sym
     extra = f" @ <code>{price:.6f}</code>" if price is not None else ""
     await update.message.reply_html(
-        f"Ок. Запросил немедленный старт через хедж: <b>{side.upper()}</b> по <b>{_hs(sym)}</b>{extra}."
+        f"Ок. Запросил ручной bias: <b>{side.upper()}</b> по <b>{_hs(sym)}</b>{extra}.\n"
+        f"Ручной режим снят. Сканер выполнит вход при первой возможности или пересчитает план."
     )
+# --- КОНЕЦ ЗАМЕНЫ _set_manual_open ---
 
 
 async def cmd_openlong(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -666,6 +736,7 @@ async def cmd_openshort(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return await _set_manual_open(update, context, "SHORT")
 
 
+# --- cmd_hedge_flip ПОЛНОСТЬЮ ЗАМЕНЕН ---
 async def cmd_hedge_flip(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args or []
     if not args or args[0].upper() not in ("LONG", "SHORT"):
@@ -673,11 +744,14 @@ async def cmd_hedge_flip(update: Update, context: ContextTypes.DEFAULT_TYPE):
     side = args[0].upper()
     sym = _norm_symbol(args[1]) if len(args) > 1 else (context.chat_data.get("current_symbol") or CONFIG.SYMBOL)
     chat_id = _chat_id(update)
-    ns = _ns_key(sym, chat_id)
-    box = context.application.bot_data.setdefault(ns, {})
-    box["cmd_hedge_flip"] = side
+    
+    # ИСПРАВЛЕНО
+    box = _get_scanner_box(context.application, sym, chat_id)
+    box["pending_hedge_bias"] = side # <-- Пишем в 'pending_hedge_bias'
+    
     context.chat_data["current_symbol"] = sym
-    await update.message.reply_html(f"Ок. Переворот bias хеджа на <b>{side}</b> по <b>{_hs(sym)}</b> запрошен.")
+    await update.message.reply_html(f"Ок. Переворот bias хеджа на <b>{side}</b> по <b>{_hs(sym)}</b> запрошен. Ожидаю пересчет...")
+# --- КОНЕЦ ЗАМЕНЫ cmd_hedge_flip ---
 
 
 # ---------------- unknown -----------------
