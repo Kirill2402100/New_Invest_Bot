@@ -2461,8 +2461,148 @@ def is_scanner_running(app, arg1, arg2) -> bool:
     tasks = app.bot_data.get(TASKS_KEY, {})
     task = tasks.get(ns_key)
     return bool(task and not task.done())
-    
 
+# ---------------------------------------------------------------------------
+# === РЕЕСТРЫ ДЛЯ ЗАДАЧ (если выше в файле их нет, пусть будут тут) =========
+# ---------------------------------------------------------------------------
+TASKS_KEY = globals().get("TASKS_KEY", "scan_tasks")
+BOXES_KEY = globals().get("BOXES_KEY", "scan_boxes")
+BANKS_KEY = globals().get("BANKS_KEY", "scan_banks")
+
+
+def _ns(chat_id: int, symbol: str) -> str:
+    return f"{chat_id}:{symbol.upper()}"
+
+
+def _parse_chat_and_symbol(args, kwargs):
+    """
+    Поддерживаем ВСЕ варианты, которые может прислать main.py:
+
+    1) start_scanner_for_pair(app, "EURUSD", -123456)       # (symbol, chat_id)
+    2) start_scanner_for_pair(app, -123456, "EURUSD")       # (chat_id, symbol)
+    3) start_scanner_for_pair(app, symbol="EURUSD", chat_id=-123456)
+    4) start_scanner_for_pair(app, chat_id=-123456, symbol="EURUSD")
+
+    Возвращаем: (chat_id:int, symbol:str)
+    """
+    sym = kwargs.get("symbol")
+    cid = kwargs.get("chat_id")
+
+    # если оба уже есть из kwargs – отлично
+    if sym is not None and cid is not None:
+        return int(cid), str(sym).upper()
+
+    # если приехали 2 позиционных
+    if len(args) >= 2:
+        a1, a2 = args[0], args[1]
+        # строка + int
+        if isinstance(a1, str) and isinstance(a2, int):
+            return a2, a1.upper()
+        # int + строка
+        if isinstance(a1, int) and isinstance(a2, str):
+            return a1, a2.upper()
+        # что-то странное – приведём
+        if sym is None:
+            sym = a1 if isinstance(a1, str) else a2
+        if cid is None:
+            cid = a1 if isinstance(a1, int) else a2
+
+    if sym is None:
+        raise ValueError("symbol is required")
+    if cid is None:
+        raise ValueError("chat_id is required")
+
+    return int(cid), str(sym).upper()
+
+
+# ---------------------------------------------------------------------------
+# ПУБЛИЧНО: старт, стоп, проверка
+# ---------------------------------------------------------------------------
+async def start_scanner_for_pair(app, *args, **kwargs):
+    """
+    Стартует (или не стартует, если уже есть) фоновую задачу сканера
+    для конкретного чата и символа.
+    Возвращает строку для отправки в Telegram.
+    """
+    chat_id, symbol = _parse_chat_and_symbol(args, kwargs)
+    ns_key = _ns(chat_id, symbol)
+
+    bot_data = app.bot_data
+    bot_data.setdefault(TASKS_KEY, {})
+    bot_data.setdefault(BOXES_KEY, {})
+    bot_data.setdefault(BANKS_KEY, {})
+
+    # банк, который ты задаёшь командой /setbank SYMBOL 20000
+    bank_key = f"{chat_id}:{symbol}"
+    bank = float(bot_data[BANKS_KEY].get(bank_key, CONFIG.SAFETY_BANK_USDT))
+
+    # уже бежит?
+    task = bot_data[TASKS_KEY].get(ns_key)
+    if task and not task.done():
+        return f"ℹ️ сканер по {symbol} уже запущен."
+
+    # коробка состояния для этого сканера
+    box = {
+        "chat_id": chat_id,
+        "symbol": symbol,
+        "bank_usd": bank,
+        "stop_flag": False,
+        "user_manual_mode": False,
+        "fsm_state": int(FSM.IDLE),
+        "position": None,
+        "m15_state": {},
+        "m15_sig": {},
+    }
+    bot_data[BOXES_KEY][ns_key] = box
+
+    # сам цикл – это твоя большая корутина _scanner_main(...)
+    task = app.create_task(_scanner_main(app, ns_key))
+    bot_data[TASKS_KEY][ns_key] = task
+
+    return f"✅ сканер по {symbol} запущен."
+
+
+async def stop_scanner_for_pair(app, *args, **kwargs):
+    """
+    Останавливает сканер, если он был.
+    Возвращает строку для Telegram.
+    """
+    chat_id, symbol = _parse_chat_and_symbol(args, kwargs)
+    ns_key = _ns(chat_id, symbol)
+
+    bot_data = app.bot_data
+    tasks = bot_data.get(TASKS_KEY, {})
+    boxes = bot_data.get(BOXES_KEY, {})
+
+    # помечаем, что надо завершиться
+    box = boxes.get(ns_key)
+    if box:
+        box["stop_flag"] = True
+
+    task = tasks.get(ns_key)
+    if task and not task.done():
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    tasks.pop(ns_key, None)
+    boxes.pop(ns_key, None)
+
+    return f"🛑 сканер по {symbol} остановлен."
+
+
+def is_scanner_running(app, *args, **kwargs) -> bool:
+    """
+    Просто говорит, есть ли активная задача.
+    """
+    chat_id, symbol = _parse_chat_and_symbol(args, kwargs)
+    ns_key = _ns(chat_id, symbol)
+    tasks = app.bot_data.get(TASKS_KEY, {})
+    task = tasks.get(ns_key)
+    return bool(task and not task.done())
+    
 __all__ = [
     "start_scanner_for_pair",
     "stop_scanner_for_pair",
