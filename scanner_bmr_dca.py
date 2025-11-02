@@ -2374,12 +2374,31 @@ async def _scanner_main(app, ns_key: str):
 # ---------------------------------------------------------------------------
 # === ПУБЛИЧНЫЕ ФУНКЦИИ, КОТОРЫЕ ЖДЁТ main.py ===
 # ---------------------------------------------------------------------------
-async def start_scanner_for_pair(app, chat_id: int, symbol: str):
+
+def _resolve_chat_and_symbol(arg1, arg2):
     """
-    Запустить / перезапустить сканер по паре в конкретном чате.
-    main.py обычно вызывает это из /run
+    main.py у тебя, судя по логу, зовёт вот так:
+        start_scanner_for_pair(app, symbol, chat_id)
+        is_scanner_running(app, symbol, chat_id)
+        stop_scanner_for_pair(app, symbol, chat_id)
+
+    а сам модуль я изначально писал под
+        (..., chat_id, symbol)
+
+    Поэтому тут просто определяем, что где.
     """
-    symbol = symbol.upper()
+    # вариант 1: (symbol: str, chat_id: int)
+    if isinstance(arg1, str) and isinstance(arg2, int):
+        return arg2, arg1.upper()
+    # вариант 2: (chat_id: int, symbol: str)
+    if isinstance(arg1, int) and isinstance(arg2, str):
+        return arg1, arg2.upper()
+    # если совсем что-то экзотичное — приведём к строке
+    return int(arg1), str(arg2).upper()
+
+
+async def start_scanner_for_pair(app, arg1, arg2):
+    chat_id, symbol = _resolve_chat_and_symbol(arg1, arg2)
     ns_key = _ns(chat_id, symbol)
 
     bot_data = app.bot_data
@@ -2387,16 +2406,14 @@ async def start_scanner_for_pair(app, chat_id: int, symbol: str):
     bot_data.setdefault(BOXES_KEY, {})
     bot_data.setdefault(BANKS_KEY, {})
 
-    # банк main, скорее всего, кладёт по ключу "chat:symbol"
     bank_key = f"{chat_id}:{symbol}"
     bank = float(bot_data[BANKS_KEY].get(bank_key, CONFIG.SAFETY_BANK_USDT))
 
-    # если уже бежит — не дублируем
+    # если уже бежит — просто выходим
     task = bot_data[TASKS_KEY].get(ns_key)
     if task and not task.done():
         return
 
-    # создаём коробку для этого сканера
     box = {
         "chat_id": chat_id,
         "symbol": symbol,
@@ -2410,17 +2427,14 @@ async def start_scanner_for_pair(app, chat_id: int, symbol: str):
     }
     bot_data[BOXES_KEY][ns_key] = box
 
-    # запускаем задачу
     task = app.create_task(_scanner_main(app, ns_key))
     bot_data[TASKS_KEY][ns_key] = task
 
 
-async def stop_scanner_for_pair(app, chat_id: int, symbol: str):
-    """
-    Остановить сканер. main.py, скорее всего, вызывает из /stop
-    """
-    symbol = symbol.upper()
+async def stop_scanner_for_pair(app, arg1, arg2):
+    chat_id, symbol = _resolve_chat_and_symbol(arg1, arg2)
     ns_key = _ns(chat_id, symbol)
+
     bot_data = app.bot_data
     tasks = bot_data.get(TASKS_KEY, {})
     boxes = bot_data.get(BOXES_KEY, {})
@@ -2436,20 +2450,18 @@ async def stop_scanner_for_pair(app, chat_id: int, symbol: str):
             await task
         except asyncio.CancelledError:
             pass
+
     tasks.pop(ns_key, None)
     boxes.pop(ns_key, None)
 
 
-def is_scanner_running(app, chat_id: int, symbol: str) -> bool:
-    """
-    Вернёт True, если по этой паре в этом чате сейчас крутится цикл
-    """
-    symbol = symbol.upper()
+def is_scanner_running(app, arg1, arg2) -> bool:
+    chat_id, symbol = _resolve_chat_and_symbol(arg1, arg2)
     ns_key = _ns(chat_id, symbol)
     tasks = app.bot_data.get(TASKS_KEY, {})
     task = tasks.get(ns_key)
     return bool(task and not task.done())
-
+    
 
 __all__ = [
     "start_scanner_for_pair",
