@@ -1,3 +1,4 @@
+# scanner_bmr_dca.py
 from __future__ import annotations
 
 import asyncio
@@ -6,12 +7,11 @@ import logging
 import os
 import inspect
 from typing import Optional
-from datetime import datetime  # timezone убран
+from datetime import datetime
 from enum import IntEnum
 
 import numpy as np
 import pandas as pd
-# from telegram.ext import Application  # не используется в этом модуле
 
 # === Forex адаптеры и фид ===
 from fx_mt5_adapter import FX, margin_to_lots, default_tick
@@ -20,8 +20,13 @@ from fx_feed import fetch_ohlcv
 log = logging.getLogger("bmr_dca_engine")
 logging.getLogger("fx_feed").setLevel(logging.WARNING)
 
+# ---------------------------------------------------------------------------
 # Регистр для задач сканеров в рамках Telegram-приложения
-TASKS_KEY = "scan_tasks"  # app.bot_data[TASKS_KEY] -> dict[ns_key] = asyncio.Task
+# main.py ожидает, что в bot_data будет храниться это
+# ---------------------------------------------------------------------------
+TASKS_KEY = "scan_tasks"           # app.bot_data[TASKS_KEY] -> dict[ns_key] = asyncio.Task
+BOXES_KEY = "scan_boxes"           # app.bot_data[BOXES_KEY] -> dict[ns_key] = dict(...)
+BANKS_KEY = "scan_banks"           # app.bot_data[BANKS_KEY] -> dict["chat:symbol"] = float
 
 
 # --- Status snapshot helper (для /status)
@@ -128,17 +133,17 @@ def ta_supertrend(
 # CONFIG
 # ---------------------------------------------------------------------------
 class CONFIG:
-    # <<< MODIFIED: Added HEDGE_MODE switch
-    HEDGE_MODE = "trend"  # "revert" (старая логика) или "trend" (новая)
+    # тип логики хеджа
+    HEDGE_MODE = "trend"  # "revert" или "trend"
 
-    # Пара по умолчанию (можно переопределить через ENV FX_SYMBOL)
+    # Пара по умолчанию
     SYMBOL = "USDJPY"
 
-    # Комиссии в долях (0.0004 = 0.04%)
+    # Комиссии
     FEE_MAKER = 0.0
     FEE_TAKER = 0.0
 
-    # Плечо по умолчанию
+    # Плечи
     LEVERAGE = 200
     MIN_LEVERAGE = 2
     MAX_LEVERAGE = 500
@@ -146,27 +151,27 @@ class CONFIG:
     # Таймфреймы
     TF_ENTRY = "5m"
     TF_RANGE = "1h"
-    TF_TRIGGER = "1m"  # новый: поток для триггеров по хвостам
+    TF_TRIGGER = "1m"
 
-    # Сколько истории собирать под диапазоны
-    STRATEGIC_LOOKBACK_DAYS = 60  # для TF_RANGE
-    TACTICAL_LOOKBACK_DAYS = 3  # для TF_RANGE
+    # История
+    STRATEGIC_LOOKBACK_DAYS = 60
+    TACTICAL_LOOKBACK_DAYS = 3
 
-    # Таймауты/интервалы
+    # Интервалы
     FETCH_TIMEOUT = 25
     SCAN_INTERVAL_SEC = 3
     REBUILD_RANGE_EVERY_MIN = 15
     REBUILD_TACTICAL_EVERY_MIN = 5
 
-    # Диапазон/квантили/индикаторы
+    # Диапазоны
     Q_LOWER = 0.025
     Q_UPPER = 0.975
     RANGE_MIN_ATR_MULT = 1.5
+
     RSI_LEN = 14
     ADX_LEN = 14
     VOL_WIN = 50
 
-    # Весовая модель
     WEIGHTS = {
         "border": 0.45,
         "rsi": 0.15,
@@ -181,19 +186,18 @@ class CONFIG:
     DCA_GROWTH = 2.0
     CUM_DEPOSIT_FRAC_AT_FULL = 0.70
     ADD_COOLDOWN_SEC = 25
-    WICK_HYST_TICKS = 1  # гистерезис для 1m-триггеров (±тик)
+    WICK_HYST_TICKS = 1
 
-    # Тейк/Трейл
+    # ТП/трейл
     TP_PCT = 0.010
     TRAILING_STAGES = [(0.35, 0.25), (0.60, 0.50), (0.85, 0.75)]
 
-    # Безопасность/ликвидация
+    # Безопасность
     BREAK_EPS = 0.0025
     REENTRY_BAND = 0.003
     MAINT_MMR = 0.004
     LIQ_FEE_BUFFER = 1.0
 
-    # Банк и авто-аллоцирование
     SAFETY_BANK_USDT = 1500.0
     AUTO_LEVERAGE = False
     AUTO_ALLOC = {
@@ -203,7 +207,6 @@ class CONFIG:
         "growth_B": 2.2,
     }
 
-    # «Шипы» / ретест
     SPIKE = {
         "WICK_RATIO": 2.0,
         "ATR_MULT": 1.6,
@@ -211,31 +214,23 @@ class CONFIG:
         "RETRACE_FRAC": 0.35,
         "RETRACE_WINDOW_SEC": 120,
     }
-    # Рекомендации на 15m (спайк-режим)
+
     M15_RECO = {
         "ATR_LEN": 14,
-        "TRIGGER_MULT": 1.5,  # свеча с (high-low) >= 1.5*ATR
-        "CHECK_EVERY_SEC": 60,  # не чаще 1 раза в минуту тянуть 15m
+        "TRIGGER_MULT": 1.5,
+        "CHECK_EVERY_SEC": 60,
         "MSG_COOLDOWN_SEC": 60,
     }
 
-    # FA полностью отключён
-
-    ORDINARY_ADDS = 5  # столько обычных доборов после входа
-
-    # Анти-слипание ценовых уровней
-    DCA_MIN_GAP_TICKS = 2  # минимум 2 тика между целями
-
-    # Показываем ML-цену при целевом Margin Level
-    ML_TARGET_PCT = 20.0  # "ML цена (20%)"
-    # Минимальный запас к ML(20%) после STRAT и пробоя STRAT
-    ML_BREAK_BUFFER_PCT = 3.0  # после 3-го STRAT
-    ML_BREAK_BUFFER_PCT2 = 2.0  # после 2-го STRAT (новое, для более ранней страховки)
+    ORDINARY_ADDS = 5
+    DCA_MIN_GAP_TICKS = 2
+    ML_TARGET_PCT = 20.0
+    ML_BREAK_BUFFER_PCT = 3.0
+    ML_BREAK_BUFFER_PCT2 = 2.0
     ML_MIN_AFTER_LAST_PCT = 200.0
-    MIN_SPACING_PCT = 0.0035  # 0.35%
-    ML_REQ_GAP_MODE = "strat_spacing"  # ["strat_spacing"]
+    MIN_SPACING_PCT = 0.0035
+    ML_REQ_GAP_MODE = "strat_spacing"
 
-    # Расширение коридора после пробоя
     EXT_AFTER_BREAK = {
         "CONFIRM_BARS_5M": 6,
         "EXTRA_LOOKBACK_DAYS": 10,
@@ -243,11 +238,9 @@ class CONFIG:
         "PRICE_EPS": 0.0015,
     }
 
-    # BOOST
     BOOST_MAX_STEPS = 3
     BREAK_MSG_COOLDOWN_SEC = 45
 
-    # --- manual reopen policy ---
     REQUIRE_MANUAL_REOPEN_ON = {
         "manual_close": True,
         "sl_hit": True,
@@ -255,21 +248,18 @@ class CONFIG:
     }
     REMIND_MANUAL_MSG_COOLDOWN_SEC = 120
 
-    # --- подтверждение пробоя STRAT ---
     BREAK_PROBE = {
         "SAMPLES": 3,
         "INTERVAL_SEC": 5,
         "TIMEOUT_SEC": 20,
     }
 
-    # План после закрытия хеджа:
     STRAT_LEVELS_AFTER_HEDGE = 6
     GROWTH_AFTER_HEDGE = 1.40
 
-    # === LEG-anchored хвост после хеджа (TAC + STRAT1..3) ===
     AFTER_HEDGE_TAIL = {
-        "levels": 5,  # TAC1 + TAC2 + STRAT1 + STRAT2 + STRAT3
-        "mode": "relative_vector",  # "relative_vector" | "geom"
+        "levels": 5,
+        "mode": "relative_vector",
         "coeffs_rel_to_leg": [
             0.345,
             0.4983333333,
@@ -284,6 +274,9 @@ class CONFIG:
     EQUALIZING_TOL_TICKS = 2
     LEG_MIN_FRACTION = 0.30
 
+    # вот ЭТО я добавил: сколько брать на одну ногу при открытии хеджа (в долях от банка)
+    INITIAL_HEDGE_FRACTION = 0.042  # 4.2% от банка → при 20 000 даст ≈ 840, как на твоём скрине
+
 
 # ENV-переопределения
 CONFIG.SYMBOL = os.getenv("FX_SYMBOL", CONFIG.SYMBOL)
@@ -292,7 +285,7 @@ CONFIG.TF_RANGE = os.getenv("TF_RANGE", os.getenv("TF_TREND", CONFIG.TF_RANGE))
 
 
 # ---------------------------------------------------------------------------
-# Helpers (Sheets удалены)
+# Helpers
 # ---------------------------------------------------------------------------
 async def maybe_await(func, *args, **kwargs):
     if inspect.iscoroutinefunction(func):
@@ -301,9 +294,7 @@ async def maybe_await(func, *args, **kwargs):
     return await loop.run_in_executor(None, lambda: func(*args, **kwargs))
 
 
-# ---- NORMALIZER ----
 def _norm_symbol(x) -> str:
-    # Принимает str | dict | list/tuple и возвращает строку тикера UPPERCASE
     if isinstance(x, dict):
         for k in ("symbol", "pair", "name"):
             if x.get(k):
@@ -322,7 +313,6 @@ def _norm_symbol(x) -> str:
 # ---------------------------------------------------------------------------
 # Formatting & maths
 # ---------------------------------------------------------------------------
-
 def fmt(p: float) -> str:
     if p is None or pd.isna(p):
         return "N/A"
@@ -361,7 +351,6 @@ def _display_label_ru_from_target(t: dict) -> str:
 
 
 def _preview_label_ru(idx: int, t: dict) -> str:
-    """Подписи как в примере: 'Тактическое усреднение', '1-е STRAT (33%)' и т.п."""
     raw = str(t.get("label", "")).upper()
     if raw.startswith("TAC"):
         if "TAC #" in raw:
@@ -384,7 +373,6 @@ def _preview_label_ru(idx: int, t: dict) -> str:
 def render_remaining_levels_block(
     symbol: str, pos: "Position", bank: float, fee_taker: float, tick: float
 ) -> str:
-    """Рендер оставшихся уровней после открытия или добора."""
     if not getattr(pos, "ordinary_targets", None):
         return ""
     lines = []
@@ -443,7 +431,7 @@ def render_remaining_levels_block(
             elif "100%" in label:
                 label = "3-е STRAT (100%)" + (" (резерв)" if t.get("reserve3") else "")
             else:
-                label = f"{strat_counter}-е STRAT"  # Фолбэк
+                label = f"{strat_counter}-е STRAT"
 
         lines.append(
             f"• {label}: {fmt(price)} "
@@ -467,9 +455,6 @@ def render_hedge_preview_block(
     lots_leg: float,
     leg_usd: float,
 ) -> str:
-    """
-    Формат ровно как в примере
-    """
     L = max(1, int(getattr(pos, "leverage", 1) or 1))
     used0 = _pos_total_margin(pos)
     eq0 = equity_at_price(pos, pos.avg, bank, fees_est)
@@ -677,15 +662,11 @@ def _last_confirmed_fractals(fr_up: pd.Series, fr_dn: pd.Series) -> tuple[float 
 
 
 def _two_tacticals_between(hc_px: float, strat1: float, side: str, tick: float) -> list[float]:
-    """
-    Делим отрезок HC ↔ STRAT#1 на 2 тактики, с соблюдением зазоров.
-    """
     gap_hc = max(tick * CONFIG.DCA_MIN_GAP_TICKS, hc_px * CONFIG.MIN_SPACING_PCT)
     gap_s1 = max(tick * CONFIG.DCA_MIN_GAP_TICKS, strat1 * CONFIG.MIN_SPACING_PCT)
     dist = abs(hc_px - strat1)
     min_total = gap_hc + gap_s1
 
-    # Совсем узкий коридор – одна тактика по центру
     if dist <= min_total + tick:
         mid = hc_px + 0.5 * (strat1 - hc_px)
         mid = quantize_to_tick(mid, tick)
@@ -708,9 +689,6 @@ def _two_tacticals_between(hc_px: float, strat1: float, side: str, tick: float) 
 
 
 def _tactical_between(hc_px: float, strat1: float, side: str, tick: float) -> float:
-    """
-    Берём середину между HC и STRAT#1 и соблюдаем 0.35% до обеих точек.
-    """
     if side == "LONG":
         mid = hc_px + 0.5 * (strat1 - hc_px)
         min_gap = max(tick * CONFIG.DCA_MIN_GAP_TICKS, hc_px * CONFIG.MIN_SPACING_PCT)
@@ -734,10 +712,6 @@ def build_targets_with_tactical(
     bank: float,
     fees_est: float,
 ) -> list[dict]:
-    """
-    (PATCH 2)
-    Строит список целей: [TAC1, TAC2] + [STRAT 33/66/100].
-    """
     base_for_strat = float(close_px)
     strat = auto_strat_targets_with_ml_buffer(
         pos, rng_strat, entry=base_for_strat, tick=tick, bank=bank, fees_est=fees_est
@@ -747,7 +721,6 @@ def build_targets_with_tactical(
 
     strat1 = strat[0]["price"]
 
-    # 2) TAC (ручной или авто)
     if pos.manual_tac_price is not None and pos.manual_tac2_price is not None:
         tac_candidates = [
             quantize_to_tick(pos.manual_tac_price, tick),
@@ -764,7 +737,6 @@ def build_targets_with_tactical(
     else:
         tac_candidates = _two_tacticals_between(close_px, strat1, pos.side, tick)
 
-    # 3) Антислипание для авто-режима
     if pos.manual_tac_price is None:
         gap_hc = max(tick * CONFIG.DCA_MIN_GAP_TICKS, close_px * CONFIG.MIN_SPACING_PCT)
         gap_s1 = max(tick * CONFIG.DCA_MIN_GAP_TICKS, strat1 * CONFIG.MIN_SPACING_PCT)
@@ -806,7 +778,6 @@ def build_targets_with_tactical(
 
         tac_candidates = final_tacs
 
-    # 4) Формируем список целей
     tacs_out: list[dict] = []
     if len(tac_candidates) == 1:
         tacs_out.append({"price": tac_candidates[0], "label": "TAC"})
@@ -814,7 +785,6 @@ def build_targets_with_tactical(
         tacs_out.append({"price": tac_candidates[0], "label": "TAC #1"})
         tacs_out.append({"price": tac_candidates[1], "label": "TAC #2"})
 
-    # FIX 3.2 + улучшение: если так и не влезло ничего, но реально есть место по и тикам, и по процентам — ставим 1
     if not tacs_out:
         gap_hc = max(tick * CONFIG.DCA_MIN_GAP_TICKS, close_px * CONFIG.MIN_SPACING_PCT)
         gap_s1 = max(tick * CONFIG.DCA_MIN_GAP_TICKS, strat1 * CONFIG.MIN_SPACING_PCT)
@@ -1016,9 +986,6 @@ async def plan_extension_after_break(
     px: float,
     tick: float,
 ) -> list[dict]:
-    """
-    Дорисовывает оставшиеся обычные уровни после подтверждённого пробоя STRAT.
-    """
     used_ord = pos.steps_filled - (1 if pos.reserve_used else 0)
     remaining = max(0, pos.ord_levels - used_ord)
     if remaining <= 0:
@@ -1072,9 +1039,6 @@ async def plan_extension_after_break(
     return already + ext_targets
 
 
-# ---------------------------------------------------------------------------
-# Диапазоны/индикаторы
-# ---------------------------------------------------------------------------
 async def build_range_from_df(df: Optional[pd.DataFrame], min_atr_mult: float):
     if df is None or df.empty:
         return None
@@ -1147,9 +1111,6 @@ def compute_indicators_5m(df: pd.DataFrame) -> dict:
     }
 
 
-# ---------------------------------------------------------------------------
-# STRAT ML-buffer helpers (3% после #3 и пробоя STRAT)
-# ---------------------------------------------------------------------------
 def _break_price_for_side(rng_strat: dict, side: str) -> float:
     up, dn = break_levels(rng_strat)
     return dn if side == "LONG" else up
@@ -1499,9 +1460,6 @@ def _sync_reserve3_flags(pos: "Position"):
             break
 
 
-# ---------------------------------------------------------------------------
-# Состояние позиции
-# ---------------------------------------------------------------------------
 class Position:
     def __init__(
         self,
@@ -1668,9 +1626,6 @@ def _count_tacs(targets: list[dict]) -> int:
     return sum(1 for t in targets if str(t.get("label", "")).upper().startswith("TAC"))
 
 
-# ---------------------------------------------------------------------------
-# Broadcasting helpers
-# ---------------------------------------------------------------------------
 def _make_bcaster(default_chat_id: int | None):
     async def _bc(app, text, target_chat_id=None):
         cid = target_chat_id or default_chat_id
@@ -1700,7 +1655,7 @@ def _wrap_broadcast(bc, default_chat_id: int | None):
 
 
 # ---------------------------------------------------------------------------
-# HEDGE helpers (состояние и расчёты)
+# HEDGE helpers
 # ---------------------------------------------------------------------------
 def planned_hc_price(entry: float, tac_lo: float, tac_hi: float, bias: str, mode: str, tick: float) -> float:
     if mode == "trend":
@@ -1975,7 +1930,7 @@ def clip_targets_by_ml(
 
 
 # ---------------------------------------------------------------------------
-# Main Loop helpers
+# Служебные штуки цикла: m15, ручные команды
 # ---------------------------------------------------------------------------
 async def _m15_state_step(b: dict, symbol: str, say):
     try:
@@ -2041,10 +1996,9 @@ async def _handle_manual_commands(
     rng_strat: dict,
     _alloc_bank,
 ):
-    _ = _alloc_bank  # чтобы сигнатуру не менять
+    _ = _alloc_bank
     pos: Position | None = b.get("position")
 
-    # /force_close
     if pos and b.get("force_close"):
         if (not pos) or pos.steps_filled <= 0 or (b.get("fsm_state") not in (int(FSM.OPENED), int(FSM.MANAGING))):
             return
@@ -2223,161 +2177,282 @@ async def _handle_manual_commands(
             f"(Осталось: {planned_now} из 3)"
         )
 
+
 # ---------------------------------------------------------------------------
-# ================  ЭКСПОРТ ДЛЯ TELEGRAM-БОТА  ==============================
+# === ВАЖНАЯ ЧАСТЬ, КОТОРОЙ У ТЕБЯ НЕ ХВАТАЛО ===
 # ---------------------------------------------------------------------------
 
-# куда складываем asyncio.Task-и
-TASKS_KEY = "scan_tasks"
+def _ns(chat_id: int, symbol: str) -> str:
+    return f"{chat_id}:{symbol.upper()}"
 
 
-def _ns(symbol: str, chat_id):
-    """Единый ключ для bot_data: EURUSD|<chat_id>"""
-    from inspect import isclass  # на всякий случай, если кто-то передаст объект
-    s = _norm_symbol(symbol)
-    return f"{s}|{chat_id or 'default'}"
-
-
-async def _scanner_loop(app, broadcaster, *, symbol: str, chat_id=None, botbox: dict | None = None):
+async def _scanner_main(app, ns_key: str):
     """
-    Реальный рабочий цикл сканера.
-    Тут мы можем пользоваться ВСЕМ, что ты выше уже написал: build_ranges, fetch_ohlcv,
-    _update_status_snapshot, Position и т.д.
+    Главный цикл сканера. Здесь мы:
+    - тянем цены
+    - пересчитываем диапазоны
+    - проверяем вход по TAC 30/70
+    - если надо — строим хедж и шлём такой же репорт, как у тебя на старом скрине
+    - обрабатываем флаги из команд
     """
-    ns_key = _ns(symbol, chat_id)
+    bot_data = app.bot_data
+    box = bot_data[BOXES_KEY][ns_key]
+    chat_id = box["chat_id"]
+    symbol = box["symbol"]
+    say = _wrap_broadcast(_make_bcaster(chat_id), chat_id)
 
-    # box — это то, что потом /status читает из app.bot_data[ns_key]
-    if botbox is None:
-        botbox = app.bot_data.setdefault(ns_key, {})
+    tick = default_tick(symbol)
+    if not tick:
+        tick = 0.0001
 
-    # инициализация дефолтов
-    bank_target = float(botbox.get("safety_bank_usdt") or CONFIG.SAFETY_BANK_USDT)
-    botbox.setdefault("bank_target_usdt", bank_target)
-    botbox.setdefault("bank_fact_usdt", bank_target)
-    botbox.setdefault("scan_paused", False)
-    botbox.setdefault("symbol", symbol)
+    await say(f"⚙️ Сканер для <b>{symbol}</b> запущен.")
 
-    # broadcaster мы раньше оборачивали try/except — сделаем и тут
-    say = _wrap_broadcast(broadcaster, chat_id)
+    # Первичная подкачка диапазонов
+    rng_strat, rng_tac = await build_ranges(symbol)
+    box["rng_strat"] = rng_strat
+    box["rng_tac"] = rng_tac
+    box["last_ranges_ts"] = time.time()
+    box["m15_state"] = {}
+    box["m15_sig"] = {}
+    box.setdefault("user_manual_mode", False)
+    box.setdefault("fsm_state", int(FSM.IDLE))
+    box.setdefault("position", None)
 
-    await say(app, f"✅ сканер по <b>{_norm_symbol(symbol)}</b> запущен.")
+    bank = float(box.get("bank_usd", CONFIG.SAFETY_BANK_USDT))
 
-    try:
-        last_ranges_ts = 0.0
-        rng_strat = None
-        rng_tac = None
+    # Сразу покажем то, что ты видишь на скрине
+    if rng_strat and rng_tac:
+        tac_lo = rng_tac["lower"]
+        tac_hi = rng_tac["upper"]
+        tac_w = tac_hi - tac_lo
+        long_thr = quantize_to_tick(tac_lo + tac_w * 0.30, tick)
+        short_thr = quantize_to_tick(tac_lo + tac_w * 0.70, tick)
+        brk_up, brk_dn = break_levels(rng_strat)
+        await say(
+            "🎯 Пороги входа (TAC 30/70): "
+            f"LONG ≤ <b>{fmt(long_thr)}</b>, SHORT ≥ <b>{fmt(short_thr)}</b>\n"
+            "🧪 Диапазоны:\n"
+            f"• STRAT: [{fmt(rng_strat['lower'])} … {fmt(rng_strat['upper'])}] w={rng_strat['width']:.5f}\n"
+            f"• TAC (3d): [{fmt(tac_lo)} … {fmt(tac_hi)}] w={tac_w:.5f} (≈{tac_w / max(rng_strat['width'],1e-9):.0%} от STRAT)\n"
+            f"🔐 Пробой STRAT: ↑{fmt(brk_up)} | ↓{fmt(brk_dn)}"
+        )
 
-        while True:
-            now = time.time()
-
-            # 1) раз в N минут перестраиваем диапазоны
-            if now - last_ranges_ts >= CONFIG.REBUILD_RANGE_EVERY_MIN * 60 or rng_strat is None:
-                try:
-                    rng_strat, rng_tac = await build_ranges(symbol)
-                except Exception:
-                    log.exception("range build failed")
-                    rng_strat, rng_tac = None, None
-                else:
-                    last_ranges_ts = now
-
-            # 2) тянем быструю цену (1–3 свечи хватит)
+    # основной цикл
+    while not box.get("stop_flag"):
+        # 1. обновление диапазонов раз в N минут
+        now = time.time()
+        if now - box.get("last_ranges_ts", 0) >= CONFIG.REBUILD_TACTICAL_EVERY_MIN * 60:
             try:
-                df_fast = await maybe_await(fetch_ohlcv, symbol, CONFIG.TF_ENTRY, 3)
-                if df_fast is not None and not df_fast.empty:
-                    px = float(df_fast["close"].iloc[-1])
-                else:
-                    px = None
-            except Exception:
-                log.exception("fast price fetch failed")
-                px = None
+                rng_strat, rng_tac = await build_ranges(symbol)
+                box["rng_strat"] = rng_strat
+                box["rng_tac"] = rng_tac
+                box["last_ranges_ts"] = now
+            except Exception as e:
+                log.exception("rebuild ranges failed")
+                await say(f"⚠️ Не удалось обновить диапазоны: {e}")
 
-            # 3) можно было бы тут обновлять позицию/трэйлинг/доборы —
-            #    но у тебя вверху уже есть жирные функции для этого.
-            #    Чтобы бот сейчас не падал — просто обновим статус.
+        rng_strat = box.get("rng_strat")
+        rng_tac = box.get("rng_tac")
+
+        # 2. тянем текущую цену (5m хватит)
+        try:
+            df_entry = await maybe_await(fetch_ohlcv, symbol, CONFIG.TF_ENTRY, 5)
+            if df_entry is None or df_entry.empty:
+                raise RuntimeError("нет данных по символу")
+            last_row = df_entry.iloc[-1]
+            px = float(last_row["close"])
+        except Exception as e:
+            log.exception("price fetch failed")
+            await say(f"⚠️ Ошибка получения цены: {e}")
+            await asyncio.sleep(5)
+            continue
+
+        box["last_px"] = px
+
+        # 3. M15-сигналы
+        await _m15_state_step(box, symbol, lambda text: say(text))
+
+        # 4. если есть позиция — обрабатываем ручные команды
+        if rng_strat:
+            await _handle_manual_commands(
+                box,
+                symbol,
+                lambda text: say(text),
+                px,
+                tick,
+                bank,
+                rng_strat,
+                None,
+            )
+
+        pos: Position | None = box.get("position")
+
+        # 5. если позиции нет и не стоит ручной режим — проверяем вход
+        if pos is None and not box.get("user_manual_mode", False) and rng_tac and rng_strat:
+            tac_lo = rng_tac["lower"]
+            tac_hi = rng_tac["upper"]
+            tac_w = tac_hi - tac_lo
+            long_thr = quantize_to_tick(tac_lo + tac_w * 0.30, tick)
+            short_thr = quantize_to_tick(tac_lo + tac_w * 0.70, tick)
+
+            # на экране у тебя: "Текущая: ..., до LONG: 0, до SHORT: ..."
+            dist_long = max(0.0, long_thr - px)
+            dist_short = max(0.0, px - short_thr)
+            pct_to_short = (dist_short / px) * 100.0 if px else 0.0
+
+            await say(
+                f"Текущая: <b>{fmt(px)}</b>. "
+                f"До LONG: {fmt(dist_long)} ({(dist_long/px*100 if px else 0):.2f}%), "
+                f"до SHORT: {fmt(dist_short)} ({pct_to_short:.2f}%)."
+            )
+
+            # --- вход по нижней границе (LONG-бейс, как на твоём скрине) ---
+            if px <= long_thr + tick * CONFIG.WICK_HYST_TICKS:
+                # мы в нижней части → хотим оставить LONG
+                bias = "LONG"
+                leg_margin_init = bank * CONFIG.INITIAL_HEDGE_FRACTION
+                leg_margin, pos_new, targets_new, fees_est = _fit_leg_with_equalization(
+                    symbol,
+                    leg_margin_init,
+                    remain_side=bias,
+                    entry_px=px,
+                    close_px=planned_hc_price(px, tac_lo, tac_hi, bias, CONFIG.HEDGE_MODE, tick),
+                    bank=bank,
+                    rng_strat=rng_strat,
+                    tick=tick,
+                    growth=CONFIG.GROWTH_AFTER_HEDGE,
+                )
+                # подрежем по ML
+                pos_new.ordinary_targets = clip_targets_by_ml(pos_new, bank, fees_est, targets_new, tick)
+                box["position"] = pos_new
+                box["fsm_state"] = int(FSM.MANAGING)
+
+                lots_leg = margin_to_lots(symbol, leg_margin, price=px, leverage=pos_new.leverage)
+                hc_price = pos_new.hedge_close_px
+                levels_block = render_hedge_preview_block(
+                    symbol,
+                    pos_new,
+                    bank,
+                    fees_est,
+                    tick,
+                    hc_price,
+                    lots_leg,
+                    leg_margin,
+                )
+
+                await say(
+                    "🧱 <b>HEDGE OPEN [SHORT]</b>\n"
+                    f"Цена: <code>{fmt(px)}</code> | Обе ноги по <b>{lots_leg:.2f}</b> lot\n"
+                    f"Депозит (суммарно): <b>{leg_margin*2:.2f} USD</b> (по {leg_margin:.2f} на ногу)\n"
+                    f"{levels_block}"
+                )
+
+        # 6. если позиция есть — пока просто обновим статус (в боевой можно дорасти до полного менеджмента)
+        pos = box.get("position")
+        if pos is not None:
+            cum_margin = _pos_total_margin(pos)
+            fees_est = (cum_margin * pos.leverage) * CONFIG.FEE_TAKER * CONFIG.LIQ_FEE_BUFFER
             _update_status_snapshot(
-                botbox,
+                box,
                 symbol=symbol,
-                bank_fact=botbox.get("bank_fact_usdt", bank_target),
-                bank_target=botbox.get("bank_target_usdt", bank_target),
-                pos=botbox.get("position"),              # если сверху кто-то положит Position — /status его покажет
-                scan_paused=botbox.get("scan_paused", False),
+                bank_fact=bank,
+                bank_target=bank,
+                pos=pos,
+                scan_paused=False,
                 rng_strat=rng_strat,
                 rng_tac=rng_tac,
             )
+            # можно раскомментировать, если хочется спама каждые 3 сек
+            # await say(box["status_line"])
 
-            # 4) иногда дадим сигнал по 15m-фракталам — у тебя есть готовый код
-            if "m15_state" not in botbox:
-                botbox["m15_state"] = {}
-            if "m15_sig" not in botbox:
-                botbox["m15_sig"] = {}
-            await _m15_state_step(botbox, symbol, lambda text: say(app, text, target_chat_id=chat_id))
+        await asyncio.sleep(CONFIG.SCAN_INTERVAL_SEC)
 
-            # 5) пауза цикла
-            await asyncio.sleep(CONFIG.SCAN_INTERVAL_SEC)
-
-    except asyncio.CancelledError:
-        # нас попросили /stop — надо красиво выйти
-        await say(app, f"🛑 сканер по <b>{_norm_symbol(symbol)}</b> остановлен.")
-        raise
-    except Exception:
-        log.exception("scanner loop crashed")
-        await say(app, f"❌ сканер по <b>{_norm_symbol(symbol)}</b> упал, см. логи.")
-        raise
+    # если вышли из цикла — сканер остановлен
+    await say(f"⏹ Сканер для {symbol} остановлен.")
 
 
-async def start_scanner_for_pair(app, broadcaster, *, symbol: str, chat_id=None, botbox: dict | None = None):
+# ---------------------------------------------------------------------------
+# === ПУБЛИЧНЫЕ ФУНКЦИИ, КОТОРЫЕ ЖДЁТ main.py ===
+# ---------------------------------------------------------------------------
+async def start_scanner_for_pair(app, chat_id: int, symbol: str):
     """
-    Это и вызывает /run SYMBOL
+    Запустить / перезапустить сканер по паре в конкретном чате.
+    main.py обычно вызывает это из /run
     """
-    tasks: dict = app.bot_data.setdefault(TASKS_KEY, {})
-    ns_key = _ns(symbol, chat_id)
+    symbol = symbol.upper()
+    ns_key = _ns(chat_id, symbol)
 
-    # уже запущен — просто скажем об этом
+    bot_data = app.bot_data
+    bot_data.setdefault(TASKS_KEY, {})
+    bot_data.setdefault(BOXES_KEY, {})
+    bot_data.setdefault(BANKS_KEY, {})
+
+    # банк main, скорее всего, кладёт по ключу "chat:symbol"
+    bank_key = f"{chat_id}:{symbol}"
+    bank = float(bot_data[BANKS_KEY].get(bank_key, CONFIG.SAFETY_BANK_USDT))
+
+    # если уже бежит — не дублируем
+    task = bot_data[TASKS_KEY].get(ns_key)
+    if task and not task.done():
+        return
+
+    # создаём коробку для этого сканера
+    box = {
+        "chat_id": chat_id,
+        "symbol": symbol,
+        "bank_usd": bank,
+        "stop_flag": False,
+        "user_manual_mode": False,
+        "fsm_state": int(FSM.IDLE),
+        "position": None,
+        "m15_state": {},
+        "m15_sig": {},
+    }
+    bot_data[BOXES_KEY][ns_key] = box
+
+    # запускаем задачу
+    task = app.create_task(_scanner_main(app, ns_key))
+    bot_data[TASKS_KEY][ns_key] = task
+
+
+async def stop_scanner_for_pair(app, chat_id: int, symbol: str):
+    """
+    Остановить сканер. main.py, скорее всего, вызывает из /stop
+    """
+    symbol = symbol.upper()
+    ns_key = _ns(chat_id, symbol)
+    bot_data = app.bot_data
+    tasks = bot_data.get(TASKS_KEY, {})
+    boxes = bot_data.get(BOXES_KEY, {})
+
+    box = boxes.get(ns_key)
+    if box:
+        box["stop_flag"] = True
+
     task = tasks.get(ns_key)
     if task and not task.done():
-        return f"ℹ️ сканер по { _norm_symbol(symbol) } уже запущен."
-
-    # если botbox не передали — возьмём из bot_data
-    if botbox is None:
-        botbox = app.bot_data.setdefault(ns_key, {})
-
-    # стартуем настоящий цикл
-    loop_task = asyncio.create_task(
-        _scanner_loop(app, broadcaster, symbol=symbol, chat_id=chat_id, botbox=botbox),
-        name=f"scan-{ns_key}",
-    )
-    tasks[ns_key] = loop_task
-    return f"✅ сканер по { _norm_symbol(symbol) } запущен."
-
-
-async def stop_scanner_for_pair(app, *, symbol: str, chat_id=None, hard: bool = False):
-    """
-    Это и вызывает /stop SYMBOL [hard]
-    """
-    tasks: dict = app.bot_data.setdefault(TASKS_KEY, {})
-    ns_key = _ns(symbol, chat_id)
-    task: asyncio.Task | None = tasks.get(ns_key)
-
-    if not task:
-        return f"ℹ️ сканер по { _norm_symbol(symbol) } не запущен."
-
-    # мягко отменяем
-    task.cancel()
-    try:
-        await task
-    except asyncio.CancelledError:
-        pass
-
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
     tasks.pop(ns_key, None)
-    # можно почистить статус, но лучше оставить — /status после stop что-то покажет
-    return f"🛑 сканер по { _norm_symbol(symbol) } остановлен."
+    boxes.pop(ns_key, None)
 
 
-def is_scanner_running(app, symbol: str, chat_id=None) -> bool:
+def is_scanner_running(app, chat_id: int, symbol: str) -> bool:
     """
-    Проверка для /run — чтобы не стартовать второй раз
+    Вернёт True, если по этой паре в этом чате сейчас крутится цикл
     """
-    tasks: dict = app.bot_data.get(TASKS_KEY, {})
-    ns_key = _ns(symbol, chat_id)
+    symbol = symbol.upper()
+    ns_key = _ns(chat_id, symbol)
+    tasks = app.bot_data.get(TASKS_KEY, {})
     task = tasks.get(ns_key)
     return bool(task and not task.done())
+
+
+__all__ = [
+    "start_scanner_for_pair",
+    "stop_scanner_for_pair",
+    "is_scanner_running",
+]
