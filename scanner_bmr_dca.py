@@ -2023,6 +2023,64 @@ async def _handle_manual_commands(
     _ = _alloc_bank
     pos: Position | None = b.get("position")
 
+    # --- ВОТ ЭТОТ БЛОК ТЫ ПРЕДЛОЖИЛ (он абсолютно верный) ---
+    # --- НОВОЕ: обработка /hedge_flip и /hedge_close ---
+    # если позиция есть и это позиция "из хеджа" – пересобрать план
+    pending_bias = b.pop("pending_hedge_bias", None)
+    pending_hc = b.pop("pending_hc_price", None)
+
+    if pos and pos.from_hedge and (pending_bias or pending_hc):
+        # 1. что у нас уже есть
+        entry_px = pos.hedge_entry_px or pos.avg or px
+        old_close = pos.hedge_close_px or pos.avg or px
+        leg_margin = float(pos.step_margins[0])  # первую ступень НЕ меняем
+        remain_side = pending_bias or pos.side   # если flip – берём новое, иначе старое
+        new_close = float(pending_hc) if pending_hc is not None else old_close
+
+        # 2. пересобираем позицию ТЕМ ЖЕ банком
+        new_pos, new_targets, fees_est = _plan_with_leg(
+            symbol=symbol,
+            leg_margin=leg_margin,
+            remain_side=remain_side,
+            entry_px=entry_px,
+            close_px=new_close,
+            bank=bank,
+            rng_strat=rng_strat,
+            tick=tick,
+            growth=CONFIG.GROWTH_AFTER_HEDGE,
+        )
+
+        # 3. подрезаем по ML и синкаем reserve3
+        new_pos.ordinary_targets = clip_targets_by_ml(new_pos, bank, fees_est, new_targets, tick)
+        _sync_reserve3_flags(new_pos)
+
+        # 4. сохраняем
+        b["position"] = new_pos
+        b["fsm_state"] = int(FSM.MANAGING)
+
+        # 5. и вот ЭТО сообщение, которое ты сейчас не получаешь
+        lots_leg = margin_to_lots(symbol, leg_margin, price=entry_px, leverage=new_pos.leverage)
+        levels_block = render_hedge_preview_block(
+            symbol,
+            new_pos,
+            bank,
+            fees_est,
+            tick,
+            new_close,
+            lots_leg,
+            leg_margin,
+        )
+
+        await say(
+            "♻️ План после ручного изменения хеджа\n"
+            f"Bias: <b>{remain_side}</b>\n"
+            f"HC: <code>{fmt(new_close)}</code>\n"
+            f"{levels_block}"
+        )
+        # на этом можно завершить обработчик, чтобы ниже не сработали другие ветки
+        return
+    # --- КОНЕЦ НОВОГО БЛОКА ---
+
     if pos and b.get("force_close"):
         if (not pos) or pos.steps_filled <= 0 or (b.get("fsm_state") not in (int(FSM.OPENED), int(FSM.MANAGING))):
             return
@@ -2513,6 +2571,10 @@ async def start_scanner_for_pair(app, *args, **kwargs):
         "m15_state": {},
         "m15_sig": {},
         "say": say,
+        
+        # 👇 ИСПРАВЛЕНИЕ (ДОБАВЛЕНО)
+        "pending_hedge_bias": None,  # "LONG" / "SHORT"
+        "pending_hc_price": None,    # float
     }
     bot_data[BOXES_KEY][ns_key] = box
 
