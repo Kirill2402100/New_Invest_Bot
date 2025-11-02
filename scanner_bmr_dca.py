@@ -135,6 +135,11 @@ def ta_supertrend(
 class CONFIG:
     # тип логики хеджа
     HEDGE_MODE = "trend"  # "revert" или "trend"
+    
+    # --- ИСПРАВЛЕНИЕ 2 ---
+    # насколько внутрь TAC закрываем хедж (в долях ширины TAC)
+    HEDGE_CLOSE_FRAC = 0.15  # 15% как в твоём примере: 2п из 13п
+    # ---------------------
 
     # Пара по умолчанию
     SYMBOL = "USDJPY"
@@ -969,7 +974,7 @@ def _is_df_fresh(df: pd.DataFrame, max_age_min: int = 15) -> bool:
         idx = df.index
         last_ts = idx[-1].to_pydatetime() if hasattr(idx[-1], "to_pydatetime") else None
         if last_ts is None and "time" in df.columns:
-            last_ts = pd.to_datetime(df["time"].iloc[-1]).to_pydatetime()
+            last_ts = pd.to_datetime(df["time"].iloc[-1]).to_pydatETIME()
         if last_ts is None:
             return True
         age_min = (datetime.utcnow() - last_ts.replace(tzinfo=None)).total_seconds() / 60.0
@@ -1657,13 +1662,22 @@ def _make_say(app, default_chat_id: int | None):
 # ---------------------------------------------------------------------------
 # HEDGE helpers
 # ---------------------------------------------------------------------------
-def planned_hc_price(entry: float, tac_lo: float, tac_hi: float, bias: str, mode: str, tick: float) -> float:
-    if mode == "trend":
-        span = float(tac_hi) - float(tac_lo)
-        px = entry + span if bias == "LONG" else entry - span
+
+# --- ИСПРАВЛЕНИЕ 2 ---
+# Логика закрытия хеджа теперь "внутрь" диапазона
+def planned_hc_price(entry: float, tac_lo: float, tac_hi: float,
+                     bias: str, mode: str, tick: float) -> float:
+    span = float(tac_hi) - float(tac_lo)
+
+    # мы внизу и хотим оставить LONG → закрываемся ЧУТЬ НИЖЕ входа (внутрь)
+    if bias == "LONG":
+        px = entry - span * CONFIG.HEDGE_CLOSE_FRAC
     else:
-        px = tac_hi if bias == "LONG" else tac_lo
+        # мы вверху и хотим оставить SHORT → закрываемся чуть ВЫШЕ входа (внутрь)
+        px = entry + span * CONFIG.HEDGE_CLOSE_FRAC
+
     return quantize_to_tick(px, tick)
+# ---------------------
 
 
 def _sum_first_n(lst: list[float], n: int) -> float:
@@ -1920,8 +1934,18 @@ def clip_targets_by_ml(
         ml_guard = ml_price_at(tmp, CONFIG.ML_TARGET_PCT, bank, fees_est)
         if np.isnan(ml_guard):
             break
-        buf = max(1, int(safety_ticks_eff)) * tick
-        ok = (price > ml_guard + buf) if pos.side == "LONG" else (price < ml_guard - buf)
+        
+        # --- ИСПРАВЛЕНИЕ 3 ---
+        # Ослабляем проверку для TAC-уровней
+        is_tac = str(t.get("label", "")).upper().startswith("TAC")
+        if is_tac:
+            safety = tick * max(1, safety_ticks_eff // 2)  # для TAC уменьшаем буфер
+        else:
+            safety = tick * max(1, safety_ticks_eff)
+
+        ok = (price > ml_guard + safety) if pos.side == "LONG" else (price < ml_guard - safety)
+        # ---------------------
+        
         if not ok:
             break
         out.append(t)
@@ -2200,11 +2224,9 @@ async def _scanner_main(app, ns_key: str):
     chat_id = box["chat_id"]
     symbol = box["symbol"]
     
-    # --- ИСПРАВЛЕНИЕ ---
     # say теперь берётся из box'а, куда его положил start_scanner_for_pair
     # или создаётся заново, если его там нет.
     say = box.get("say") or _make_say(app, chat_id)
-    # -------------------
 
     tick = default_tick(symbol)
     if not tick:
@@ -2223,7 +2245,14 @@ async def _scanner_main(app, ns_key: str):
     box.setdefault("fsm_state", int(FSM.IDLE))
     box.setdefault("position", None)
 
+    # --- ИСПРАВЛЕНИЕ 1 ---
+    # Обновляем банк из bot_data при старте цикла
+    banks = app.bot_data.get(BANKS_KEY, {})
+    fresh_bank = banks.get(ns_key) # ns_key - это УЖЕ _ns(chat_id, symbol)
+    if fresh_bank is not None:
+        box["bank_usd"] = float(fresh_bank)
     bank = float(box.get("bank_usd", CONFIG.SAFETY_BANK_USDT))
+    # ---------------------
 
     # Сразу покажем то, что ты видишь на скрине
     if rng_strat and rng_tac:
@@ -2277,6 +2306,15 @@ async def _scanner_main(app, ns_key: str):
         # 3. M15-сигналы
         await _m15_state_step(box, symbol, lambda text: say(text))
 
+        # --- ИСПРАВЛЕНИЕ 1 (повтор) ---
+        # Обновляем банк перед каждой проверкой входа / ручными командами
+        banks = app.bot_data.get(BANKS_KEY, {})
+        fresh_bank = banks.get(ns_key)
+        if fresh_bank is not None:
+            box["bank_usd"] = float(fresh_bank)
+        bank = float(box.get("bank_usd", CONFIG.SAFETY_BANK_USDT))
+        # -----------------------------
+
         # 4. если есть позиция — обрабатываем ручные команды
         if rng_strat:
             await _handle_manual_commands(
@@ -2321,7 +2359,10 @@ async def _scanner_main(app, ns_key: str):
                     leg_margin_init,
                     remain_side=bias,
                     entry_px=px,
+                    # --- ИСПРАВЛЕНИЕ 2 (применение) ---
+                    # Используем новую логику цены закрытия
                     close_px=planned_hc_price(px, tac_lo, tac_hi, bias, CONFIG.HEDGE_MODE, tick),
+                    # ----------------------------------
                     bank=bank,
                     rng_strat=rng_strat,
                     tick=tick,
@@ -2446,14 +2487,14 @@ async def start_scanner_for_pair(app, *args, **kwargs):
     bot_data.setdefault(BOXES_KEY, {})
     bot_data.setdefault(BANKS_KEY, {})
 
+    # --- ИСПРАВЛЕНИЕ 1 ---
     # банк, который ты задаёшь командой /setbank SYMBOL 20000
-    bank_key = f"{chat_id}:{symbol}"
-    bank = float(bot_data[BANKS_KEY].get(bank_key, CONFIG.SAFETY_BANK_USDT))
+    # Читаем по ns_key, а не по старому f-string
+    bank = float(bot_data[BANKS_KEY].get(ns_key, CONFIG.SAFETY_BANK_USDT))
+    # ---------------------
     
-    # --- ИСПРАВЛЕНИЕ ---
     # Создаём 'say' здесь, чтобы передать его в box
     say = _make_say(app, chat_id)
-    # -------------------
 
     # уже бежит?
     task = bot_data[TASKS_KEY].get(ns_key)
@@ -2464,14 +2505,14 @@ async def start_scanner_for_pair(app, *args, **kwargs):
     box = {
         "chat_id": chat_id,
         "symbol": symbol,
-        "bank_usd": bank,
+        "bank_usd": bank, # <-- ИСПРАВЛЕНИЕ 1: здесь будет 20000
         "stop_flag": False,
         "user_manual_mode": False,
         "fsm_state": int(FSM.IDLE),
         "position": None,
         "m15_state": {},
         "m15_sig": {},
-        "say": say,  # <-- ИСПРАВЛЕНИЕ: кладём say в box
+        "say": say,
     }
     bot_data[BOXES_KEY][ns_key] = box
 
