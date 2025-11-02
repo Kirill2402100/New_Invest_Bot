@@ -24,9 +24,9 @@ logging.getLogger("fx_feed").setLevel(logging.WARNING)
 # Регистр для задач сканеров в рамках Telegram-приложения
 # main.py ожидает, что в bot_data будет храниться это
 # ---------------------------------------------------------------------------
-TASKS_KEY = "scan_tasks"           # app.bot_data[TASKS_KEY] -> dict[ns_key] = asyncio.Task
-BOXES_KEY = "scan_boxes"           # app.bot_data[BOXES_KEY] -> dict[ns_key] = dict(...)
-BANKS_KEY = "scan_banks"           # app.bot_data[BANKS_KEY] -> dict["chat:symbol"] = float
+TASKS_KEY = "scan_tasks"        # app.bot_data[TASKS_KEY] -> dict[ns_key] = asyncio.Task
+BOXES_KEY = "scan_boxes"        # app.bot_data[BOXES_KEY] -> dict[ns_key] = dict(...)
+BANKS_KEY = "scan_banks"        # app.bot_data[BANKS_KEY] -> dict["chat:symbol"] = float
 
 
 # --- Status snapshot helper (для /status)
@@ -1626,32 +1626,32 @@ def _count_tacs(targets: list[dict]) -> int:
     return sum(1 for t in targets if str(t.get("label", "")).upper().startswith("TAC"))
 
 
-def _make_bcaster(default_chat_id: int | None):
-    async def _bc(app, text, target_chat_id=None):
+# ---------------------------------------------------------------------------
+# Broadcasting helpers (FIXED)
+# ---------------------------------------------------------------------------
+import logging
+log = logging.getLogger("bmr_dca_engine")
+
+
+def _make_say(app, default_chat_id: int | None):
+    """
+    Возвращает функцию, которую можно вызывать просто так:
+        await say("текст")
+    или
+        await say("текст", target_chat_id=...)
+    Никаких app внутрь больше передавать не надо.
+    """
+    async def say(text: str, target_chat_id: int | None = None):
         cid = target_chat_id or default_chat_id
         if cid is None:
-            log.warning("[broadcast-fallback] No chat id, message dropped")
+            log.warning("[broadcast] no chat_id, msg=%r", text)
             return
         try:
             await app.bot.send_message(chat_id=cid, text=text, parse_mode="HTML")
         except Exception as e:
-            log.error(f"[broadcast-fallback] send failed: {e}")
+            log.error("[broadcast] send failed: %s", e)
 
-    return _bc
-
-
-def _wrap_broadcast(bc, default_chat_id: int | None):
-    async def _wb(app, text, target_chat_id=None):
-        try:
-            return await bc(app, text, target_chat_id=target_chat_id or default_chat_id)
-        except TypeError:
-            return await bc(app, text)
-        except Exception as e:
-            log.error(f"[broadcast wrapper] falling back: {e}")
-            fb = _make_bcaster(default_chat_id)
-            return await fb(app, text, target_chat_id=target_chat_id)
-
-    return _wb
+    return say
 
 
 # ---------------------------------------------------------------------------
@@ -2199,7 +2199,12 @@ async def _scanner_main(app, ns_key: str):
     box = bot_data[BOXES_KEY][ns_key]
     chat_id = box["chat_id"]
     symbol = box["symbol"]
-    say = _wrap_broadcast(_make_bcaster(chat_id), chat_id)
+    
+    # --- ИСПРАВЛЕНИЕ ---
+    # say теперь берётся из box'а, куда его положил start_scanner_for_pair
+    # или создаётся заново, если его там нет.
+    say = box.get("say") or _make_say(app, chat_id)
+    # -------------------
 
     tick = default_tick(symbol)
     if not tick:
@@ -2372,97 +2377,6 @@ async def _scanner_main(app, ns_key: str):
 
 
 # ---------------------------------------------------------------------------
-# === ПУБЛИЧНЫЕ ФУНКЦИИ, КОТОРЫЕ ЖДЁТ main.py ===
-# ---------------------------------------------------------------------------
-
-def _resolve_chat_and_symbol(arg1, arg2):
-    """
-    main.py у тебя, судя по логу, зовёт вот так:
-        start_scanner_for_pair(app, symbol, chat_id)
-        is_scanner_running(app, symbol, chat_id)
-        stop_scanner_for_pair(app, symbol, chat_id)
-
-    а сам модуль я изначально писал под
-        (..., chat_id, symbol)
-
-    Поэтому тут просто определяем, что где.
-    """
-    # вариант 1: (symbol: str, chat_id: int)
-    if isinstance(arg1, str) and isinstance(arg2, int):
-        return arg2, arg1.upper()
-    # вариант 2: (chat_id: int, symbol: str)
-    if isinstance(arg1, int) and isinstance(arg2, str):
-        return arg1, arg2.upper()
-    # если совсем что-то экзотичное — приведём к строке
-    return int(arg1), str(arg2).upper()
-
-
-async def start_scanner_for_pair(app, arg1, arg2):
-    chat_id, symbol = _resolve_chat_and_symbol(arg1, arg2)
-    ns_key = _ns(chat_id, symbol)
-
-    bot_data = app.bot_data
-    bot_data.setdefault(TASKS_KEY, {})
-    bot_data.setdefault(BOXES_KEY, {})
-    bot_data.setdefault(BANKS_KEY, {})
-
-    bank_key = f"{chat_id}:{symbol}"
-    bank = float(bot_data[BANKS_KEY].get(bank_key, CONFIG.SAFETY_BANK_USDT))
-
-    # если уже бежит — просто выходим
-    task = bot_data[TASKS_KEY].get(ns_key)
-    if task and not task.done():
-        return
-
-    box = {
-        "chat_id": chat_id,
-        "symbol": symbol,
-        "bank_usd": bank,
-        "stop_flag": False,
-        "user_manual_mode": False,
-        "fsm_state": int(FSM.IDLE),
-        "position": None,
-        "m15_state": {},
-        "m15_sig": {},
-    }
-    bot_data[BOXES_KEY][ns_key] = box
-
-    task = app.create_task(_scanner_main(app, ns_key))
-    bot_data[TASKS_KEY][ns_key] = task
-
-
-async def stop_scanner_for_pair(app, arg1, arg2):
-    chat_id, symbol = _resolve_chat_and_symbol(arg1, arg2)
-    ns_key = _ns(chat_id, symbol)
-
-    bot_data = app.bot_data
-    tasks = bot_data.get(TASKS_KEY, {})
-    boxes = bot_data.get(BOXES_KEY, {})
-
-    box = boxes.get(ns_key)
-    if box:
-        box["stop_flag"] = True
-
-    task = tasks.get(ns_key)
-    if task and not task.done():
-        task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
-
-    tasks.pop(ns_key, None)
-    boxes.pop(ns_key, None)
-
-
-def is_scanner_running(app, arg1, arg2) -> bool:
-    chat_id, symbol = _resolve_chat_and_symbol(arg1, arg2)
-    ns_key = _ns(chat_id, symbol)
-    tasks = app.bot_data.get(TASKS_KEY, {})
-    task = tasks.get(ns_key)
-    return bool(task and not task.done())
-
-# ---------------------------------------------------------------------------
 # === РЕЕСТРЫ ДЛЯ ЗАДАЧ (если выше в файле их нет, пусть будут тут) =========
 # ---------------------------------------------------------------------------
 TASKS_KEY = globals().get("TASKS_KEY", "scan_tasks")
@@ -2478,8 +2392,8 @@ def _parse_chat_and_symbol(args, kwargs):
     """
     Поддерживаем ВСЕ варианты, которые может прислать main.py:
 
-    1) start_scanner_for_pair(app, "EURUSD", -123456)       # (symbol, chat_id)
-    2) start_scanner_for_pair(app, -123456, "EURUSD")       # (chat_id, symbol)
+    1) start_scanner_for_pair(app, "EURUSD", -123456)      # (symbol, chat_id)
+    2) start_scanner_for_pair(app, -123456, "EURUSD")      # (chat_id, symbol)
     3) start_scanner_for_pair(app, symbol="EURUSD", chat_id=-123456)
     4) start_scanner_for_pair(app, chat_id=-123456, symbol="EURUSD")
 
@@ -2535,6 +2449,11 @@ async def start_scanner_for_pair(app, *args, **kwargs):
     # банк, который ты задаёшь командой /setbank SYMBOL 20000
     bank_key = f"{chat_id}:{symbol}"
     bank = float(bot_data[BANKS_KEY].get(bank_key, CONFIG.SAFETY_BANK_USDT))
+    
+    # --- ИСПРАВЛЕНИЕ ---
+    # Создаём 'say' здесь, чтобы передать его в box
+    say = _make_say(app, chat_id)
+    # -------------------
 
     # уже бежит?
     task = bot_data[TASKS_KEY].get(ns_key)
@@ -2552,6 +2471,7 @@ async def start_scanner_for_pair(app, *args, **kwargs):
         "position": None,
         "m15_state": {},
         "m15_sig": {},
+        "say": say,  # <-- ИСПРАВЛЕНИЕ: кладём say в box
     }
     bot_data[BOXES_KEY][ns_key] = box
 
