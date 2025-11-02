@@ -24,9 +24,9 @@ logging.getLogger("fx_feed").setLevel(logging.WARNING)
 # Регистр для задач сканеров в рамках Telegram-приложения
 # main.py ожидает, что в bot_data будет храниться это
 # ---------------------------------------------------------------------------
-TASKS_KEY = "scan_tasks"        # app.bot_data[TASKS_KEY] -> dict[ns_key] = asyncio.Task
-BOXES_KEY = "scan_boxes"        # app.bot_data[BOXES_KEY] -> dict[ns_key] = dict(...)
-BANKS_KEY = "scan_banks"        # app.bot_data[BANKS_KEY] -> dict["chat:symbol"] = float
+TASKS_KEY = "scan_tasks"      # app.bot_data[TASKS_KEY] -> dict[ns_key] = asyncio.Task
+BOXES_KEY = "scan_boxes"      # app.bot_data[BOXES_KEY] -> dict[ns_key] = dict(...)
+BANKS_KEY = "scan_banks"      # app.bot_data[BANKS_KEY] -> dict["chat:symbol"] = float
 
 
 # --- Status snapshot helper (для /status)
@@ -709,6 +709,10 @@ def _tactical_between(hc_px: float, strat1: float, side: str, tick: float) -> fl
     return quantize_to_tick(p, tick)
 
 
+# ===========================================================================
+# === НАЧАЛО ЗАМЕНЫ build_targets_with_tactical (ИСПРАВЛЕНИЕ 2) ============
+# ===========================================================================
+
 def build_targets_with_tactical(
     pos: "Position",
     rng_strat: dict,
@@ -725,6 +729,7 @@ def build_targets_with_tactical(
         return []
 
     strat1 = strat[0]["price"]
+    tac_candidates = []
 
     if pos.manual_tac_price is not None and pos.manual_tac2_price is not None:
         tac_candidates = [
@@ -742,55 +747,66 @@ def build_targets_with_tactical(
     else:
         tac_candidates = _two_tacticals_between(close_px, strat1, pos.side, tick)
 
-    if pos.manual_tac_price is None:
-        gap_hc = max(tick * CONFIG.DCA_MIN_GAP_TICKS, close_px * CONFIG.MIN_SPACING_PCT)
-        gap_s1 = max(tick * CONFIG.DCA_MIN_GAP_TICKS, strat1 * CONFIG.MIN_SPACING_PCT)
-        dist = abs(close_px - strat1)
-        min_total = gap_hc + gap_s1
+    # --- НАЧАЛО ИСПРАВЛЕНИЯ ---
+    
+    # 1. Логика клиппинга (ограничения) цен.
+    #    Она должна применяться ВСЕГДА (и для ручных, и для авто).
+    
+    gap_hc = max(tick * CONFIG.DCA_MIN_GAP_TICKS, close_px * CONFIG.MIN_SPACING_PCT)
+    gap_s1 = max(tick * CONFIG.DCA_MIN_GAP_TICKS, strat1 * CONFIG.MIN_SPACING_PCT)
+    dist = abs(close_px - strat1)
+    min_total = gap_hc + gap_s1
+    
+    final_tacs = []
 
-        final_tacs = []
-        if len(tac_candidates) == 1:
-            tac_px = tac_candidates[0]
-            if dist <= min_total:
-                w_hc = gap_hc / max(min_total, 1e-12)
-                w_s1 = 1.0 - w_hc
-                gap_hc = max(tick * CONFIG.DCA_MIN_GAP_TICKS, dist * w_hc)
-                gap_s1 = max(tick * CONFIG.DCA_MIN_GAP_TICKS, dist * w_s1)
-            if pos.side == "LONG":
-                upper_bound = close_px - gap_hc
-                lower_bound = strat1 + gap_s1
-                tac_px = max(min(tac_px, upper_bound), lower_bound)
-            else:
-                lower_bound = close_px + gap_hc
-                upper_bound = strat1 - gap_s1
-                tac_px = min(max(tac_px, lower_bound), upper_bound)
-            final_tacs.append(quantize_to_tick(tac_px, tick))
-
-        elif len(tac_candidates) >= 2:
-            t1, t2 = tac_candidates[0], tac_candidates[1]
-            if pos.side == "LONG":
-                hi = close_px - gap_hc
-                lo = strat1 + gap_s1
-                t1 = min(max(t1, lo), hi)
-                t2 = min(max(t2, lo), hi)
-                final_tacs = [max(t1, t2), min(t1, t2)]
-            else:
-                lo = close_px + gap_hc
-                hi = strat1 - gap_s1
-                t1 = min(max(t1, lo), hi)
-                t2 = min(max(t2, lo), hi)
-                final_tacs = [min(t1, t2), max(t1, t2)]
-
-        tac_candidates = final_tacs
-
-    tacs_out: list[dict] = []
     if len(tac_candidates) == 1:
-        tacs_out.append({"price": tac_candidates[0], "label": "TAC"})
+        tac_px = tac_candidates[0]
+        # Если коридор слишком узкий, сжимаем буферы
+        if dist <= min_total:
+            w_hc = gap_hc / max(min_total, 1e-12)
+            w_s1 = 1.0 - w_hc
+            gap_hc = max(tick * CONFIG.DCA_MIN_GAP_TICKS, dist * w_hc)
+            gap_s1 = max(tick * CONFIG.DCA_MIN_GAP_TICKS, dist * w_s1)
+        
+        if pos.side == "LONG":
+            upper_bound = close_px - gap_hc
+            lower_bound = strat1 + gap_s1
+            tac_px = max(min(tac_px, upper_bound), lower_bound)
+        else:
+            lower_bound = close_px + gap_hc
+            upper_bound = strat1 - gap_s1
+            tac_px = min(max(tac_px, lower_bound), upper_bound)
+        final_tacs.append(quantize_to_tick(tac_px, tick))
+
     elif len(tac_candidates) >= 2:
-        tacs_out.append({"price": tac_candidates[0], "label": "TAC #1"})
-        tacs_out.append({"price": tac_candidates[1], "label": "TAC #2"})
+        t1, t2 = tac_candidates[0], tac_candidates[1]
+        if pos.side == "LONG":
+            hi = close_px - gap_hc
+            lo = strat1 + gap_s1
+            t1 = min(max(t1, lo), hi)
+            t2 = min(max(t2, lo), hi)
+            final_tacs = [max(t1, t2), min(t1, t2)]
+        else:
+            lo = close_px + gap_hc
+            hi = strat1 - gap_s1
+            t1 = min(max(t1, lo), hi)
+            t2 = min(max(t2, lo), hi)
+            final_tacs = [min(t1, t2), max(t1, t2)]
+
+    # 2. Логика маркировки (labeling)
+    #    Она должна читать из final_tacs, а не из tac_candidates
+    
+    tacs_out: list[dict] = []
+    if len(final_tacs) == 1:
+        tacs_out.append({"price": final_tacs[0], "label": "TAC"})
+    elif len(final_tacs) >= 2:
+        tacs_out.append({"price": final_tacs[0], "label": "TAC #1"})
+        tacs_out.append({"price": final_tacs[1], "label": "TAC #2"})
+
+    # --- КОНЕЦ ИСПРАВЛЕНИЯ ---
 
     if not tacs_out:
+        # Если final_tacs пуст, но место есть - пробуем вставить один TAC
         gap_hc = max(tick * CONFIG.DCA_MIN_GAP_TICKS, close_px * CONFIG.MIN_SPACING_PCT)
         gap_s1 = max(tick * CONFIG.DCA_MIN_GAP_TICKS, strat1 * CONFIG.MIN_SPACING_PCT)
         min_total = gap_hc + gap_s1
@@ -800,6 +816,10 @@ def build_targets_with_tactical(
 
     out = tacs_out + strat
     return out
+
+# ===========================================================================
+# === КОНЕЦ ЗАМЕНЫ build_targets_with_tactical =============================
+# ===========================================================================
 
 
 def break_distance_pcts(px: float, up: float, dn: float) -> tuple[float, float]:
