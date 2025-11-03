@@ -1994,7 +1994,7 @@ def clip_targets_by_ml(
         tmp.step_margins = [used_new]
         tmp.reserve_used = False
         tmp.reserve_margin_usdt = 0.0
-        ml_guard = ml_price_at(tmp, CONFIG.ML_TARGET_PЦТ, bank, fees_est)
+        ml_guard = ml_price_at(tmp, CONFIG.ML_TARGET_PCT, bank, fees_est)
         if np.isnan(ml_guard):
             break
         
@@ -2328,7 +2328,7 @@ async def _handle_manual_commands(
         _sync_reserve3_flags(pos)
         # --- (P4 FIX) КОНЕЦ БЛОКА ---
 
-        ml_now = ml_price_at(pos, CONFIG.ML_TARGET_PЦТ, bank, fees_est)
+        ml_now = ml_price_at(pos, CONFIG.ML_TARGET_PCT, bank, fees_est)
         ml_reserve = ml_reserve_pct_to_ml20(pos, px, bank, fees_est)
         ml_arrow = "↓" if pos.side == "LONG" else "↑"
         dist_now = ml_distance_pct(pos.side, px, ml_now)
