@@ -1,5 +1,4 @@
 from __future__ import annotations
-
 import asyncio
 import time
 import logging
@@ -1385,7 +1384,7 @@ def auto_strat_targets_with_ml_buffer(
         if ok_corridor and ok_ml:
             break
 
-        g += g_step
+    ￼    g += g_step
         moved += g_step
 
     labels = ["STRAT 33%", "STRAT 66%", "STRAT 100% (RESERVE)"]
@@ -2031,7 +2030,7 @@ async def _m15_state_step(b: dict, symbol: str, say):
                 fr_up, fr_dn = compute_fractals_15m(d)
                 last_up, last_dn = _last_confirmed_fractals(fr_up, fr_dn)
 
-                st = b["m15_sig"]
+                st = b["м15_sig"] if "м15_sig" in b else b["m15_sig"]
 
                 if last_up is not None:
                     if st.get("last_fr_up") is None or abs(st["last_fr_up"] - last_up) > 1e-9:
@@ -2066,26 +2065,43 @@ async def _handle_manual_commands(
     tick: float,
     bank: float,
     rng_strat: dict,
+    rng_tac: dict,   # <— добавили
     _alloc_bank,
 ):
     _ = _alloc_bank
     pos: Position | None = b.get("position")
 
-    # --- НОВОЕ: обработка /hedge_flip и /hedge_close ---
-    # если позиция есть и это позиция "из хеджа" – пересобрать план
+    # --- Обработка /hedge_flip и /hedge_close с пересчётом HC внутрь TAC ---
     pending_bias = b.pop("pending_hedge_bias", None)
     pending_hc = b.pop("pending_hc_price", None)
 
     if pos and pos.from_hedge and (pending_bias or pending_hc):
-        # 1. что у нас уже есть
         entry_px = pos.hedge_entry_px or pos.avg or px
-        old_close = pos.hedge_close_px or pos.avg or px
-        leg_margin = float(pos.step_margins[0])  # первую ступень НЕ меняем
-        remain_side = pending_bias or pos.side   # если flip – берём новое, иначе старое
-        # если пользователь не задал /hedge_close, берём РЫНОЧНУЮ цену
-        new_close = float(pending_hc) if pending_hc is not None else px
+        leg_margin = float(pos.step_margins[0])
+        remain_side = pending_bias or pos.side
 
-        # 2. пересобираем позицию ТЕМ ЖЕ банком
+        if pending_hc is not None:
+            new_close = float(pending_hc)
+        else:
+            # ➊ при flip без /hedge_close — пересчитать HC
+            if rng_tac:
+                new_close = planned_hc_price(
+                    entry_px,
+                    rng_tac["lower"],
+                    rng_tac["upper"],
+                    remain_side,
+                    CONFIG.HEDGE_MODE,
+                    tick,
+                )
+            else:
+                # fallback: рыночная цена
+                new_close = px
+
+        # ➋ сбросить ручные TAC’ы
+        pos.manual_tac_price = None
+        pos.manual_tac2_price = None
+
+        # ➌ пересобрать план на новую сторону с новым HC
         new_pos, new_targets, fees_est = _plan_with_leg(
             symbol=symbol,
             leg_margin=leg_margin,
@@ -2098,34 +2114,23 @@ async def _handle_manual_commands(
             growth=CONFIG.GROWTH_AFTER_HEDGE,
         )
 
-        # 3. подрезаем по ML и синкаем reserve3
         new_pos.ordinary_targets = clip_targets_by_ml(new_pos, bank, fees_est, new_targets, tick)
         _sync_reserve3_flags(new_pos)
 
-        # 4. сохраняем
         b["position"] = new_pos
         b["fsm_state"] = int(FSM.MANAGING)
 
-        # 5. сообщение
         lots_leg = margin_to_lots(symbol, leg_margin, price=entry_px, leverage=new_pos.leverage)
         levels_block = render_hedge_preview_block(
-            symbol,
-            new_pos,
-            bank,
-            fees_est,
-            tick,
-            new_close,
-            lots_leg,
-            leg_margin,
+            symbol, new_pos, bank, fees_est, tick, new_close, lots_leg, leg_margin
         )
-
         await say(
             "♻️ План после ручного изменения хеджа\n"
             f"Bias: <b>{remain_side}</b>\n"
             f"HC: <code>{fmt(new_close)}</code>\n"
             f"{levels_block}"
         )
-        return  # завершаем обработчик
+        return
 
     if pos and b.get("force_close"):
         if (not pos) or pos.steps_filled <= 0 or (b.get("fsm_state") not in (int(FSM.OPENED), int(FSM.MANAGING))):
@@ -2356,7 +2361,7 @@ async def _scanner_main(app, ns_key: str):
     # ---------------------
 
     # Снимок порогов
-    if rng_strat and rng_tac:
+    if rng_strат and rng_tac:
         tac_lo = rng_tac["lower"]
         tac_hi = rng_tac["upper"]
         tac_w = tac_hi - tac_lo
@@ -2426,6 +2431,7 @@ async def _scanner_main(app, ns_key: str):
                 tick,
                 bank,
                 rng_strat,
+                rng_tac,   # ← передаём тактический диапазон
                 None,
             )
 
