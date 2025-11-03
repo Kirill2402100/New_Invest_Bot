@@ -822,6 +822,15 @@ def build_targets_with_tactical(
         final_tacs.append(quantize_to_tick(tac_px, tick))
 
     elif len(tac_candidates) >= 2:
+        # --- НАЧАЛО ФИКСА (Проблема 1 "слипания") ---
+        # Добавляем проверку на узкий коридор, как в блоке 'len == 1'
+        if dist <= min_total:
+            w_hc = gap_hc / max(min_total, 1e-12)
+            w_s1 = 1.0 - w_hc
+            gap_hc = max(tick * CONFIG.DCA_MIN_GAP_TICKS, dist * w_hc)
+            gap_s1 = max(tick * CONFIG.DCA_MIN_GAP_TICKS, dist * w_s1)
+        # --- КОНЕЦ ФИКСА ---
+
         t1, t2 = tac_candidates[0], tac_candidates[1]
         if pos.side == "LONG":
             hi = close_px - gap_hc
@@ -1032,7 +1041,7 @@ def _is_df_fresh(df: pd.DataFrame, max_age_min: int = 15) -> bool:
         idx = df.index
         last_ts = idx[-1].to_pydatetime() if hasattr(idx[-1], "to_pydatetime") else None
         if last_ts is None and "time" in df.columns:
-            last_ts = pd.to_datetime(df["time"].iloc[-1]).to_pydatETIME()
+            last_ts = pd.to_datetime(df["time"].iloc[-1]).to_pydatetime()
         if last_ts is None:
             return True
         age_min = (datetime.utcnow() - last_ts.replace(tzinfo=None)).total_seconds() / 60.0
@@ -2085,10 +2094,14 @@ async def _handle_manual_commands(
         else:
             # ➊ при flip без /hedge_close — пересчитать HC
             if rng_tac:
+                # --- НАЧАЛО ФИКСА (Проблема 2 "HC при флипе") ---
+                # Базой для нового HC должна быть ТЕКУЩАЯ цена (px),
+                # а не цена первоначального входа (entry_px).
                 new_close = planned_hc_price(
-                    entry_px,
+                    px,  # <--- ЗАМЕНА: было entry_px
                     rng_tac["lower"],
                     rng_tac["upper"],
+                # --- КОНЕЦ ФИКСА ---
                     remain_side,
                     CONFIG.HEDGE_MODE,
                     tick,
