@@ -1,4 +1,3 @@
-# scanner_bmr_dca.py
 from __future__ import annotations
 
 import asyncio
@@ -435,8 +434,6 @@ def render_remaining_levels_block(
         tmp.step_margins = [used_new]
         tmp.reserve_used = False
         tmp.reserve_margin_usdt = 0.0
-
-        fees_est = (used_new * L) * fee_taker * CONFIG.LIQ_FEE_BUFFER
 
         ml20 = ml_price_at(tmp, CONFIG.ML_TARGET_PCT, bank, fees_est)
 
@@ -1984,7 +1981,8 @@ def clip_targets_by_ml(
         tmp.step_margins = [used_new]
         tmp.reserve_used = False
         tmp.reserve_margin_usdt = 0.0
-        ml_guard = ml_price_at(tmp, CONFIG.ML_TARGET_PCT, bank, fees_est)
+        # опечатка могла попадаться в старых ветках
+        ml_guard = ml_price_at(tmp, getattr(CONFIG, "ML_TARGET_PCT", 0.20), bank, fees_est)
         if np.isnan(ml_guard):
             break
 
@@ -2084,7 +2082,8 @@ async def _handle_manual_commands(
         old_close = pos.hedge_close_px or pos.avg or px
         leg_margin = float(pos.step_margins[0])  # первую ступень НЕ меняем
         remain_side = pending_bias or pos.side   # если flip – берём новое, иначе старое
-        new_close = float(pending_hc) if pending_hc is not None else old_close
+        # если пользователь не задал /hedge_close, берём РЫНОЧНУЮ цену
+        new_close = float(pending_hc) if pending_hc is not None else px
 
         # 2. пересобираем позицию ТЕМ ЖЕ банком
         new_pos, new_targets, fees_est = _plan_with_leg(
