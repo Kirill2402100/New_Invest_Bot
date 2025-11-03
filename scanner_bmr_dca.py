@@ -21,9 +21,9 @@ logging.getLogger("fx_feed").setLevel(logging.WARNING)
 # ---------------------------------------------------------------------------
 # Регистр/ключи — берём из globals(), если их определили извне; иначе дефолт
 # ---------------------------------------------------------------------------
-TASKS_KEY = globals().get("TASKS_KEY", "scan_tasks")   # app.bot_data[TASKS_KEY] -> dict[ns_key] = asyncio.Task
-BOXES_KEY = globals().get("BOXES_KEY", "scan_boxes")   # app.bot_data[BOXES_KEY] -> dict[ns_key] = dict(...)
-BANKS_KEY = globals().get("BANKS_KEY", "scan_banks")   # app.bot_data[BANKS_KEY] -> dict["chat:symbol"] = float
+TASKS_KEY = globals().get("TASKS_KEY", "scan_tasks")  # app.bot_data[TASKS_KEY] -> dict[ns_key] = asyncio.Task
+BOXES_KEY = globals().get("BOXES_KEY", "scan_boxes")  # app.bot_data[BOXES_KEY] -> dict[ns_key] = dict(...)
+BANKS_KEY = globals().get("BANKS_KEY", "scan_banks")  # app.bot_data[BANKS_KEY] -> dict["chat:symbol"] = float
 
 
 # ---------------------------------------------------------------------------
@@ -1032,7 +1032,7 @@ def _is_df_fresh(df: pd.DataFrame, max_age_min: int = 15) -> bool:
         idx = df.index
         last_ts = idx[-1].to_pydatetime() if hasattr(idx[-1], "to_pydatetime") else None
         if last_ts is None and "time" in df.columns:
-            last_ts = pd.to_datetime(df["time"].iloc[-1]).to_pydatetime()
+            last_ts = pd.to_datetime(df["time"].iloc[-1]).to_pydatETIME()
         if last_ts is None:
             return True
         age_min = (datetime.utcnow() - last_ts.replace(tzinfo=None)).total_seconds() / 60.0
@@ -1331,7 +1331,6 @@ def _linspace_exclusive(
             out.append(q)
     return out
 
-
 def auto_strat_targets_with_ml_buffer(
     pos: "Position",
     rng_strat: dict,
@@ -1366,18 +1365,15 @@ def auto_strat_targets_with_ml_buffer(
     max_depth = max(atr * 4.0, g_step * 60)
     moved = 0.0
 
-    # подберём шаг g так, чтобы выдержать и «коридор», и ML-буферы
     while moved <= max_depth:
         p1, p2, p3 = _triplet(g)
 
-        # Требование минимального зазора между HC и STRAT#1
         min_total = (
             max(tick * CONFIG.DCA_MIN_GAP_TICKS, hc * CONFIG.MIN_SPACING_PCT)
             + max(tick * CONFIG.DCA_MIN_GAP_TICKS, p1 * CONFIG.MIN_SPACING_PCT)
         )
         ok_corridor = (abs(p1 - hc) >= min_total)
 
-        # Буфер ML после 2-й и 3-й ступеней (относительно пробоя STRAT)
         buf3 = _ml_buffer_after_3(pos, bank, fees_est, rng_strat, p1, p2, p3)
         buf2 = ml_distance_pct(
             side, _break_price_for_side(rng_strat, side), _ml_after_k(pos, bank, fees_est, [p1, p2], 2)
@@ -1390,7 +1386,6 @@ def auto_strat_targets_with_ml_buffer(
         g += g_step
         moved += g_step
     else:
-        # Если не нашли «идеальный» g, берём последний рассчитанный триплет
         p1, p2, p3 = _triplet(g)
 
     labels = ["STRAT 33%", "STRAT 66%", "STRAT 100% (RESERVE)"]
@@ -2070,7 +2065,7 @@ async def _handle_manual_commands(
     tick: float,
     bank: float,
     rng_strat: dict,
-    rng_tac: dict,   # <— добавили
+    rng_tac: dict,  # <— добавили
     _alloc_bank,
 ):
     _ = _alloc_bank
@@ -2099,10 +2094,10 @@ async def _handle_manual_commands(
                     tick,
                 )
             else:
-                # fallback: рыночная цена
+                # fallback: текущая рыночная
                 new_close = px
 
-        # ➋ сбросить ручные TAC’ы
+        # ➋ сбросить ручные TAC’и, чтобы не перекрывали автогенерацию
         pos.manual_tac_price = None
         pos.manual_tac2_price = None
 
@@ -2366,7 +2361,7 @@ async def _scanner_main(app, ns_key: str):
     # ---------------------
 
     # Снимок порогов
-    if rng_strат and rng_tac:
+    if rng_strat and rng_tac:
         tac_lo = rng_tac["lower"]
         tac_hi = rng_tac["upper"]
         tac_w = tac_hi - tac_lo
@@ -2436,7 +2431,7 @@ async def _scanner_main(app, ns_key: str):
                 tick,
                 bank,
                 rng_strat,
-                rng_tac,   # ← передаём тактический диапазон
+                rng_tac,  # ← передаём тактический диапазон
                 None,
             )
 
