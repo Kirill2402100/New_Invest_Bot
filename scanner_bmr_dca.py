@@ -2094,6 +2094,12 @@ async def _handle_manual_commands(
         else:
             # ➊ при flip без /hedge_close — пересчитать HC
             if rng_tac:
+
+                # --- !!! TEST !!! ---
+                # Вставьте этот log.info прямо сюда
+                log.info(f"[V_TEST] Flipping HC. Base price for calc: {px} (should be current price, NOT {entry_px})")
+                # --- !!! END TEST !!! ---
+
                 # --- НАЧАЛО ФИКСА (Проблема 2 "HC при флипе") ---
                 # Базой для нового HC должна быть ТЕКУЩАЯ цена (px),
                 # а не цена первоначального входа (entry_px).
