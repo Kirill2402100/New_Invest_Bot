@@ -646,15 +646,49 @@ def break_levels(rng: dict) -> tuple[float, float]:
 
 
 def compute_fractals_15m(df: pd.DataFrame) -> tuple[pd.Series, pd.Series]:
+    """
+    (P5 FIX) Обновленный расчет фракталов (non-strict),
+    допускающий 'плато' (равные значения <= и >=).
+    """
     h, l = df["high"], df["low"]
     n = len(df)
     up = pd.Series([np.nan] * n, index=df.index)
     dn = pd.Series([np.nan] * n, index=df.index)
     for i in range(2, n - 2):
-        if h.iloc[i - 2] < h.iloc[i] and h.iloc[i - 1] < h.iloc[i] and h.iloc[i + 1] < h.iloc[i] and h.iloc[i + 2] < h.iloc[i]:
-            up.iloc[i] = h.iloc[i]
-        if l.iloc[i - 2] > l.iloc[i] and l.iloc[i - 1] > l.iloc[i] and l.iloc[i + 1] > l.iloc[i] and l.iloc[i + 2] > l.iloc[i]:
-            dn.iloc[i] = l.iloc[i]
+        # Фрактал ВВЕРХ (non-strict) — центральный high >= 2 слева и 2 справа
+        is_up = (
+            h.iloc[i - 2] <= h.iloc[i] and
+            h.iloc[i - 1] <= h.iloc[i] and
+            h.iloc[i + 1] <= h.iloc[i] and
+            h.iloc[i + 2] <= h.iloc[i]
+        )
+        # Фрактал ВНИЗ (non-strict) — центральный low <= 2 слева и 2 справа
+        is_dn = (
+            l.iloc[i - 2] >= l.iloc[i] and
+            l.iloc[i - 1] >= l.iloc[i] and
+            l.iloc[i + 1] >= l.iloc[i] and
+            l.iloc[i + 2] >= l.iloc[i]
+        )
+        # Доп. проверка: это не должно быть 5+ одинаковых баров подряд.
+        # Хотя бы один из 4 соседей должен быть СТРОГО < (для up) или > (для dn).
+        if is_up:
+            is_not_flat_plateau = (
+                h.iloc[i - 2] < h.iloc[i] or
+                h.iloc[i - 1] < h.iloc[i] or
+                h.iloc[i + 1] < h.iloc[i] or
+                h.iloc[i + 2] < h.iloc[i]
+            )
+            if is_not_flat_plateau:
+                up.iloc[i] = h.iloc[i]
+        if is_dn:
+            is_not_flat_plateau_low = (
+                l.iloc[i - 2] > l.iloc[i] or
+                l.iloc[i - 1] > l.iloc[i] or
+                l.iloc[i + 1] > l.iloc[i] or
+                l.iloc[i + 2] > l.iloc[i]
+            )
+            if is_not_flat_plateau_low:
+                dn.iloc[i] = l.iloc[i]
     return up, dn
 
 
@@ -667,30 +701,39 @@ def _last_confirmed_fractals(fr_up: pd.Series, fr_dn: pd.Series) -> tuple[float 
 
 
 def _two_tacticals_between(hc_px: float, strat1: float, side: str, tick: float) -> list[float]:
-    gap_hc = max(tick * CONFIG.DCA_MIN_GAP_TICKS, hc_px * CONFIG.MIN_SPACING_PCT)
-    gap_s1 = max(tick * CONFIG.DCA_MIN_GAP_TICKS, strat1 * CONFIG.MIN_SPACING_PCT)
-    dist = abs(hc_px - strat1)
-    min_total = gap_hc + gap_s1
+    """
+    (P1 FIX) Всегда размещает ДВЕ тактики, делящие ОБЩЕЕ расстояние
+    (hc_px ... strat1) на три равные части.
+    """
+    dist_total = strat1 - hc_px
 
-    if dist <= min_total + tick:
-        mid = hc_px + 0.5 * (strat1 - hc_px)
-        mid = quantize_to_tick(mid, tick)
-        return [mid]
+    # Точки на 1/3 и 2/3 пути
+    p1_raw = hc_px + dist_total / 3.0
+    p2_raw = hc_px + 2.0 * dist_total / 3.0
 
+    t1 = quantize_to_tick(p1_raw, tick)
+    t2 = quantize_to_tick(p2_raw, tick)
+
+    # Убедимся, что они не слиплись после квантования
+    min_gap_ticks = max(1, CONFIG.DCA_MIN_GAP_TICKS)
+
+    # Если t1 и t2 одинаковы или слишком близки
+    if abs(_ticks_between(t1, t2, tick)) < min_gap_ticks:
+        # Сдвигаем вторую точку от первой на минимальный разрыв
+        if side == "LONG":
+            # t1 (ближняя) > t2 (дальняя)
+            t2 = quantize_to_tick(t1 - min_gap_ticks * tick, tick)
+        else:
+            # t1 (ближняя) < t2 (дальняя)
+            t2 = quantize_to_tick(t1 + min_gap_ticks * tick, tick)
+
+    # Возвращаем в правильном порядке (от hc_px к strat1)
     if side == "LONG":
-        top = hc_px - gap_hc
-        bottom = strat1 + gap_s1
-        L = top - bottom
-        t1 = top - L / 3.0
-        t2 = top - 2.0 * L / 3.0
-        return [quantize_to_tick(t1, tick), quantize_to_tick(t2, tick)]
+        # [t1 (выше), t2 (ниже)]
+        return [max(t1, t2), min(t1, t2)]
     else:
-        bottom = hc_px + gap_hc
-        top = strat1 - gap_s1
-        L = top - bottom
-        t1 = bottom + L / 3.0
-        t2 = bottom + 2.0 * L / 3.0
-        return [quantize_to_tick(t1, tick), quantize_to_tick(t2, tick)]
+        # [t1 (ниже), t2 (выше)]
+        return [min(t1, t2), max(t1, t2)]
 
 
 def _tactical_between(hc_px: float, strat1: float, side: str, tick: float) -> float:
@@ -1239,7 +1282,7 @@ def _gap_ticks_to_ml_after_k(
 ) -> float:
     if k <= 0 or k > len(strat_prices):
         return float("nan")
-    mlk = _ml_after_k(pos, bank, fees_est, strat_prices[:k], k)
+    mlk = _ml_after_k(pos, bank, fees_est, [p for p in strat_prices[:k]], k)
     if np.isnan(mlk):
         return float("nan")
     p_k = strat_prices[k - 1]
@@ -1463,7 +1506,7 @@ def _strat_report_text(
         brk_up, brk_dn = break_levels(rng_strat)
         brk = brk_dn if pos.side == "LONG" else brk_up
         lines.append(
-            f"Буфер после #3 и пробоя STRAT (от <code>{fmt(brk)}</code>) → {buf:.2f}% [{st}] (порог {CONFIG.ML_BREAK_BUFFER_PCT:.2f}%)"
+            f"Буфер после #3 и пробоя STRAT (от <code>{fmt(brk)}</code>) → {buf:.2f}% [{st}] (порог {CONFIG.ML_BREAK_BUFFER_PЦТ:.2f}%)"
         )
     return "\n".join(lines)
 
@@ -1951,7 +1994,7 @@ def clip_targets_by_ml(
         tmp.step_margins = [used_new]
         tmp.reserve_used = False
         tmp.reserve_margin_usdt = 0.0
-        ml_guard = ml_price_at(tmp, CONFIG.ML_TARGET_PCT, bank, fees_est)
+        ml_guard = ml_price_at(tmp, CONFIG.ML_TARGET_PЦТ, bank, fees_est)
         if np.isnan(ml_guard):
             break
         
@@ -2191,9 +2234,22 @@ async def _handle_manual_commands(
             if len(idxs) >= 3:
                 pos.ordinary_targets[idxs[2]]["reserve3"] = True
             _sync_reserve3_flags(pos)
+
+            # --- (P4 FIX) НАЧАЛО БЛОКА ПЕРЕСЧЕТА МАРЖИ ---
+            # Пересчитываем "хвост" маржи, как при /hedge_close
+            pos.rebalance_tail_margins_excluding_reserve(bank)
+            _shape_tail_from_leg(pos, bank)
+            
+            # Так как маржа могла измениться, надо перепроверить ML
             cum_margin = _pos_total_margin(pos)
             fees_est = (cum_margin * pos.leverage) * CONFIG.FEE_TAKER * CONFIG.LIQ_FEE_BUFFER
-            await say(_strat_report_text(pos, px, tick, bank, fees_est, rng_strat, hdr="✏️ STRAT обновлён вручную (TAC сохранён)"))
+            
+            # Пере-обрезаем цели по ML, так как объемы изменились
+            pos.ordinary_targets = clip_targets_by_ml(pos, bank, fees_est, pos.ordinary_targets, tick)
+            _sync_reserve3_flags(pos)  # clip_targets_by_ml мог отрезать 3-й страт
+            
+            await say(_strat_report_text(pos, px, tick, bank, fees_est, rng_strat, hdr="✏️ STRAT обновлён (маржа хвоста пересчитана)"))
+            # --- (P4 FIX) КОНЕЦ БЛОКА ---
 
     if b.pop("cmd_strat_reset", False):
         cum_margin = _pos_total_margin(pos)
@@ -2254,15 +2310,25 @@ async def _handle_manual_commands(
         tac_msg = "♻️ TAC сброшен к авто-плану\n"
 
     if rebuild_tac:
+        # --- (P4 FIX) НАЧАЛО БЛОКА ПЕРЕСЧЕТА МАРЖИ ---
+        # 1. Сначала пересчитываем "хвост" маржи
+        pos.rebalance_tail_margins_excluding_reserve(bank)
+        _shape_tail_from_leg(pos, bank)
+        
+        # 2. Теперь, зная новую маржу, строим цены
         cum_margin = _pos_total_margin(pos)
         fees_est = (cum_margin * pos.leverage) * CONFIG.FEE_TAKER * CONFIG.LIQ_FEE_BUFFER
         base_close = pos.hedge_close_px or pos.avg
+        
         pos.ordinary_targets = build_targets_with_tactical(pos, rng_strat, base_close, tick, bank, fees_est)
+        
+        # 3. И обрезаем по ML с учетом новой маржи
         pos.ordinary_targets = clip_targets_by_ml(pos, bank, fees_est, pos.ordinary_targets, tick)
         pos.ordinary_offset = min(getattr(pos, "ordinary_offset", 0), len(pos.ordinary_targets))
         _sync_reserve3_flags(pos)
+        # --- (P4 FIX) КОНЕЦ БЛОКА ---
 
-        ml_now = ml_price_at(pos, CONFIG.ML_TARGET_PCT, bank, fees_est)
+        ml_now = ml_price_at(pos, CONFIG.ML_TARGET_PЦТ, bank, fees_est)
         ml_reserve = ml_reserve_pct_to_ml20(pos, px, bank, fees_est)
         ml_arrow = "↓" if pos.side == "LONG" else "↑"
         dist_now = ml_distance_pct(pos.side, px, ml_now)
@@ -2390,7 +2456,7 @@ async def _scanner_main(app, ns_key: str):
         fresh_bank = banks.get(ns_key)
         if fresh_bank is not None:
             box["bank_usd"] = float(fresh_bank)
-        bank = float(box.get("bank_usd", CONFIG.SAFETY_BANK_USDT))
+        bank = float(box.get("bank_usд", CONFIG.SAFETY_BANK_USDT))
         # -----------------------------
 
         # 4. если есть позиция — обрабатываем ручные команды
