@@ -822,36 +822,42 @@ def build_targets_with_tactical(
         final_tacs.append(quantize_to_tick(tac_px, tick))
 
     elif len(tac_candidates) >= 2:
-        # --- НАЧАЛО ФИКСА (Проблема 1 "слипания") ---
-        # Добавляем проверку на узкий коридор, как в блоке 'len == 1'
-        if dist <= min_total:
-            w_hc = gap_hc / max(min_total, 1e-12)
-            w_s1 = 1.0 - w_hc
-            gap_hc = max(tick * CONFIG.DCA_MIN_GAP_TICKS, dist * w_hc)
-            gap_s1 = max(tick * CONFIG.DCA_MIN_GAP_TICKS, dist * w_s1)
-        # --- КОНЕЦ ФИКСА ---
-
         t1, t2 = tac_candidates[0], tac_candidates[1]
-        if pos.side == "LONG":
-            hi = close_px - gap_hc
-            lo = strat1 + gap_s1
-            t1 = min(max(t1, lo), hi)
-            t2 = min(max(t2, lo), hi)
-            final_tacs = [max(t1, t2), min(t1, t2)]
+
+        # --- НАЧАЛО ФИКСА "СЛИПАНИЯ" v2 ---
+        # Применяем буферы (клиппинг) ТОЛЬКО если коридор шире,
+        # чем сумма самих буферов.
+        if dist > min_total:
+            if pos.side == "LONG":
+                hi = close_px - gap_hc
+                lo = strat1 + gap_s1
+                t1 = min(max(t1, lo), hi)
+                t2 = min(max(t2, lo), hi)
+                final_tacs = [max(t1, t2), min(t1, t2)]
+            else:
+                lo = close_px + gap_hc
+                hi = strat1 - gap_s1
+                t1 = min(max(t1, lo), hi)
+                t2 = min(max(t2, lo), hi)
+                final_tacs = [min(t1, t2), max(t1, t2)]
         else:
-            lo = close_px + gap_hc
-            hi = strat1 - gap_s1
-            t1 = min(max(t1, lo), hi)
-            t2 = min(max(t2, lo), hi)
-            final_tacs = [min(t1, t2), max(t1, t2)]
+            # Коридор слишком узкий.
+            # Игнорируем буферы и берём "сырые" точки 1/3 и 2/3,
+            # которые уже вернула _two_tacticals_between.
+            final_tacs = [t1, t2]
+        # --- КОНЕЦ ФИКСА "СЛИПАНИЯ" v2 ---
 
     # Маркировка
     tacs_out: list[dict] = []
     if len(final_tacs) == 1:
         tacs_out.append({"price": final_tacs[0], "label": "TAC"})
     elif len(final_tacs) >= 2:
-        tacs_out.append({"price": final_tacs[0], "label": "TAC #1"})
-        tacs_out.append({"price": final_tacs[1], "label": "TAC #2"})
+        # Убедимся, что T1 и T2 не слиплись после квантования (на всякий случай)
+        if abs(_ticks_between(final_tacs[0], final_tacs[1], tick)) < 1:
+             tacs_out.append({"price": final_tacs[0], "label": "TAC"})
+        else:
+            tacs_out.append({"price": final_tacs[0], "label": "TAC #1"})
+            tacs_out.append({"price": final_tacs[1], "label": "TAC #2"})
 
     if not tacs_out:
         # Если final_tacs пуст, но место есть — вставляем один TAC по центру
@@ -2094,12 +2100,6 @@ async def _handle_manual_commands(
         else:
             # ➊ при flip без /hedge_close — пересчитать HC
             if rng_tac:
-
-                # --- !!! TEST !!! ---
-                # Вставьте этот log.info прямо сюда
-                log.info(f"[V_TEST] Flipping HC. Base price for calc: {px} (should be current price, NOT {entry_px})")
-                # --- !!! END TEST !!! ---
-
                 # --- НАЧАЛО ФИКСА (Проблема 2 "HC при флипе") ---
                 # Базой для нового HC должна быть ТЕКУЩАЯ цена (px),
                 # а не цена первоначального входа (entry_px).
