@@ -253,21 +253,49 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_html(HELP_TEXT)
 
 
+# --- (P3 FIX) cmd_restart ПОЛНОСТЬЮ ЗАМЕНЕН ---
 async def cmd_restart(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Попросить сам сканер сделать свой внутренний /restart (он там у тебя в main loop)."""
+    """
+    (P3 FIX) Полностью останавливает сканер и УДАЛЯЕТ банк.
+    Требует нового /setbank и /run.
+    """
     chat_id = _chat_id(update)
     args = context.args or []
+    
     if args:
         sym = _norm_symbol(args[0])
     else:
-        sym = context.chat_data.get("current_symbol") or CONFIG.SYMBOL
-    
-    # ИСПРАВЛЕНО
-    box = _get_scanner_box(context.application, sym, chat_id)
-    box["cmd_restart"] = True
+        sym = context.chat_data.get("current_symbol")
+        if not sym:
+            return await update.message.reply_html("Укажи символ: <code>/restart SYMBOL</code>")
     
     context.chat_data["current_symbol"] = sym
-    await update.message.reply_html(f"✅ Запросил /restart для <b>{_hs(sym)}</b>.")
+    ns_key = _get_scanner_ns_key(chat_id, sym) # Используем _get_scanner_ns_key
+    
+    # 1. Останавливаем сканер (если запущен)
+    stop_msg = await stop_scanner_for_pair(context.application, symbol=sym, chat_id=chat_id, hard=True)
+    
+    # 2. Удаляем банк из реестра
+    banks_registry = _get_banks_registry(context.application)
+    removed_bank = banks_registry.pop(ns_key, None)
+    
+    # 3. Чистим 'коробку' (stop_scanner_for_pair уже должен это делать, но для гарантии)
+    boxes = context.application.bot_data.get(BOXES_KEY, {})
+    boxes.pop(ns_key, None)
+    
+    if removed_bank is not None:
+        await update.message.reply_html(
+            f"{stop_msg}\n"
+            f"🏦 Банк для <b>{_hs(sym)}</b> (<code>{removed_bank:.2f} USD</code>) сброшен.\n"
+            f"Требуется новая настройка: <code>/setbank {_hs(sym)} USD</code> и <code>/run {_hs(sym)}</code>."
+        )
+    else:
+        await update.message.reply_html(
+            f"{stop_msg}\n"
+            f"Банк для <b>{_hs(sym)}</b> не был найден (уже сброшен).\n"
+            f"Требуется новая настройка: <code>/setbank {_hs(sym)} USD</code>."
+        )
+# --- КОНЕЦ ЗАМЕНЫ cmd_restart ---
 
 
 # --- cmd_setbank ПОЛНОСТЬЮ ЗАМЕНЕН ---
@@ -722,7 +750,7 @@ async def _set_manual_open(update: Update, context: ContextTypes.DEFAULT_TYPE, s
     context.chat_data["current_symbol"] = sym
     extra = f" @ <code>{price:.6f}</code>" if price is not None else ""
     await update.message.reply_html(
-        f"Ок. Запросил ручной bias: <b>{side.upper()}</b> по <b>{_hs(sym)}</b>{extra}.\n"
+        f"Ок. Запросил ручной bias: <b>{side.UPPER()}</b> по <b>{_hs(sym)}</b>{extra}.\n"
         f"Ручной режим снят. Сканер выполнит вход при первой возможности или пересчитает план."
     )
 # --- КОНЕЦ ЗАМЕНЫ _set_manual_open ---
