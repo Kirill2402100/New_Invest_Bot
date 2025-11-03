@@ -1366,15 +1366,18 @@ def auto_strat_targets_with_ml_buffer(
     max_depth = max(atr * 4.0, g_step * 60)
     moved = 0.0
 
+    # подберём шаг g так, чтобы выдержать и «коридор», и ML-буферы
     while moved <= max_depth:
         p1, p2, p3 = _triplet(g)
 
+        # Требование минимального зазора между HC и STRAT#1
         min_total = (
             max(tick * CONFIG.DCA_MIN_GAP_TICKS, hc * CONFIG.MIN_SPACING_PCT)
             + max(tick * CONFIG.DCA_MIN_GAP_TICKS, p1 * CONFIG.MIN_SPACING_PCT)
         )
         ok_corridor = (abs(p1 - hc) >= min_total)
 
+        # Буфер ML после 2-й и 3-й ступеней (относительно пробоя STRAT)
         buf3 = _ml_buffer_after_3(pos, bank, fees_est, rng_strat, p1, p2, p3)
         buf2 = ml_distance_pct(
             side, _break_price_for_side(rng_strat, side), _ml_after_k(pos, bank, fees_est, [p1, p2], 2)
@@ -1384,8 +1387,11 @@ def auto_strat_targets_with_ml_buffer(
         if ok_corridor and ok_ml:
             break
 
-    ￼    g += g_step
+        g += g_step
         moved += g_step
+    else:
+        # Если не нашли «идеальный» g, берём последний рассчитанный триплет
+        p1, p2, p3 = _triplet(g)
 
     labels = ["STRAT 33%", "STRAT 66%", "STRAT 100% (RESERVE)"]
     return [
@@ -1393,7 +1399,6 @@ def auto_strat_targets_with_ml_buffer(
         {"price": p2, "label": labels[1]},
         {"price": p3, "label": labels[2], "reserve3": True},
     ]
-
 
 def _equalize_p3_to_gap_and_ml(
     pos: "Position",
