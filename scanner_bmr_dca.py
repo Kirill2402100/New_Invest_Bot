@@ -2059,18 +2059,62 @@ async def _handle_manual_commands(
     _ = _alloc_bank
     pos: Position | None = b.get("position")
 
-    # --- Обработка /hedge_flip и /hedge_close с пересчётом HC внутрь TAC ---
     pending_bias = b.pop("pending_hedge_bias", None)
     pending_hc = b.pop("pending_hc_price", None)
 
+    # --- ИСПРАВЛЕНИЕ: Логика ручного входа /openlong ---
+    if pos is None and pending_bias and not b.get("user_manual_mode", False) and rng_tac:
+        log.info(f"Ручной вход: {pending_bias} по рынку (px={px})")
+        bias = pending_bias
+        
+        # Рассчитываем 1/4 бюджета
+        total_target = bank * CONFIG.CUM_DEPOSIT_FRAC_AT_FULL
+        total_levels = 1 + CONFIG.STRAT_LEVELS_AFTER_HEDGE # 1+3=4
+        leg_margin = total_target / total_levels # 1/4 бюджета
+        
+        tac_lo = rng_tac["lower"]
+        tac_hi = rng_tac["upper"]
+        hc_price = pending_hc if pending_hc is not None else planned_hc_price(px, tac_lo, tac_hi, bias, CONFIG.HEDGE_MODE, tick)
+
+        pos_new, targets_new, fees_est = _plan_with_leg(
+            symbol,
+            leg_margin,
+            remain_side=bias,
+            entry_px=px, # Вход по рынку
+            close_px=hc_price,
+            bank=bank,
+            rng_strat=rng_strat,
+            tick=tick,
+            growth=CONFIG.GROWTH_AFTER_HEDGE, # (growth=1.0)
+        )
+        
+        pos_new.ordinary_targets = clip_targets_by_ml(pos_new, bank, fees_est, targets_new, tick)
+        b["position"] = pos_new
+        b["fsm_state"] = int(FSM.MANAGING)
+
+        lots_leg = margin_to_lots(symbol, leg_margin, price=px, leverage=pos_new.leverage)
+        levels_block = render_hedge_preview_block(
+            symbol, pos_new, bank, fees_est, tick, hc_price, lots_leg, leg_margin,
+        )
+
+        await say(
+            f"🧱 <b>HEDGE OPEN [MANUAL {bias}]</b>\n"
+            f"Цена: <code>{fmt(px)}</code> | Обе ноги по <b>{lots_leg:.2f}</b> lot\n"
+            f"Депозит (суммарно): <b>{leg_margin*2:.2f} USD</b> (по {leg_margin:.2f} на ногу)\n"
+            f"{levels_block}"
+        )
+        return # Важно: выходим, чтобы не попасть в /strat reset и т.д.
+    # --- КОНЕЦ ИСПРАВЛЕНИЯ ---
+
+
+    # --- Старая логика (ФЛИП) ---
     if pos and pos.from_hedge and (pending_bias or pending_hc):
         entry_px = pos.hedge_entry_px or pos.avg or px
         
         # --- ПРАВКА 19: Маржа ноги теперь ПЕРВЫЙ элемент из 4-х ---
-        # (вместо leg_margin = float(pos.step_margins[0]))
-        # Рассчитываем 1/4 бюджета
         total_target = bank * CONFIG.CUM_DEPOSIT_FRAC_AT_FULL
-        leg_margin = total_target / 4.0 # 1/4
+        total_levels = 1 + CONFIG.STRAT_LEVELS_AFTER_HEDGE # 1+3=4
+        leg_margin = total_target / total_levels # 1/4 бюджета
         
         remain_side = pending_bias or pos.side
 
@@ -2387,7 +2431,7 @@ async def _scanner_main(app, ns_key: str):
             box["bank_usd"] = float(fresh_bank)
         bank = float(box.get("bank_usd", CONFIG.SAFETY_BANK_USDT))
         
-        # 4) Ручные команды, если есть позиция
+        # 4) Ручные команды (включая ручной вход)
         if rng_strat:
             await _handle_manual_commands(
                 box,
@@ -2397,13 +2441,13 @@ async def _scanner_main(app, ns_key: str):
                 tick,
                 bank,
                 rng_strat,
-                rng_tac,  # ← передаём тактический диапазон
+                rng_tac,
                 None,
             )
 
         pos: Position | None = box.get("position")
 
-        # 5) Если позиции нет и не стоит ручной режим — проверяем вход по TAC
+        # 5) Если позиции НЕТ — проверяем АВТО-вход
         if pos is None and not box.get("user_manual_mode", False) and rng_tac and rng_strat:
             tac_lo = rng_tac["lower"]
             tac_hi = rng_tac["upper"]
@@ -2423,7 +2467,6 @@ async def _scanner_main(app, ns_key: str):
 
             # --- вход по нижней границе (LONG-бейс)
             if px <= long_thr + tick * CONFIG.WICK_HYST_TICKS:
-                # мы в нижней части → хотим оставить LONG
                 bias = "LONG"
                 
                 # --- ПРАВКА 21: Прямой расчет ноги (1/4 бюджета) ---
@@ -2431,7 +2474,6 @@ async def _scanner_main(app, ns_key: str):
                 total_levels = 1 + CONFIG.STRAT_LEVELS_AFTER_HEDGE # 1+3=4
                 leg_margin = total_target / total_levels # 1/4 бюджета
                 
-                # Вызываем _plan_with_leg напрямую, без _fit_leg...
                 pos_new, targets_new, fees_est = _plan_with_leg(
                     symbol,
                     leg_margin,
@@ -2444,7 +2486,6 @@ async def _scanner_main(app, ns_key: str):
                     growth=CONFIG.GROWTH_AFTER_HEDGE, # (growth=1.0)
                 )
                 
-                # подрежем по ML
                 pos_new.ordinary_targets = clip_targets_by_ml(pos_new, bank, fees_est, targets_new, tick)
                 box["position"] = pos_new
                 box["fsm_state"] = int(FSM.MANAGING)
@@ -2463,7 +2504,7 @@ async def _scanner_main(app, ns_key: str):
                 )
 
                 await say(
-                    "🧱 <b>HEDGE OPEN [SHORT]</b>\n"
+                    "🧱 <b>HEDGE OPEN [AUTO]</b>\n" # Изменено на AUTO
                     f"Цена: <code>{fmt(px)}</code> | Обе ноги по <b>{lots_leg:.2f}</b> lot\n"
                     f"Депозит (суммарно): <b>{leg_margin*2:.2f} USD</b> (по {leg_margin:.2f} на ногу)\n"
                     f"{levels_block}"
