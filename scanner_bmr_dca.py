@@ -1501,7 +1501,7 @@ def _strat_report_text(
 
     # Буфер после 3-го STRAT больше не считаем, т.к. у нас только STRAT 1
     return "\n".join(lines)
-
+    
 class FSM(IntEnum):
     IDLE = 0
     OPENED = 1
@@ -1769,9 +1769,10 @@ def _count_strats(targets: list[dict]) -> int:
     return sum(1 for t in targets if str(t.get("label", "")).upper().startswith("STRAT"))
 
 
+# === ИСПРАВЛЕНИЕ: Убрана сложная логика хвоста, оставлено только выравнивание ===
 def _plan_with_leg(
     symbol: str,
-    leg_margin: float,
+    leg_margin: float, # Это *целевая* маржа, будет выровнена
     remain_side: str,
     entry_px: float,
     close_px: float,
@@ -1781,25 +1782,25 @@ def _plan_with_leg(
     growth: float,
 ) -> tuple["Position", list[dict], float]:
     pos = Position(remain_side, signal_id="SIZER", leverage=CONFIG.LEVERAGE, owner_key="SIZER")
+    # 1. Планируем *весь* бюджет (N уровней + 1 резерв)
     pos.plan_with_reserve(bank, growth, CONFIG.STRAT_LEVELS_AFTER_HEDGE)
 
-    # 0) 1-й шаг равен leg_margin, но далее выравниваем все обычные шаги
+    # 2. Устанавливаем целевую маржу (она все равно будет перезаписана)
     pos.step_margins[0] = float(leg_margin)
 
-    # 1) Сформировать хвост на основе ноги
-    _shape_tail_from_leg(pos, bank)
+    # 3. <<< УДАЛЕНО _shape_tail_from_leg >>>
 
-    # 2) РАВНОМЕРНО: вход + все обычные доборы (резерв не трогаем)
+    # 4. РАВНОМЕРНО: Распределяем бюджет по ВСЕМ обычным доборам (включая [0])
+    #    Именно эта функция делает все доли ОДИНАКОВЫМИ
     _equalize_entry_and_adds(pos, bank)
 
-    # 3) Открыть 0-й шаг уже равными долями
-    _ = pos.add_step(entry_px)
+    # 5. Открываем 0-й шаг (уже с РАВНОЙ долей)
+    _ = pos.add_step(entry_px) # pos.step_margins[0] теперь содержит фактическую равную долю
 
-    # 4) Пересчитать хвост после входа
-    pos.rebalance_tail_margins_excluding_reserve(bank)
-    _shape_tail_from_leg(pos, bank)
+    # 6. <<< УДАЛЕНО rebalance_tail_margins_excluding_reserve >>>
+    # 7. <<< УДАЛЕНО _shape_tail_from_leg >>>
 
-    # 5) Сбор целей (с новой логикой STRAT 1 + TAC #1/#2)
+    # 8. Сбор целей (с новой логикой STRAT 1 + TAC #1/#2)
     pos.from_hedge = True
     pos.hedge_entry_px = entry_px
     pos.hedge_close_px = close_px
@@ -1808,12 +1809,15 @@ def _plan_with_leg(
     pos.ordinary_targets = build_targets_with_tactical(pos, rng_strat, close_px, tick, bank, fees_est)
     pos.ordinary_offset = 0
     _sync_reserve3_flags(pos)
+    
+    # Возвращаем pos, в котором step_margins[0] УЖЕ ВЫРОВНЕНА
     return pos, pos.ordinary_targets, fees_est
 
 
+# === ИСПРАВЛЕНИЕ: Функция возвращает ФАКТИЧЕСКУЮ (выровненную) маржу ===
 def _fit_leg_with_equalization(
     symbol: str,
-    leg_margin_init: float,
+    leg_margin_init: float, # Это *целевая* начальная нога (4.2% банка)
     remain_side: str,
     entry_px: float,
     close_px: float,
@@ -1821,23 +1825,34 @@ def _fit_leg_with_equalization(
     rng_strat: dict,
     tick: float,
     growth: float,
-) -> tuple[float, "Position", list[dict], float]:
+) -> tuple[float, "Position", list[dict], float]: # (фактическая_нога_usd, pos, targets, fees)
     lo = max(CONFIG.LEG_MIN_FRACTION, 0.25)
     hi = 1.0
     best = None
     thr_pct = float(getattr(CONFIG, "ML_MIN_AFTER_LAST_PCT", 0.0) or 0.0)
     PENALTY_W = 10.0
+    
+    # Итеративно подбираем *целевую* маржу (leg)
     for s in [1.00, 0.90, 0.80, 0.70, 0.60, 0.50, max(0.45, lo), lo]:
-        leg = leg_margin_init * s
+        leg_target = leg_margin_init * s # Это все еще *цель*
+        
+        # _plan_with_leg ВЫРАВНИВАЕТ эту цель
         pos, tgts, fees = _plan_with_leg(
-            symbol, leg, remain_side, entry_px, close_px, bank, rng_strat, tick, growth
+            symbol, leg_target, remain_side, entry_px, close_px, bank, rng_strat, tick, growth
         )
+        
+        # Берем ФАКТИЧЕСКУЮ маржу после выравнивания
+        actual_equalized_leg_margin = float(pos.step_margins[0])
+
         tgts2, ok = _equalize_p3_to_gap_and_ml(pos, bank, fees, tick)
         strat = _extract_first_three_strats(tgts2)
         ml_last = _ml_pct_after_k_at_p_k(pos, bank, fees, strat, 3) if len(strat) == 3 else float("inf")
         ok_ml = (thr_pct <= 0.0) or (ml_last >= thr_pct)
+        
         if _count_strats(tgts2) >= 3 and ok and ok_ml:
-            return leg, pos, tgts2, fees
+            # ИСПРАВЛЕНО: Возвращаем фактическую маржу
+            return actual_equalized_leg_margin, pos, tgts2, fees
+            
         if len(strat) == 3:
             p1, p2, p3 = strat
             gap12 = _ticks_between(p1, p2, tick)
@@ -1847,97 +1862,65 @@ def _fit_leg_with_equalization(
             penalty = max(0.0, thr_pct - ml_last) * PENALTY_W
             err = abs(gap23 - gap12) + abs(gapML - gap12) + penalty
             if best is None or err < best[0]:
-                best = (err, leg, pos, tgts2, fees)
+                 # ИСПРАВЛЕНО: Сохраняем фактическую маржу
+                best = (err, actual_equalized_leg_margin, pos, tgts2, fees)
+                
     if best is not None:
-        _, leg0, _, _, _ = best
-        a = max(lo, leg0 * 0.6)
-        b = min(hi, leg0 * 1.0)
+        _, leg0_target, _, _, _ = best # leg0_target - это сохраненная *фактическая* маржа
+        a_target = max(lo, leg0_target * 0.6)
+        b_target = min(hi, leg0_target * 1.0)
+        
         for _ in range(18):
-            mid = (a + b) / 2.0
+            mid_target_margin = (a_target + b_target) / 2.0
             pos, tgts, fees = _plan_with_leg(
-                symbol, mid, remain_side, entry_px, close_px, bank, rng_strat, tick, growth
+                symbol, mid_target_margin, remain_side, entry_px, close_px, bank, rng_strat, tick, growth
             )
+            actual_equalized_leg_margin = float(pos.step_margins[0])
+            
             tgts2, ok = _equalize_p3_to_gap_and_ml(pos, bank, fees, tick)
             strat = _extract_first_three_strats(tgts2)
             ml_last = _ml_pct_after_k_at_p_k(pos, bank, fees, strat, 3) if len(strat) == 3 else float("inf")
             ok_ml = (thr_pct <= 0.0) or (ml_last >= thr_pct)
+            
             if _count_strats(tgts2) >= 3 and ok and ok_ml:
-                return mid, pos, tgts2, fees
+                # ИСПРАВЛЕНО: Возвращаем фактическую маржу
+                return actual_equalized_leg_margin, pos, tgts2, fees
+                
             if len(strat) < 3:
-                a = mid
+                a_target = mid_target_margin
                 continue
+                
             p1, p2, p3 = strat
             ml3 = _ml_after_k(pos, bank, fees, [p1, p2, p3], 3)
             if np.isnan(ml3):
-                a = mid
+                a_target = mid_target_margin
                 continue
+                
             gap12 = _ticks_between(p1, p2, tick)
             gapML = _ticks_between(p3, ml3, tick)
             if thr_pct > 0.0 and (not ok_ml):
-                b = mid
+                b_target = mid_target_margin
             else:
-                a = mid
+                a_target = mid_target_margin
+                
+        # best[1] теперь содержит правильную, фактическую маржу
         return best[1], best[2], best[3], best[4]
-    return leg_margin_init, *_plan_with_leg(
-        symbol, leg_margin_init, remain_side, entry_px, close_px, bank, rng_strat, tick, growth
+
+    # Fallback (возврат при сбое)
+    pos_fb, tgts_fb, fees_fb = _plan_with_leg(
+         symbol, leg_margin_init, remain_side, entry_px, close_px, bank, rng_strat, tick, growth
     )
+    # ИСПРАВЛЕНО: Возвращаем фактическую маржу
+    return float(pos_fb.step_margins[0]), pos_fb, tgts_fb, fees_fb
 
 
+# === ИСПРАВЛЕНИЕ: Убрана сложная логика хвоста ===
 def _shape_tail_from_leg(pos: "Position", bank: float):
-    cfg = getattr(CONFIG, "AFTER_HEDGE_TAIL", None)
-    if not cfg:
-        return
-
-    total_target = bank * CONFIG.CUM_DEPOSIT_FRAC_AT_FULL
-
-    used_ord_count = max(0, pos.steps_filled - (1 if getattr(pos, "reserve_used", False) else 0))
-    if not pos.step_margins or used_ord_count <= 0:
-        return
-
-    leg = float(pos.step_margins[0])
-    levels = int(cfg.get("levels", 4))
-    mode = str(cfg.get("mode", "relative_vector")).lower()
-    rnd = float(cfg.get("round_usd", 1.0))
-
-    if mode == "geom":
-        k1 = float(cfg.get("first_rel_to_leg", 0.345))
-        g = float(cfg.get("growth", CONFIG.GROWTH_AFTER_HEDGE))
-        a0 = max(0.0, leg * k1)
-        tail_raw = [a0 * (g ** i) for i in range(max(0, levels))]
-    else:
-        coeffs = list(cfg.get("coeffs_rel_to_leg", [0.345, 0.4983333333, 0.690, 0.9583333333]))
-        if levels > len(coeffs) and len(coeffs) >= 2:
-            g_implied = coeffs[-1] / max(coeffs[-2], 1e-9)
-            next_c = coeffs[-1] * g_implied
-            coeffs.append(next_c)
-        tail_raw = [max(0.0, leg * c) for c in coeffs[: max(0, levels)]]
-
-    used_ord_sum = sum(pos.step_margins[:used_ord_count])
-    max_tail_budget = max(0.0, total_target - used_ord_sum)
-
-    raw_sum = sum(tail_raw)
-    if raw_sum > max_tail_budget and raw_sum > 0:
-        s = max_tail_budget / raw_sum
-        tail = [t * s for t in tail_raw]
-    else:
-        tail = tail_raw
-
-    if rnd > 0:
-        tail = [round(t / rnd) * rnd for t in tail]
-
-    tail_sum = sum(tail)
-    if tail_sum > max_tail_budget and tail_sum > 0:
-        s = max_tail_budget / tail_sum
-        tail = [t * s for t in tail]
-
-    remaining_levels = max(0, pos.ord_levels - used_ord_count)
-    tail = tail[:remaining_levels]
-    pos.step_margins = (pos.step_margins[:used_ord_count] or []) + tail
-
-    used_now = sum(pos.step_margins[: pos.ord_levels])
-    pos.reserve_margin_usdt = max(0.0, total_target - used_now)
-    pos.reserve_available = pos.reserve_margin_usdt > 0
-    pos.max_steps = pos.ord_levels + (1 if (pos.reserve_available and not pos.reserve_used) else 0)
+    # Эта функция больше не используется для выравнивания,
+    # т.к. _equalize_entry_and_adds делает всю работу.
+    # Оставляем ее на случай, если она нужна где-то еще,
+    # но _plan_with_leg ее больше не вызывает.
+    pass
 
 
 def _equalize_entry_and_adds(pos: "Position", bank: float):
@@ -2128,6 +2111,8 @@ async def _handle_manual_commands(
             hc_price = planned_hc_price(px, rng_tac["lower"], rng_tac["upper"], bias, CONFIG.HEDGE_MODE, tick)
 
         leg_margin_init = bank * CONFIG.INITIAL_HEDGE_FRACTION
+        
+        # === ИСПРАВЛЕНИЕ: leg_margin теперь ФАКТИЧЕСКАЯ выровненная маржа ===
         leg_margin, pos_new, targets_new, fees_est = _fit_leg_with_equalization(
             symbol=symbol,
             leg_margin_init=leg_margin_init,
@@ -2150,6 +2135,7 @@ async def _handle_manual_commands(
         b["pending_hedge_bias"] = None
         b["pending_hc_price"] = None
 
+        # === ИСПРАВЛЕНИЕ: Используем leg_margin (фактическую) для расчета лотов и вывода ===
         lots_leg = margin_to_lots(symbol, leg_margin, price=px, leverage=pos_new.leverage)
         levels_block = render_hedge_preview_block(
             symbol, pos_new, bank, fees_est, tick, hc_price, lots_leg, leg_margin
@@ -2167,6 +2153,8 @@ async def _handle_manual_commands(
     # --- 1) Изменение текущего хеджа (flip/перенос HC) при УЖЕ открытой позиции-хедже ---
     if pos and pos.from_hedge and (pending_bias or pending_hc is not None):
         entry_px = pos.hedge_entry_px or pos.avg or px
+        
+        # === ИСПРАВЛЕНИЕ: Берем фактическую выровненную маржу из pos ===
         leg_margin = float(pos.step_margins[0])
         remain_side = pending_bias or pos.side
 
@@ -2179,9 +2167,10 @@ async def _handle_manual_commands(
         pos.manual_tac_price = None
         pos.manual_tac2_price = None
 
+        # _plan_with_leg выровняет доли заново, leg_margin здесь - это *цель*
         new_pos, new_targets, fees_est = _plan_with_leg(
             symbol=symbol,
-            leg_margin=leg_margin,
+            leg_margin=leg_margin, # Передаем старую фактическую маржу как новую *цель*
             remain_side=remain_side,
             entry_px=entry_px,
             close_px=new_close,
@@ -2190,6 +2179,10 @@ async def _handle_manual_commands(
             tick=tick,
             growth=CONFIG.GROWTH_AFTER_HEDGE,
         )
+        
+        # === ИСПРАВЛЕНИЕ: Получаем новую фактическую маржу после выравнивания ===
+        new_actual_leg_margin = float(new_pos.step_margins[0])
+        
         new_pos.ordinary_targets = clip_targets_by_ml(new_pos, bank, fees_est, new_targets, tick)
         _sync_reserve3_flags(new_pos)
 
@@ -2200,9 +2193,10 @@ async def _handle_manual_commands(
         b["pending_hedge_bias"] = None
         b["pending_hc_price"] = None
 
-        lots_leg = margin_to_lots(symbol, leg_margin, price=entry_px, leverage=new_pos.leverage)
+        # === ИСПРАВЛЕНИЕ: Используем new_actual_leg_margin для логов ===
+        lots_leg = margin_to_lots(symbol, new_actual_leg_margin, price=entry_px, leverage=new_pos.leverage)
         levels_block = render_hedge_preview_block(
-            symbol, new_pos, bank, fees_est, tick, new_close, lots_leg, leg_margin
+            symbol, new_pos, bank, fees_est, tick, new_close, lots_leg, new_actual_leg_margin
         )
         await say(
             "♻️ План после ручного изменения хеджа\n"
@@ -2398,6 +2392,8 @@ async def _scanner_main(app, ns_key: str):
             # --- Авто-вход в любую из сторон
             if bias_to_open:
                 leg_margin_init = bank * CONFIG.INITIAL_HEDGE_FRACTION
+                
+                # === ИСПРАВЛЕНИЕ: leg_margin теперь ФАКТИЧЕСКАЯ выровненная маржа ===
                 leg_margin, pos_new, targets_new, fees_est = _fit_leg_with_equalization(
                     symbol,
                     leg_margin_init,
@@ -2414,6 +2410,7 @@ async def _scanner_main(app, ns_key: str):
                 box["position"] = pos_new
                 box["fsm_state"] = int(FSM.MANAGING)
 
+                # === ИСПРАВЛЕНИЕ: Используем leg_margin (фактическую) для расчета лотов и вывода ===
                 lots_leg = margin_to_lots(symbol, leg_margin, price=px, leverage=pos_new.leverage)
                 hc_price = pos_new.hedge_close_px
                 levels_block = render_hedge_preview_block(
