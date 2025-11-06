@@ -854,7 +854,7 @@ def build_targets_with_tactical(
     elif len(final_tacs) >= 2:
         # Убедимся, что T1 и T2 не слиплись после квантования (на всякий случай)
         if abs(_ticks_between(final_tacs[0], final_tacs[1], tick)) < 1:
-             tacs_out.append({"price": final_tacs[0], "label": "TAC"})
+            tacs_out.append({"price": final_tacs[0], "label": "TAC"})
         else:
             tacs_out.append({"price": final_tacs[0], "label": "TAC #1"})
             tacs_out.append({"price": final_tacs[1], "label": "TAC #2"})
@@ -1372,14 +1372,14 @@ def auto_strat_targets_with_ml_buffer(
     def _triplet(gv: float) -> tuple[float, float, float]:
         if side == "LONG":
             return (
-                quantize_to_tick(hc - gv, tick),       # (старый STRAT 1, 33%)
-                quantize_to_tick(hc - 2 * gv, tick),   # (старый STRAT 2, 66%) ← НОВЫЙ STRAT 1
-                quantize_to_tick(hc - 3 * gv, tick),   # (старый STRAT 3, 100%)
+                quantize_to_tick(hc - gv, tick),      # (старый STRAT 1, 33%)
+                quantize_to_tick(hc - 2 * gv, tick),    # (старый STRAT 2, 66%) ← НОВЫЙ STRAT 1
+                quantize_to_tick(hc - 3 * gv, tick),    # (старый STRAT 3, 100%)
             )
         else:
             return (
                 quantize_to_tick(hc + gv, tick),
-                quantize_to_tick(hc + 2 * gv, tick),   # ← НОВЫЙ STRAT 1
+                quantize_to_tick(hc + 2 * gv, tick),    # ← НОВЫЙ STRAT 1
                 quantize_to_tick(hc + 3 * gv, tick),
             )
 
@@ -1501,7 +1501,6 @@ def _strat_report_text(
 
     # Буфер после 3-го STRAT больше не считаем, т.к. у нас только STRAT 1
     return "\n".join(lines)
-
 
 class FSM(IntEnum):
     IDLE = 0
@@ -2105,8 +2104,8 @@ async def _handle_manual_commands(
     pos: Position | None = b.get("position")
 
     # ⚠️ Больше НЕ pop: смотрим значения, а очищаем только ПОСЛЕ успешной обработки
-    pending_bias = b.get("pending_hedge_bias")     # "LONG"/"SHORT" или None
-    pending_hc = b.get("pending_hc_price")         # float или None
+    pending_bias = b.get("pending_hedge_bias")    # "LONG"/"SHORT" или None
+    pending_hc = b.get("pending_hc_price")        # float или None
 
     # Ручные команды (флаги из вашего обработчика)
     open_long = b.get("cmd_openlong", False)
@@ -2244,7 +2243,7 @@ async def _handle_manual_commands(
         b.pop("cmd_tac_reset", None)
         return
 
-    # ... далее ВЕСЬ существующий код работы со STRAT/TAC без изменений ... 
+    # ... далее ВЕСЬ существующий код работы со STRAT/TAC без изменений ...
 
 
 # ---------------------------------------------------------------------------
@@ -2275,6 +2274,12 @@ async def _scanner_main(app, ns_key: str):
     box.setdefault("user_manual_mode", False)
     box.setdefault("fsm_state", int(FSM.IDLE))
     box.setdefault("position", None)
+    
+    # === АНТИ-СПАМ ===
+    # Время последнего сообщения "Текущая:"
+    box["last_idle_status_ts"] = 0.0
+    IDLE_STATUS_COOLDOWN_SEC = 60.0 # 60 секунд
+    # ===============
 
     # --- ИСПРАВЛЕНИЕ 1 ---
     # Обновляем банк из bot_data при старте цикла
@@ -2362,7 +2367,7 @@ async def _scanner_main(app, ns_key: str):
 
         pos: Position | None = box.get("position")
 
-        # 5) Если позиции нет и не стоит ручной режим — проверяем вход по TAC (нижняя граница/LONG-бейс)
+        # 5) Если позиции нет и не стоит ручной режим — проверяем вход по TAC (обе стороны)
         if pos is None and not box.get("user_manual_mode", False) and rng_tac and rng_strat:
             tac_lo = rng_tac["lower"]
             tac_hi = rng_tac["upper"]
@@ -2370,27 +2375,35 @@ async def _scanner_main(app, ns_key: str):
             long_thr = quantize_to_tick(tac_lo + tac_w * 0.30, tick)
             short_thr = quantize_to_tick(tac_lo + tac_w * 0.70, tick)
 
-            dist_long = max(0.0, long_thr - px)
-            dist_short = max(0.0, px - short_thr)
-            pct_to_short = (dist_short / px) * 100.0 if px else 0.0
+            dist_long_pct = (long_thr / px - 1.0) * 100.0 if px else 0.0
+            dist_short_pct = (short_thr / px - 1.0) * 100.0 if px else 0.0
+            
+            # === АНТИ-СПАМ ===
+            # Отправляем сообщение "Текущая" не чаще раза в 60 сек
+            if now - box.get("last_idle_status_ts", 0.0) >= IDLE_STATUS_COOLDOWN_SEC:
+                await say(
+                    f"Текущая: <b>{fmt(px)}</b>. "
+                    f"До LONG: {fmt(px - long_thr)} ({dist_long_pct:+.2f}%), "
+                    f"до SHORT: {fmt(px - short_thr)} ({dist_short_pct:+.2f}%)."
+                )
+                box["last_idle_status_ts"] = now
+            # ================
 
-            await say(
-                f"Текущая: <b>{fmt(px)}</b>. "
-                f"До LONG: {fmt(dist_long)} ({(dist_long/px*100 if px else 0):.2f}%), "
-                f"до SHORT: {fmt(dist_short)} ({pct_to_short:.2f}%)."
-            )
-
-            # --- вход по нижней границе (LONG-бейс)
+            bias_to_open = None
             if px <= long_thr + tick * CONFIG.WICK_HYST_TICKS:
-                # мы в нижней части → хотим оставить LONG
-                bias = "LONG"
+                bias_to_open = "LONG"
+            elif px >= short_thr - tick * CONFIG.WICK_HYST_TICKS:
+                bias_to_open = "SHORT"
+
+            # --- Авто-вход в любую из сторон
+            if bias_to_open:
                 leg_margin_init = bank * CONFIG.INITIAL_HEDGE_FRACTION
                 leg_margin, pos_new, targets_new, fees_est = _fit_leg_with_equalization(
                     symbol,
                     leg_margin_init,
-                    remain_side=bias,
+                    remain_side=bias_to_open,
                     entry_px=px,
-                    close_px=planned_hc_price(px, tac_lo, tac_hi, bias, CONFIG.HEDGE_MODE, tick),
+                    close_px=planned_hc_price(px, tac_lo, tac_hi, bias_to_open, CONFIG.HEDGE_MODE, tick),
                     bank=bank,
                     rng_strat=rng_strat,
                     tick=tick,
@@ -2415,7 +2428,7 @@ async def _scanner_main(app, ns_key: str):
                 )
 
                 await say(
-                    f"🧱 <b>HEDGE OPEN [{bias}]</b>\n"
+                    f"🧱 <b>AUTO HEDGE OPEN [{bias_to_open}]</b>\n"
                     f"Цена: <code>{fmt(px)}</code> | Обе ноги по <b>{lots_leg:.2f}</b> lot\n"
                     f"Депозит (суммарно): <b>{leg_margin*2:.2f} USD</b> (по {leg_margin:.2f} на ногу)\n"
                     f"{levels_block}"
@@ -2436,8 +2449,10 @@ async def _scanner_main(app, ns_key: str):
                 rng_strat=rng_strat,
                 rng_tac=rng_tac,
             )
-            # можно раскомментировать для частых апдейтов:
-            # await say(box["status_line"])
+            # можно раскомментировать для частых апдейтов (но будет спамить):
+            # if now - box.get("last_active_status_ts", 0.0) >= 60.0: # раз в 60 сек
+            #     await say(box["status_line"])
+            #     box["last_active_status_ts"] = now
 
         await asyncio.sleep(CONFIG.SCAN_INTERVAL_SEC)
 
@@ -2518,6 +2533,8 @@ async def start_scanner_for_pair(app, *args, **kwargs):
         "m15_state": {},
         "m15_sig": {},
         "say": say,
+        # анти-спам
+        "last_idle_status_ts": 0.0,
         # флаги для /hedge_flip и /hedge_close
         "pending_hedge_bias": None,  # "LONG" / "SHORT"
         "pending_hc_price": None,    # float
